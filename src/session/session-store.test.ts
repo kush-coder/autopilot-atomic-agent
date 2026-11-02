@@ -1,0 +1,271 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Database as DatabaseCtor } from "../native/load-better-sqlite3.js";
+import { SessionStore } from "./session-store.js";
+import { createEmptySessionState } from "./session-state.js";
+import { EMPTY_CONTEXT_USAGE } from "./context-usage.js";
+
+describe("SessionStore", () => {
+  let tmp: string;
+  let store: SessionStore;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), "atomic-agent-sess-"));
+    store = new SessionStore({ dbFile: join(tmp, "sessions.sqlite") });
+  });
+
+  afterEach(() => {
+    store.close();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("round-trips a session state", () => {
+    const initial = createEmptySessionState({
+      id: "s1",
+      workingDir: "/work",
+    });
+    store.save(initial);
+    const loaded = store.load("s1");
+    expect(loaded).not.toBeNull();
+    expect(loaded!.id).toBe("s1");
+    expect(loaded!.workingDir).toBe("/work");
+    expect(loaded!.turns).toEqual([]);
+    expect(loaded!.turnCount).toBe(0);
+    expect(loaded!.loadedSkills).toEqual([]);
+    expect(loaded!.loadedTools).toEqual([]);
+    expect(loaded!.worldSnapshot).toBeNull();
+  });
+
+  it("round-trips loadedTools on the session payload", () => {
+    const initial = createEmptySessionState({
+      id: "s-tools",
+      workingDir: "/w",
+    });
+    const withTools = {
+      ...initial,
+      loadedTools: [
+        {
+          name: "os.git.show",
+          summary: "Show commit",
+          argsSchema: "{ revision?: string }",
+          loadedAt: 99,
+          source: "explicit" as const,
+        },
+      ],
+    };
+    store.save(withTools);
+    const loaded = store.load("s-tools");
+    expect(loaded?.loadedTools).toHaveLength(1);
+    expect(loaded?.loadedTools[0]?.name).toBe("os.git.show");
+  });
+
+  it("round-trips the persisted context-usage snapshot", () => {
+    const initial = createEmptySessionState({
+      id: "s-ctx",
+      workingDir: "/w",
+    });
+    const snapshot = {
+      ...EMPTY_CONTEXT_USAGE,
+      tokens: 12_345,
+      contextWindow: 131_072,
+      conversationTokens: 9_000,
+      conversationPairs: 4,
+      sections: [{ label: "conversation", tokens: 9_000 }],
+    };
+    store.save({ ...initial, contextUsage: snapshot });
+    const loaded = store.load("s-ctx");
+    expect(loaded?.contextUsage).toEqual(snapshot);
+    // A session written before the field existed simply has none.
+    store.save(createEmptySessionState({ id: "s-old", workingDir: "/w" }));
+    expect(store.load("s-old")?.contextUsage).toBeUndefined();
+  });
+
+  it("updates an existing session in place", () => {
+    const state = createEmptySessionState({
+      id: "s2",
+      workingDir: "/work",
+    });
+    store.save(state);
+    // Not `running`: a live status is the turn's own to write
+    // (`beginTurn`), and `save` keeps it out of the row.
+    store.save({
+      ...state,
+      status: "completed",
+      stepCount: 3,
+      updatedAt: Date.now() + 100,
+    });
+    const loaded = store.load("s2")!;
+    expect(loaded.status).toBe("completed");
+    expect(loaded.stepCount).toBe(3);
+  });
+
+  it("lists sessions by working dir ordered by recency", () => {
+    const a = createEmptySessionState({ id: "a", workingDir: "/w" });
+    const b = createEmptySessionState({ id: "b", workingDir: "/w" });
+    const c = createEmptySessionState({ id: "c", workingDir: "/other" });
+    store.save(a);
+    store.save({ ...b, updatedAt: b.updatedAt + 1000 });
+    store.save(c);
+    const list = store.listByWorkingDir("/w", 10);
+    expect(list.map((s) => s.id)).toEqual(["b", "a"]);
+  });
+
+  it("lists recent sessions across working dirs ordered by updated_at", () => {
+    const a = createEmptySessionState({ id: "a", workingDir: "/w1" });
+    const b = createEmptySessionState({ id: "b", workingDir: "/w2" });
+    const c = createEmptySessionState({ id: "c", workingDir: "/w3" });
+    store.save({ ...a, updatedAt: 1000 });
+    store.save({ ...b, updatedAt: 3000 });
+    store.save({ ...c, updatedAt: 2000 });
+    const recent = store.listRecent(10);
+    expect(recent.map((s) => s.id)).toEqual(["b", "c", "a"]);
+  });
+
+  it("listRecent honours the limit", () => {
+    for (let i = 0; i < 5; i += 1) {
+      store.save({
+        ...createEmptySessionState({ id: `s${i}`, workingDir: "/w" }),
+        updatedAt: 1000 + i,
+      });
+    }
+    const limited = store.listRecent(2);
+    expect(limited).toHaveLength(2);
+    expect(limited[0]?.id).toBe("s4");
+    expect(limited[1]?.id).toBe("s3");
+  });
+
+  it("listRecentWorkingDirs returns column-only rows ordered by updated_at", () => {
+    const a = createEmptySessionState({ id: "a", workingDir: "/w1" });
+    const b = createEmptySessionState({ id: "b", workingDir: "/w2" });
+    const c = createEmptySessionState({ id: "c", workingDir: "/w3" });
+    store.save({ ...a, updatedAt: 1000 });
+    store.save({ ...b, updatedAt: 3000 });
+    store.save({ ...c, updatedAt: 2000 });
+
+    const rows = store.listRecentWorkingDirs(2);
+    // Narrow projection: exactly {workingDir, updatedAt}, no payload
+    // deserialisation involved.
+    expect(rows).toEqual([
+      { workingDir: "/w2", updatedAt: 3000 },
+      { workingDir: "/w3", updatedAt: 2000 },
+    ]);
+  });
+
+  describe("with a corrupt row", () => {
+    const insertCorrupt = () => {
+      const raw = new DatabaseCtor(join(tmp, "sessions.sqlite"));
+      try {
+        raw
+          .prepare(
+            `INSERT INTO sessions (id, working_dir, status, payload, created_at, updated_at)
+             VALUES ('bad', '/w', 'pending', '{not json', 9, 9000)`,
+          )
+          .run();
+      } finally {
+        raw.close();
+      }
+    };
+
+    it("listRecent and listByWorkingDir skip it instead of throwing", () => {
+      store.save({
+        ...createEmptySessionState({ id: "ok", workingDir: "/w" }),
+        updatedAt: 1,
+      });
+      insertCorrupt();
+      expect(store.listRecent(10).map((s) => s.id)).toEqual(["ok"]);
+      expect(store.listByWorkingDir("/w", 10).map((s) => s.id)).toEqual(["ok"]);
+      expect(store.unreadableRowsSkipped).toBe(2);
+    });
+
+    it("load returns null for it", () => {
+      insertCorrupt();
+      expect(store.load("bad")).toBeNull();
+      expect(store.unreadableRowsSkipped).toBe(1);
+    });
+  });
+
+  it("delete removes a session", () => {
+    const state = createEmptySessionState({ id: "x", workingDir: "/w" });
+    store.save(state);
+    expect(store.load("x")).not.toBeNull();
+    store.delete("x");
+    expect(store.load("x")).toBeNull();
+  });
+
+  it("does not persist ephemeral recalledNotes and memoryIndex fields", () => {
+    const state = createEmptySessionState({ id: "eph", workingDir: "/w" });
+    store.save({
+      ...state,
+      recalledNotes: [
+        {
+          id: 1,
+          content: "note",
+          tags: ["x"],
+          metadata: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      ],
+      memoryIndex: [{ id: 1, preview: "note", tags: ["x"], updatedAt: 1 }],
+    });
+    const loaded = store.load("eph")!;
+    expect(loaded.recalledNotes).toBeUndefined();
+    expect(loaded.memoryIndex).toBeUndefined();
+  });
+
+  it("creates an empty session with no turns by default", () => {
+    const state = createEmptySessionState({
+      id: "chat",
+      workingDir: "/w",
+    });
+    expect(state.turns).toEqual([]);
+    expect(state.turnCount).toBe(0);
+    expect(state.status).toBe("pending");
+  });
+});
+
+describe("SessionStore.save and a generated title", () => {
+  it("keeps a title a stale writer does not carry", () => {
+    // The naming call lands after `executeTurn` returns, so every
+    // caller holding the finished session is holding one without a
+    // title. Overwriting with it used to erase the name: the title was
+    // read back in-process and gone once the process exited.
+    const store = new SessionStore({ dbFile: ":memory:" });
+    const base = createEmptySessionState({ id: "s-1", workingDir: "/w" });
+    store.save(base);
+    store.save({
+      ...base,
+      metadata: { ...base.metadata, title: "Подсчёт строк" },
+    });
+    // A writer from before the name existed.
+    store.save({ ...base, stepCount: 7 });
+    const loaded = store.load("s-1");
+    expect(loaded?.metadata?.title).toBe("Подсчёт строк");
+    // …and it did not cost that writer its own changes.
+    expect(loaded?.stepCount).toBe(7);
+  });
+
+  it("does not invent a title for a session that has none", () => {
+    const store = new SessionStore({ dbFile: ":memory:" });
+    const base = createEmptySessionState({ id: "s-2", workingDir: "/w" });
+    store.save(base);
+    store.save({ ...base, stepCount: 2 });
+    expect(store.load("s-2")?.metadata?.title).toBeUndefined();
+  });
+
+  it("lets a writer that carries a title set one", () => {
+    const store = new SessionStore({ dbFile: ":memory:" });
+    const base = createEmptySessionState({ id: "s-3", workingDir: "/w" });
+    store.save({
+      ...base,
+      metadata: { ...base.metadata, title: "First" },
+    });
+    store.save({
+      ...base,
+      metadata: { ...base.metadata, title: "Second" },
+    });
+    expect(store.load("s-3")?.metadata?.title).toBe("Second");
+  });
+});

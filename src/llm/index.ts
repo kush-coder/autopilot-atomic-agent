@@ -1,0 +1,110 @@
+export { LlamaServerClient, LlamaServerError } from "./llama-server-client.js";
+export {
+  OpenAiHttpError,
+  humanizeOpenAiHttpError,
+} from "./provider/openai/openai-http.js";
+export type {
+  CompletionRequest,
+  CompletionResult,
+  CompletionTiming,
+  LlamaServerClientOptions,
+  LlamaServerProps,
+  StreamChunk,
+} from "./llama-server-client.js";
+export { checkLlamaServer } from "./llama-server-health.js";
+export { llamaEndpointUrl } from "./llama-endpoint-url.js";
+export {
+  installTransportDeadlines,
+  resetTransportDeadlines,
+  transportDeadlinesFor,
+  OPENAI_DEFAULT_REQUEST_TIMEOUT_MS,
+  TRANSPORT_DEADLINE_MARGIN_MS,
+} from "./transport-deadlines.js";
+export { describeLlamaHealthFailure } from "./describe-llama-health-failure.js";
+export type {
+  HealthCheckOptions,
+  HealthResult,
+} from "./llama-server-health.js";
+export { SlotManager, hashPrefix, DEFAULT_SLOT_COUNT } from "./slot-manager.js";
+export type { SlotAssignment } from "./slot-manager.js";
+export {
+  detectModelProfile,
+  extractTotalSlots,
+  GEMMA4_THINK_PROFILE,
+  PLAIN_INSTRUCT_PROFILE,
+  QWEN_THINK_PROFILE,
+} from "./model-profile.js";
+export type { ModelProfile, ReasoningStyle } from "./model-profile.js";
+export { ModelProfileManager } from "./model-profile-manager.js";
+export type {
+  ModelProfileManagerOptions,
+  ModelProfileRefreshResult,
+} from "./model-profile-manager.js";
+export {
+  buildGrammar,
+  buildGrammarForTools,
+  loadToolCallGrammar,
+  parseToolCall,
+  ToolCallParseError,
+  withoutReasoningPrelude,
+  withUnboundedReasoningPrelude,
+} from "./grammar/index.js";
+export {
+  DEFAULT_REASONING_BUDGET_TOKENS,
+  REASONING_CHARS_PER_TOKEN,
+  effectiveReasoningBudgetTokens,
+  estimateReasoningTokens,
+  reasoningBudgetChars,
+} from "./reasoning-budget.js";
+export { thinkingDisabledOnBuiltPrompt } from "./server-template-policy.js";
+export type { ToolCallPayload } from "./grammar/index.js";
+export {
+  CancelledError,
+  GrammarError,
+  LlmFailure,
+  ModelError,
+  ToolExecutionError,
+  TransportError,
+  LOCAL_ENGINE_DOWN_CODE,
+  LOCAL_ENGINE_DOWN_MESSAGE,
+  LOCAL_ENGINE_START_HINT,
+  LocalEngineDownError,
+  isLocalEngineDown,
+  LOCAL_OUT_OF_MEMORY_CODE,
+  LocalOutOfMemoryError,
+  isLocalOutOfMemory,
+  classifyFailure,
+  classifyTruncation,
+  detectFabricatedToolTranscript,
+  detectModelFailure,
+  FABRICATED_TRANSCRIPT_MIN_LINES,
+  formatTruncatedMessage,
+  isRequestSizeRejection,
+} from "./reliability/index.js";
+export type {
+  DetectModelFailureOptions,
+  DetectedModelFailure,
+  FabricatedToolTranscript,
+  LlmFailureCategory,
+  LlmFailureOptions,
+  ModelErrorOptions,
+  ToolExecutionErrorKind,
+  ToolExecutionErrorOptions,
+  UnregisteredToolNameClass,
+  ModelFailureReason,
+  ModelFailureStage,
+  TruncationCause,
+  TruncationDetail,
+} from "./reliability/index.js";
+export {
+  LlamaServerProvider,
+  VisionUnsupportedError,
+  ModelCannotSeeError,
+} from "./provider/index.js";
+export type {
+  LlmProvider,
+  ProviderCapabilities,
+  VisionImage,
+  VisionRequest,
+  VisionResult,
+} from "./provider/index.js";

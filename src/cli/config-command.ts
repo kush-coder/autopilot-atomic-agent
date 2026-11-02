@@ -1,0 +1,373 @@
+import {
+  ConfigValidationError,
+  ensureUserConfigFileSync,
+  getConfig,
+  parseUserConfigFile,
+  readUserConfigSnapshotSync,
+  readUserConfigVersionOnDiskSync,
+  resetConfigCache,
+  USER_CONFIG_VERSION,
+  userConfigFileSha256Sync,
+  writeUserConfigFileSync,
+} from "../config/index.js";
+import { reportAnalyticsOptOut, resolveSurface } from "../analytics/index.js";
+import { getAppVersion } from "../version.js";
+import { HELP } from "./config-help.js";
+import {
+  CONFIG_CHANGED_EXIT_CODE,
+  CONFIG_CHANGED_MESSAGE,
+  takeExpectSha256,
+  WITH_SHA256_FLAG,
+} from "./config-sha256.js";
+import {
+  deleteConfigPath,
+  findConfigLeaf,
+  formatConfigValue,
+  isConfigBranch,
+  isReadOnlyConfigKey,
+  listConfigLeaves,
+  readConfigPath,
+  readRawConfigTree,
+  suggestConfigKey,
+  writeConfigPath,
+  writeRawUserConfigFileSync,
+} from "../config/config-paths.js";
+
+/**
+ * `stdin` is where `config set -` reads its payload; the CLI passes
+ * `process.stdin`, a test hands in a stream of its own.
+ */
+export async function configCommand(
+  args: string[],
+  stdin: NodeJS.ReadableStream = process.stdin,
+): Promise<number> {
+  const sub = args[0];
+  if (!sub || sub === "-h" || sub === "--help") {
+    process.stdout.write(HELP);
+    return 0;
+  }
+  try {
+    switch (sub) {
+      case "get":
+        return handleGet(args.slice(1));
+      case "set":
+        return await handleSet(args.slice(1), stdin);
+      case "unset":
+        return handleUnset(args.slice(1));
+      case "list":
+        return handleList();
+      case "path":
+        process.stdout.write(`${getConfig().paths.userConfigFile}\n`);
+        return 0;
+      default:
+        process.stderr.write(`unknown subcommand: ${sub}\n`);
+        process.stderr.write(HELP);
+        return 1;
+    }
+  } catch (err) {
+    if (err instanceof ConfigValidationError) {
+      process.stderr.write(`config ${sub} failed: ${err.message}\n`);
+      return 1;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`config ${sub} failed: ${message}\n`);
+    return 1;
+  }
+}
+
+function handleGet(args: string[]): number {
+  const path = getConfig().paths.userConfigFile;
+  const file = ensureUserConfigFileSync(path);
+  if (args.includes(WITH_SHA256_FLAG)) {
+    if (args.length !== 1) {
+      process.stderr.write(
+        `config get failed: ${WITH_SHA256_FLAG} prints the whole file; it takes no key\n`,
+      );
+      return 1;
+    }
+    // ATO-416: the hash a later `set - --expect-sha256` compares against.
+    // Read after `ensureUserConfigFileSync` above, so a migration that
+    // rewrites the file happens before it is hashed, not after; hash and
+    // config come from one read (see `readUserConfigSnapshotSync`).
+    const snapshot = readUserConfigSnapshotSync(path);
+    process.stdout.write(
+      `${JSON.stringify({ sha256: snapshot.sha256, config: snapshot.config }, null, 2)}\n`,
+    );
+    return 0;
+  }
+  if (args.length === 0) {
+    process.stdout.write(`${JSON.stringify(file, null, 2)}\n`);
+    return 0;
+  }
+  const key = args[0]!;
+  if (isConfigBranch(key)) {
+    // A branch has no single value; print the subtree rather than
+    // refusing, since that is unambiguously what was asked for.
+    process.stdout.write(
+      `${JSON.stringify(readConfigPath(file, key), null, 2)}\n`,
+    );
+    return 0;
+  }
+  if (!findConfigLeaf(key)) return rejectUnknownKey("get", key);
+  process.stdout.write(
+    `${formatConfigValue(key, readConfigPath(file, key))}\n`,
+  );
+  return 0;
+}
+
+async function handleSet(
+  rawArgs: string[],
+  stdin: NodeJS.ReadableStream,
+): Promise<number> {
+  const cas = takeExpectSha256(rawArgs);
+  if (!cas.ok) {
+    process.stderr.write(`config set failed: ${cas.error}\n`);
+    return 1;
+  }
+  const args = cas.args;
+  if (args.length === 0) {
+    process.stderr.write(
+      "usage: atomic-agent config set <key> <value>\n" +
+        "   or: atomic-agent config set '<json>'\n" +
+        "   or: atomic-agent config set - [--expect-sha256 <hex>] < config.json\n",
+    );
+    return 1;
+  }
+  // The whole-file payload from stdin. A file that carries API keys,
+  // MCP env blocks or auth headers must not travel as an argument: any
+  // process on the machine can read another's command line (`ps`), for
+  // as long as the write runs. The desktop app writes every config
+  // change this way.
+  if (args.length === 1 && args[0] === "-") {
+    return setWholeFile(await readAllText(stdin), cas.expected);
+  }
+  // Form discrimination. A leading `{` means the whole-file JSON payload,
+  // including the case where the shell split one JSON argument across
+  // several argv entries (`set { "version":40, ... }`), which is why the
+  // test for that keeps passing.
+  const first = args[0]!;
+  if (args.length >= 2 && !first.startsWith("{")) {
+    return setOneKey(first, args.slice(1).join(" "));
+  }
+  if (!first.startsWith("{")) {
+    // Single non-JSON argument: a key with no value. Treating this as
+    // `get` would silently do something other than what was typed.
+    process.stderr.write(
+      `config set failed: no value given for ${first}\n` +
+        `usage: atomic-agent config set ${first} <value>\n`,
+    );
+    return 1;
+  }
+  return setWholeFile(args.join(" "));
+}
+
+/** Everything `stream` delivers until it ends, as UTF-8. */
+async function readAllText(stream: NodeJS.ReadableStream): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function setWholeFile(
+  raw: string,
+  expectedSha256: string | null = null,
+): Promise<number> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`config set failed: invalid JSON: ${message}\n`);
+    return 1;
+  }
+  // Reading a version from the future is right for a file on disk — some
+  // newer build wrote it. Typing one here is not: nothing understands it,
+  // the write path will not let a later `config set` lower it again, and
+  // the file would sit permanently above every future schema, skipping
+  // every migration.
+  //
+  // ATO-416: a version already on disk is not invented, though. The
+  // desktop's bundled atag can be older than the TUI sharing its state
+  // dir; once the TUI has migrated the file, `config get` reports that
+  // newer version and the desktop sends it back unchanged. Refusing it
+  // would block every desktop save, so only a version newer than BOTH
+  // this build and the file on disk is refused. (The write keeps the
+  // on-disk version anyway — see `writeUserConfigFileSync`.)
+  const path = getConfig().paths.userConfigFile;
+  const payloadVersion = (parsed as { version?: unknown } | null)?.version;
+  if (typeof payloadVersion === "number") {
+    const accepted = Math.max(
+      USER_CONFIG_VERSION,
+      readUserConfigVersionOnDiskSync(path) ?? USER_CONFIG_VERSION,
+    );
+    if (payloadVersion > accepted) {
+      process.stderr.write(
+        `config set failed: version ${payloadVersion} is newer than this build understands (${accepted})\n`,
+      );
+      return 1;
+    }
+  }
+  const next = parseUserConfigFile(parsed);
+  // ATO-416 compare-and-swap. Checked before the opt-out report too, so
+  // a refused write never sends `analytics_disabled` for a change that
+  // did not happen, and again right before the write, after that report
+  // awaited the network. What is left is the gap between this hash and
+  // the rename inside the write: microseconds, not a read-edit-write.
+  if (expectedSha256 !== null && userConfigFileSha256Sync(path) !== expectedSha256) {
+    return refuseChangedConfig();
+  }
+  await reportIfOptingOut(next.analytics.enabled);
+  if (expectedSha256 !== null && userConfigFileSha256Sync(path) !== expectedSha256) {
+    return refuseChangedConfig();
+  }
+  writeUserConfigFileSync(path, next);
+  resetConfigCache();
+  process.stdout.write(`wrote ${path}\n`);
+  return 0;
+}
+
+/** Nothing written; the client re-reads (`get --with-sha256`) and retries. */
+function refuseChangedConfig(): number {
+  process.stderr.write(`${CONFIG_CHANGED_MESSAGE}\n`);
+  return CONFIG_CHANGED_EXIT_CODE;
+}
+
+async function setOneKey(key: string, value: string): Promise<number> {
+  const leaf = findConfigLeaf(key);
+  if (!leaf) return rejectUnknownKey("set", key);
+  if (isReadOnlyConfigKey(key)) {
+    process.stderr.write(
+      `config set failed: ${key} is managed by the config schema and cannot be set by hand\n`,
+    );
+    return 1;
+  }
+  if (leaf.isArray) {
+    process.stderr.write(
+      `config set failed: ${key} is a list; set it with the whole-file JSON form\n` +
+        `  atomic-agent config set '{"version":${USER_CONFIG_VERSION}, ...}'\n`,
+    );
+    return 1;
+  }
+  const path = getConfig().paths.userConfigFile;
+  const tree = readRawConfigTree(path);
+  // The raw string goes in as-is: `parseUserConfigFile` coerces it to the
+  // declared type ("false" → false, "40" → 40) and enforces bounds and
+  // enums. Guessing the type here would be a second source of truth that
+  // drifts from the schema the moment a field changes type.
+  writeConfigPath(tree, key, value);
+  // Validate first, write second: `parseUserConfigFile` throws on a bad
+  // value, so a rejected `set` leaves the file untouched.
+  const next = parseUserConfigFile(tree);
+  /* ATO-1239: reading a file, a model id this build does not know is set
+     aside (a newer app may have written it); typed here, it is a typo. */
+  if (key === "localModels.managed.modelId" && value.trim() !== "" && value !== "null" && readConfigPath(next, key) === null) {
+    process.stderr.write(`config set failed: ${key}: unknown managed local model id: ${JSON.stringify(value)} (see \`atomic-agent models list\`)\n`);
+    return 1;
+  }
+  if ((key === "localModels.managed.engine" || key === "localModels.managed.backendVariant") && readConfigPath(next, key) !== value) {
+    process.stderr.write(`config set failed: ${key}: ${JSON.stringify(value)} is not a value this build knows\n`);
+    return 1;
+  }
+  // Store the *coerced* value the schema produced ("false" → false,
+  // "40" → 40) rather than the raw string. Both reload identically, since
+  // the schema coerces on every read, but a config file should hold
+  // JSON-typed values — anything else is a surprise to whoever opens it
+  // next. Only this one key is taken from the parse output; the rest of
+  // the tree stays exactly as it was on disk, so the file does not get
+  // expanded with every default (see `writeRawUserConfigFileSync`).
+  writeConfigPath(tree, key, readConfigPath(next, key));
+  await reportIfOptingOut(next.analytics.enabled);
+  writeRawUserConfigFileSync(path, tree);
+  resetConfigCache();
+  process.stdout.write(
+    `${key} = ${formatConfigValue(key, readConfigPath(next, key))}\n`,
+  );
+  return 0;
+}
+
+function handleUnset(args: string[]): number {
+  if (args.length === 0) {
+    process.stderr.write("usage: atomic-agent config unset <key>\n");
+    return 1;
+  }
+  const key = args[0]!;
+  const leaf = findConfigLeaf(key);
+  if (!leaf) return rejectUnknownKey("unset", key);
+  if (isReadOnlyConfigKey(key)) {
+    process.stderr.write(
+      `config unset failed: ${key} is managed by the config schema\n`,
+    );
+    return 1;
+  }
+  const path = getConfig().paths.userConfigFile;
+  const tree = readRawConfigTree(path);
+  deleteConfigPath(tree, key);
+  const next = parseUserConfigFile(tree);
+  writeRawUserConfigFileSync(path, tree);
+  resetConfigCache();
+  process.stdout.write(
+    `${key} → ${formatConfigValue(key, readConfigPath(next, key))} (default)\n`,
+  );
+  return 0;
+}
+
+function handleList(): number {
+  const file = ensureUserConfigFileSync(getConfig().paths.userConfigFile);
+  const rows = listConfigLeaves().map((leaf) => {
+    const actual = readConfigPath(file, leaf.key);
+    const rendered = `${leaf.key} = ${formatConfigValue(leaf.key, actual)}`;
+    const isDefault =
+      JSON.stringify(actual) === JSON.stringify(leaf.defaultValue);
+    return { rendered, isDefault, leaf };
+  });
+  // Align the `(default …)` notes with each other, not with all 139 rows:
+  // padding to the widest key in the whole config would strand the notes
+  // far off to the right of the handful of lines that carry them.
+  const annotated = rows.filter((row) => !row.isDefault);
+  const width = annotated.length
+    ? Math.max(...annotated.map((row) => row.rendered.length))
+    : 0;
+  for (const row of rows) {
+    if (row.isDefault) {
+      process.stdout.write(`${row.rendered}\n`);
+      continue;
+    }
+    const shown = formatConfigValue(row.leaf.key, row.leaf.defaultValue);
+    process.stdout.write(`${row.rendered.padEnd(width)}  (default ${shown})\n`);
+  }
+  return 0;
+}
+
+/**
+ * Send `analytics_disabled` (via `config`) when this write turns analytics
+ * off, BEFORE the file changes — the last event, under the old consent.
+ * Skipped when the desktop app runs this command (`ATOMIC_AGENT_SURFACE=
+ * desktop`): its main process sends its own `analytics_disabled`.
+ */
+async function reportIfOptingOut(nextEnabled: boolean): Promise<void> {
+  const config = getConfig();
+  if (!config.analytics.enabled || nextEnabled) return;
+  if (resolveSurface() === "desktop") return;
+  await reportAnalyticsOptOut({
+    stateDir: config.paths.stateDir,
+    version: getAppVersion(),
+    via: "config",
+  });
+}
+
+/**
+ * Reject a key the schema does not define.
+ *
+ * This check is the whole reason `set` does not simply hand the tree to
+ * the schema: `parseUserConfigFile` *ignores* unknown keys, so a typo
+ * would validate, write a file without the setting, and report success.
+ */
+function rejectUnknownKey(sub: string, key: string): number {
+  const suggestion = suggestConfigKey(key);
+  const hint = suggestion ? ` (did you mean ${suggestion}?)` : "";
+  process.stderr.write(`config ${sub} failed: unknown key ${key}${hint}\n`);
+  process.stderr.write("run `atomic-agent config list` to see every key\n");
+  return 1;
+}

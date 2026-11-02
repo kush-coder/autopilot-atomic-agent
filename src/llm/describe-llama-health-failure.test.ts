@@ -1,0 +1,172 @@
+import { describe, expect, it } from "vitest";
+import {
+  describeLlamaHealthFailure,
+  looksLikeOllamaUrl,
+  managedPortsOf,
+} from "./describe-llama-health-failure.js";
+import type { HealthResult } from "./llama-server-health.js";
+
+function result(partial: Partial<HealthResult>): HealthResult {
+  return {
+    reachable: false,
+    status: null,
+    kind: "unknown",
+    error: null,
+    latencyMs: 0,
+    ...partial,
+  };
+}
+
+describe("describeLlamaHealthFailure", () => {
+  it("steers an openai-compatible server to the cloud provider flow", () => {
+    const line = describeLlamaHealthFailure(
+      result({ kind: "openai-compat", status: 404, error: "http 404" }),
+      "http://127.0.0.1:1234",
+    );
+    expect(line).toContain("OpenAI-compatible");
+    expect(line).toContain("openai-compatible, base URL http://127.0.0.1:1234");
+  });
+
+  it("names Ollama outright when the openai-compat server sits on :11434", () => {
+    // The most common shape of this verdict by far: the External URL
+    // pointed at `ollama serve`. "openai-compatible" alone did not tell
+    // an Ollama user the message was about them.
+    const line = describeLlamaHealthFailure(
+      result({ kind: "openai-compat", status: 404, error: "http 404" }),
+      "http://127.0.0.1:11434",
+    );
+    expect(line).toContain("answers like Ollama");
+    expect(line).toContain("Ollama (local), base URL http://127.0.0.1:11434");
+  });
+
+  it("routes a remote Ollama through the manual compat row, keeping its host", () => {
+    // The "Ollama (local)" preset row never shows a base-URL screen —
+    // followed by hand it saves the preset's own localhost:11434 — so
+    // for a remote host the instruction must go through the manual
+    // openai-compatible row, which asks for the URL.
+    const line = describeLlamaHealthFailure(
+      result({ kind: "openai-compat", status: 404, error: "http 404" }),
+      "http://192.168.1.50:11434",
+    );
+    expect(line).toContain("answers like Ollama");
+    expect(line).toContain(
+      "openai-compatible, base URL http://192.168.1.50:11434",
+    );
+    expect(line).not.toContain("Ollama (local)");
+  });
+
+  it("names the Atomic Chat preset for a local server on :1337", () => {
+    const line = describeLlamaHealthFailure(
+      result({ kind: "openai-compat", status: 404, error: "http 404" }),
+      "http://127.0.0.1:1337",
+    );
+    expect(line).toContain("Atomic Chat (local), base URL http://127.0.0.1:1337");
+  });
+
+  it("keeps a remote :1337 server on the manual compat row", () => {
+    // The preset row saves its own 127.0.0.1:1337, so a LAN host must go
+    // through the row that asks for the URL.
+    const line = describeLlamaHealthFailure(
+      result({ kind: "openai-compat", status: 404, error: "http 404" }),
+      "http://192.168.1.50:1337",
+    );
+    expect(line).toContain("openai-compatible, base URL http://192.168.1.50:1337");
+    expect(line).not.toContain("Atomic Chat (local)");
+  });
+
+  it("says wait, not reconfigure, while the model is loading", () => {
+    const line = describeLlamaHealthFailure(
+      result({ kind: "llama-loading", status: 503 }),
+      "http://127.0.0.1:8080",
+    );
+    expect(line).toContain("still loading");
+  });
+
+  it("names the key env var for a --api-key server", () => {
+    const line = describeLlamaHealthFailure(
+      result({
+        kind: "llama-auth",
+        status: 401,
+        error: "http 401 — the server requires an API key (--api-key)",
+      }),
+      "http://127.0.0.1:8080",
+    );
+    expect(line).toContain("ATOMIC_AGENT_LLAMA_API_KEY");
+    expect(line).toContain("llama-server.key");
+    expect(line).toContain("http 401");
+  });
+
+  it("tells a 401 from our own engine to use Local models, not to set a key", () => {
+    const auth = result({
+      kind: "llama-auth",
+      status: 401,
+      error: "http 401 — the server requires an API key (--api-key)",
+    });
+    const line = describeLlamaHealthFailure(auth, "http://127.0.0.1:19091", [19091, 19092]);
+    expect(line).toContain("http 401");
+    expect(line).toContain("Local models");
+    expect(line).toContain("restart the app");
+    expect(line).not.toContain("llama-server.key");
+    expect(line).not.toContain("ATOMIC_AGENT_LLAMA_API_KEY");
+    expect(line).not.toContain("--api-key");
+    expect(line).not.toContain("—");
+  });
+
+  it("keeps the key advice for a server on another port or host", () => {
+    const auth = result({ kind: "llama-auth", status: 401, error: "http 401" });
+    for (const url of ["http://127.0.0.1:8080", "http://192.168.1.5:19091"]) {
+      const line = describeLlamaHealthFailure(auth, url, [19091]);
+      expect(line).toContain("ATOMIC_AGENT_LLAMA_API_KEY");
+      expect(line).toContain("llama-server.key");
+    }
+  });
+
+  it("reads the managed ports off localModels", () => {
+    expect(managedPortsOf({ managed: { port: 19091 }, embeddings: { port: 19092 } })).toEqual([
+      19091, 19092,
+    ]);
+    expect(managedPortsOf({})).toEqual([]);
+  });
+
+  it("names both default ports when nothing answers on a local default port", () => {
+    const refused = result({ kind: "unknown", error: "fetch failed" });
+    for (const url of ["http://127.0.0.1:8080", "http://127.0.0.1:9931"]) {
+      expect(describeLlamaHealthFailure(refused, url)).toBe(
+        `local-llm /health failed at ${url}: fetch failed. ` +
+          "A current llama-server listens on port 9931 by default. " +
+          "Older builds and the Docker images use 8080.",
+      );
+    }
+  });
+
+  it("leaves the port note off when the server did answer", () => {
+    const line = describeLlamaHealthFailure(
+      result({ kind: "unknown", status: 500, error: "http 500" }),
+      "http://127.0.0.1:9931",
+    );
+    expect(line).toBe("local-llm /health failed at http://127.0.0.1:9931: http 500");
+  });
+
+  it("falls back to the raw error with the probed URL", () => {
+    const line = describeLlamaHealthFailure(
+      result({ kind: "unknown", error: "fetch failed" }),
+      "http://10.0.0.7:8080",
+    );
+    expect(line).toBe(
+      "local-llm /health failed at http://10.0.0.7:8080: fetch failed",
+    );
+  });
+});
+
+describe("looksLikeOllamaUrl", () => {
+  it("recognizes Ollama's default port on any host", () => {
+    expect(looksLikeOllamaUrl("http://127.0.0.1:11434")).toBe(true);
+    expect(looksLikeOllamaUrl("http://192.168.1.50:11434")).toBe(true);
+  });
+
+  it("rejects other ports and unparseable URLs", () => {
+    expect(looksLikeOllamaUrl("http://127.0.0.1:1234")).toBe(false);
+    expect(looksLikeOllamaUrl("http://127.0.0.1:8080")).toBe(false);
+    expect(looksLikeOllamaUrl("not a url")).toBe(false);
+  });
+});

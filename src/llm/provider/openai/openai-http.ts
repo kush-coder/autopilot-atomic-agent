@@ -1,0 +1,1093 @@
+import { isAsciiOnly } from "./ascii-header-guard.js";
+import { buildOpenAiAuthHeaders } from "./openai-auth-headers.js";
+import { readErrnoCode } from "../../errno-code.js";
+import { providerServiceName } from "../provider-service-name.js";
+import { isLocalProviderUrl } from "../presets/is-local-provider-url.js";
+import {
+  creditLimitRetryContext,
+  creditLimitRetryMessage,
+  planCreditLimitRetry,
+  type CreditLimitLogger,
+  type CreditLimitRetryPlan,
+} from "./plan-credit-limit-retry.js";
+import {
+  CREDENTIAL_WORDING,
+  MODERATION_WORDING,
+  parseProviderErrorBody,
+  readProviderErrorReason,
+  type ProviderErrorBody,
+} from "./parse-provider-error-body.js";
+import {
+  LOCAL_BAD_REQUEST_ADVICE,
+  LOCAL_BAD_REQUEST_SENTENCE,
+  localBadRequestKind,
+} from "./local-bad-request.js";
+
+export type OpenAiHttpDeps = {
+  baseUrl: string;
+  apiKey: string;
+  extraHeaders: Record<string, string>;
+  /**
+   * Header that carries the API key when the service does not accept
+   * `Authorization: Bearer` (Anthropic wants `x-api-key`). Absent keeps
+   * the OpenAI convention. See `openai-auth-headers.ts`.
+   */
+  apiKeyHeader?: string;
+  requestTimeoutMs: number;
+  fetchImpl: typeof fetch;
+  /** Provider id shown in user-facing failure messages ("openrouter"). */
+  label: string;
+  /**
+   * Where the credit-limit retry announces itself. Absent falls back to a
+   * stderr line — this recovery changes what was sent and why, so it must
+   * never be silent, even for a provider constructed without a logger.
+   */
+  logger?: CreditLimitLogger;
+};
+
+/**
+ * A key problem the request itself shows, without asking the provider:
+ *
+ *  - `non_ascii`: the key has a character no API key has (a letter from
+ *    another keyboard layout, a typographic quote picked up while
+ *    pasting). It cannot go in a header, so nothing was sent; the 401 is
+ *    ours, built in `openAiFetch`.
+ *  - `missing`: no key was set, so the request went out without one, and
+ *    the service answered 401/403.
+ */
+export type OpenAiKeyProblem = "non_ascii" | "missing";
+
+/**
+ * Typed failure for the OpenAI-compatible HTTP path, mirroring
+ * `LlamaServerError` so the reliability classifier can tell provider
+ * failures apart from our own tool bugs (which is where untyped cloud
+ * errors used to land).
+ *
+ *  - HTTP error responses carry `status` plus a bounded body preview.
+ *  - Network-level failures (fetch threw) carry `status === null`.
+ *  - `timedOut` marks our *own* `requestTimeoutMs` controller firing, as
+ *    opposed to the transport failing or the caller cancelling. Both
+ *    surface as aborts, but a timeout is "the provider is slower than
+ *    the budget" — replaying it just burns another full timeout.
+ *  - `retryAfterMs` is populated from a `retry-after` header when the
+ *    provider sent one (429/503), falling back to structured
+ *    `RetryInfo` metadata in the error body, so the retry loop can
+ *    honor the provider's cooldown either way.
+ */
+export class OpenAiHttpError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number | null,
+    public readonly url: string,
+    public readonly timedOut = false,
+    public readonly retryAfterMs: number | null = null,
+    /** Provider id for user-facing wording; falls back to the host. */
+    public readonly providerLabel = "",
+    /**
+     * Errno of the underlying failure (`ECONNREFUSED`, `ENOTFOUND`,
+     * `UND_ERR_*`, …) when the transport left one behind. A cloud
+     * provider that is unreachable and one that refused the request
+     * both arrive with `status === null`; this is what tells them
+     * apart in a postmortem.
+     */
+    public readonly code: string | undefined = undefined,
+    options?: {
+      cause?: unknown;
+      body?: ProviderErrorBody;
+      generationId?: string;
+      streamError?: string;
+      keyProblem?: OpenAiKeyProblem;
+    },
+  ) {
+    super(message);
+    this.name = "OpenAiHttpError";
+    if (options?.cause !== undefined) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
+    if (options?.body !== undefined) this.body = options.body;
+    if (options?.generationId !== undefined) {
+      this.generationId = options.generationId;
+    }
+    if (options?.streamError !== undefined) {
+      this.streamError = options.streamError;
+    }
+    if (options?.keyProblem !== undefined) {
+      this.keyProblem = options.keyProblem;
+    }
+  }
+
+  /**
+   * What is wrong with the key itself, when the request shows it, for a
+   * 401 the provider did not get to judge on the merits. Absent on every
+   * other error, a 401 for a key that was sent included: that one the
+   * provider refused, and only it knows why.
+   */
+  readonly keyProblem?: OpenAiKeyProblem;
+
+  /**
+   * The error body read for its reason (`parseProviderErrorBody`):
+   * exhausted credit and cooldown hints live there, not in the status.
+   * Absent on network failures and on errors built without a body.
+   */
+  readonly body?: ProviderErrorBody;
+
+  /**
+   * The SSE generation id (`id` on the chunks) of a stream that failed
+   * after it had started — a 504 after 10,000 streamed tokens is still
+   * billed, and the id is what recovers the cost from the provider.
+   */
+  readonly generationId?: string;
+
+  /**
+   * The provider's own words when it reported the failure INSIDE a
+   * stream that had opened with a 200 (an SSE `error` event, or a reply
+   * it ended with an error finish reason). Present only then. Nothing
+   * was retried at the HTTP layer for such a failure, and `status` is
+   * whatever the event carried, not a response status — the wording has
+   * to say so rather than borrow the "server trouble, tried N times"
+   * sentence of a 5xx on the open.
+   */
+  readonly streamError?: string;
+}
+
+/**
+ * The message a stream carries when the provider ended its reply with
+ * `finish_reason: "error"` rather than sending an error object. The
+ * status such a failure is typed with is the stream consumer's choice
+ * (it has to pick one for the loop to park on), never something the
+ * provider answered, so it must not be shown to anyone.
+ */
+const ERROR_FINISH_MESSAGE =
+  /\bended (?:the|its) (?:completion|reply) with an error\b/i;
+
+export function isErrorFinishMessage(message: string): boolean {
+  return ERROR_FINISH_MESSAGE.test(message);
+}
+
+/** `MALFORMED_FUNCTION_CALL` out of `… with an error (MALFORMED_FUNCTION_CALL)`. */
+function errorFinishDetail(message: string): string | null {
+  const match = /\(([A-Za-z0-9_.:-]{1,64})\)\s*$/.exec(message.trim());
+  return match ? match[1]! : null;
+}
+
+/**
+ * Turn a typed cloud failure into the sentence a user should read in
+ * chat: who failed, what happened, what to do about it. The raw
+ * technical message stays on the error itself for logs. Wording follows
+ * "provider + condition + remedy"; the retry count is only claimed for
+ * classes the client actually retries.
+ */
+export function humanizeOpenAiHttpError(err: OpenAiHttpError): string {
+  const who = `"${err.providerLabel || hostOf(err.url)}"`;
+  if (err.timedOut) {
+    return `${who} took too long to answer and the request was stopped.`;
+  }
+  if (err.streamError !== undefined) {
+    // Reported inside a 200 stream: one attempt, no response status.
+    if (isErrorFinishMessage(err.streamError)) {
+      const detail = errorFinishDetail(err.streamError);
+      return `${who} ended its reply with an error${detail === null ? "" : ` (${detail})`} — this is on the provider, not your setup.`;
+    }
+    const code = err.status === null ? "" : ` (${err.status})`;
+    return `${who} reported an error in the middle of its reply${code}: ${err.streamError}`;
+  }
+  if (err.status === null) {
+    return (
+      `Can't reach ${who} — no response from ${hostOf(err.url)}. ` +
+      `Tried ${OPENAI_MAX_ATTEMPTS} times. Check the provider URL or your connection.`
+    );
+  }
+  if (err.keyProblem === "non_ascii") {
+    // Nothing was sent, so nothing was "rejected": say what is wrong with
+    // the key instead of quoting a status the provider never answered.
+    return `${who} can't use its API key: the key has a character API keys never contain (often a letter or quote picked up while pasting), so it was not sent. Re-enter the key in the Providers panel.`;
+  }
+  if (err.keyProblem === "missing") {
+    return `${who} needs an API key and none is set. Add the key in the Providers panel.`;
+  }
+  if ((err.status === 403 || err.status === 429) && isCreditExhausted(err)) {
+    return billingRefusalSentence(err);
+  }
+  if (err.status === 403 && isModerationRefusal(err)) {
+    // OpenRouter's 403 for input its moderation flagged read "rejected
+    // the API key", and sent the operator to a key that was fine. Say
+    // what it is, in the provider's own words.
+    const own = providerReason(err);
+    return `${who} refused the request (403): its moderation flagged the input, the key is fine.${own ? ` ${own}` : ""}`;
+  }
+  if (err.status === 401 || err.status === 403) {
+    return `${who} rejected the API key (${err.status}). Check the key in the Providers panel.`;
+  }
+  if ((err.status === 404 || err.status === 405) && isLocalProviderUrl(err.url)) {
+    return localServerNotFoundSentence(err.url, err.status);
+  }
+  if (err.status === 404) {
+    return `${who} answered 404 (not found). The model id or the base URL is likely wrong.`;
+  }
+  if (err.status === 402) {
+    /* Reached only after the credit-limit retry declined or failed, so the
+       ceiling is not the fixable part any more — say what is.
+
+       And say what the PROVIDER said, when it said anything. Two branches
+       met here in the desktop merge: one explaining the mechanism (the
+       service reserves the whole output ceiling against your balance), one
+       insisting that a 402 must not throw away the provider's own sentence,
+       because OpenRouter's reads "This request requires more credits, or
+       fewer max_tokens. You requested up to 8192 tokens, but can only afford
+       7181" — an instruction with the actual numbers in it. Neither is worth
+       losing, so a 402 carries both when the body has something to carry. */
+    const own = providerReason(err);
+    const mechanism =
+      `Top up the account, or lower localModels.completionMaxTokens: ` +
+      `the service reserves the whole output ceiling against your balance.`;
+    return own
+      ? `${who} rejected the request (402). ${own} ${mechanism}`
+      : `${who} rejected the request (402). ${mechanism}`;
+  }
+  if (err.status === 429) {
+    return `${who} is rate-limiting this key (429). Tried ${OPENAI_MAX_ATTEMPTS} times — wait a minute and retry.`;
+  }
+  if (err.status >= 500) {
+    return `${who} is having server trouble (${err.status}). Tried ${OPENAI_MAX_ATTEMPTS} times — this is on the provider, not your setup.`;
+  }
+  if (err.status === 400 && isLocalProviderUrl(err.url)) {
+    const sentence = localBadRequestSentence(err);
+    if (sentence !== null) return sentence;
+  }
+  // Everything else — 400 bad request, 413, 422 — has no wording of its own
+  // here, and a bare "rejected the request (400)" throws away the only
+  // sentence that could have helped. The
+  // provider already said what was wrong and what to do about it:
+  // OpenRouter's 402 reads "This request requires more credits, or fewer
+  // max_tokens. You requested up to 8192 tokens, but can only afford
+  // 7181", which is an instruction, not a status code. Pass it on.
+  const reason = providerReason(err);
+  return reason
+    ? `${who} rejected the request (${err.status}). ${reason}`
+    : `${who} rejected the request (${err.status}).`;
+}
+
+/**
+ * Which program a local OpenAI-compatible server usually is, by its
+ * default port: Atomic Chat's Local API Server on 1337, Ollama on 11434
+ * (the same port rule as `looksLikeAtomicChatUrl` / `looksLikeOllamaUrl`
+ * in `describe-llama-health-failure.ts`, kept inline so the provider
+ * path does not load the local-engine modules). Null for any other port.
+ */
+function localServerProgram(url: string): string | null {
+  let port: string;
+  try {
+    port = new URL(url).port;
+  } catch {
+    return null;
+  }
+  if (port === "1337") return "Atomic Chat";
+  if (port === "11434") return "Ollama";
+  return null;
+}
+
+/**
+ * A 404 or 405 from a server on this machine (ATO-871). A local server
+ * has no account and no model catalogue to get wrong the way a cloud one
+ * does: the reply means the model is not loaded there, or the base URL
+ * points past its API. Keeps "answered 404" / "answered 405" so the
+ * desktop still reads it as the provider having replied.
+ */
+function localServerNotFoundSentence(url: string, status: 404 | 405): string {
+  const program = localServerProgram(url);
+  const server = program === null ? "The local server" : `The local ${program} server`;
+  const remedy = program === null ? "Load the model in that server" : `Load the model in ${program}`;
+  return (
+    `${server} at ${hostOf(url)} answered ${status}: the model is not loaded there, ` +
+    `or this address is not its API. ${remedy}, or check the base URL.`
+  );
+}
+
+/**
+ * A 400 from a server on this machine whose body says why (ATO-707,
+ * ATO-737): the conversation outgrew the context window, or the server
+ * would not accept something in the request. Plain words and what to
+ * do, instead of "rejected the request (400)". Keeps "(400)" so the
+ * desktop still reads it as the provider having replied. A context
+ * overflow leaves the server's own words out: the agent loop appends
+ * the size excerpt for that one (`isRequestSizeRejection`). Null for a
+ * 400 whose body names neither reason.
+ */
+function localBadRequestSentence(err: OpenAiHttpError): string | null {
+  const raw = err.message.replace(/^openai provider \d+:\s*/, "");
+  const type = err.body?.type ?? parseProviderErrorBody(raw).type;
+  const kind = localBadRequestKind(err.status, type, err.body?.text ?? raw);
+  if (kind === null) return null;
+  const program = localServerProgram(err.url);
+  const server = program === null ? "The local server" : `The local ${program} server`;
+  const head =
+    `${server} at ${hostOf(err.url)} turned the request down (400). ` +
+    `${LOCAL_BAD_REQUEST_SENTENCE[kind]} ${LOCAL_BAD_REQUEST_ADVICE[kind]}`;
+  if (kind === "context_exceeded") return head;
+  const own = providerReason(err);
+  return own ? `${head} The server said: ${own}` : head;
+}
+
+/**
+ * A 403 whose provider says its moderation refused the input, and says
+ * nothing about the key: a plain 403 is still read as the key's, and a
+ * 401 is never a moderation refusal.
+ */
+export function isModerationRefusal(err: OpenAiHttpError): boolean {
+  if (err.status !== 403) return false;
+  const text = `${err.body?.text ?? ""}\n${err.message}`;
+  return MODERATION_WORDING.test(text) && !CREDENTIAL_WORDING.test(text);
+}
+
+/**
+ * A 403 or 429 that refused because the account cannot pay
+ * (`isCreditExhausted`): the provider by its name, its own first
+ * sentence, and what helps. Item 40: AI/ML API's 403 "You've run out of
+ * funds" read "rejected the API key (403)", and OpenAI's 429
+ * `insufficient_quota` read as rate limiting ("Tried 3 times") for a
+ * request that was never retried. A 402 keeps its own wording below,
+ * which also explains the reservation.
+ *
+ * OpenRouter relays an upstream vendor's refusal (a key of your own at
+ * Anthropic, say) as "Provider returned error", with the vendor's body in
+ * `metadata.raw`: the vendor's words are the ones quoted, and the
+ * account to top up is the vendor's.
+ */
+function billingRefusalSentence(err: OpenAiHttpError): string {
+  const who = err.providerLabel
+    ? providerServiceName(err.providerLabel)
+    : `"${hostOf(err.url)}"`;
+  const relayed = err.body?.upstreamMessage;
+  const vendor = relayed !== undefined ? err.body?.upstream : undefined;
+  // The parsed body first: it was read whole, the message keeps only its head.
+  const own = shortProviderSentence(
+    relayed ?? err.body?.message ?? providerReason(err),
+  );
+  const said = own
+    ? `${lowerFirst(own)}${own.endsWith("…") ? "" : "."}`
+    : `the account has no funds or credit left (${err.status}).`;
+  const payer =
+    vendor ?? (relayed !== undefined ? `the provider behind ${who}` : who);
+  return (
+    `${who} refused the request: ${vendor !== undefined ? `${vendor} says ` : ""}${said} ` +
+    `Top up your balance with ${payer} or pick another provider in the Providers panel.`
+  );
+}
+
+/** Longest provider sentence a billing refusal quotes. */
+const BILLING_SENTENCE_MAX_LEN = 140;
+
+/**
+ * The provider's first sentence, with every link cut to its domain:
+ * "You've run out of funds. Please top up …: https://aimlapi.com/app/…"
+ * is "You've run out of funds". The rest is the remedy the sentence
+ * around it already gives.
+ */
+function shortProviderSentence(text: string): string {
+  const flat = text
+    .replace(/\bhttps?:\/\/(?:www\.)?([^\s/?#"'<>)]+)[^\s"'<>)]*/gi, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  const first = /^(.+?[.!?])(?=\s|$)/.exec(flat)?.[1] ?? flat;
+  const bare = first.replace(/[\s.!?:;,]+$/, "");
+  return bare.length > BILLING_SENTENCE_MAX_LEN
+    ? `${bare.slice(0, BILLING_SENTENCE_MAX_LEN - 1).trimEnd()}…`
+    : bare;
+}
+
+/** "You've run out" → "you've run out"; an acronym ("API …") stays as it is. */
+function lowerFirst(text: string): string {
+  return /^[A-Z][a-z']/.test(text) ? text[0]!.toLowerCase() + text.slice(1) : text;
+}
+
+/**
+ * The provider's own explanation, dug out of the body `httpErrorFromResponse`
+ * folded into the message as `openai provider <status>: <body>`.
+ */
+function providerReason(err: OpenAiHttpError): string {
+  return providerErrorSentence(
+    err.message.replace(/^openai provider \d+:\s*/, ""),
+  );
+}
+
+/**
+ * The provider's own sentence out of an error body. Exported for the
+ * model-list fetchers, whose refusals had only a status to show.
+ *
+ * OpenAI-compatible errors are `{"error": {"message": …}}`; a few
+ * providers send `{"message": …}` or `{"error": "…"}`, Google's
+ * OpenAI-compatible surface wraps the object in an array
+ * (`[{"error": {…}}]`), and some send plain text. Anything unrecognisable
+ * is passed through as trimmed text rather than dropped — an unhelpful
+ * sentence is still better evidence than a status code alone. Bounded so
+ * a provider that echoes the whole request cannot flood a chat row.
+ */
+export function providerErrorSentence(raw: string): string {
+  const body = raw.trim();
+  if (!body) return "";
+  let text: string;
+  try {
+    // Structured body: the message is the only part worth reading out
+    // loud. If it parsed but carries no message (`{}`, an empty error
+    // object), say nothing rather than reading braces at the operator.
+    text = messageFromErrorJson(JSON.parse(body));
+  } catch {
+    // Not parseable — which is the NORMAL case for a long error, because
+    // `httpErrorFromResponse` folds only the first
+    // `OPENAI_ERROR_DETAIL_MAX_LEN` characters of the body into the
+    // message and a cut-off JSON object no longer parses. OpenRouter's
+    // 402 is exactly that shape, so relying on `JSON.parse` alone read
+    // the operator a wall of braces. Lift the first `"message"` out by
+    // hand; failing that, the raw text is still better than nothing.
+    text = messageFromTruncatedJson(body) || body;
+  }
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  return flat.length > OPENAI_REASON_MAX_LEN
+    ? `${flat.slice(0, OPENAI_REASON_MAX_LEN)}…`
+    : flat;
+}
+
+function messageFromErrorJson(parsed: unknown): string {
+  // Google's array form: the first element that says something. Read as
+  // an object it had no message, and "Please pass a valid API key" was
+  // dropped from a Gemini refusal.
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      const message = messageFromErrorJson(item);
+      if (message) return message;
+    }
+    return "";
+  }
+  if (!parsed || typeof parsed !== "object") return "";
+  const root = parsed as { error?: unknown; message?: unknown };
+  if (typeof root.message === "string" && root.message.trim()) {
+    return root.message;
+  }
+  if (typeof root.error === "string" && root.error.trim()) return root.error;
+  if (root.error && typeof root.error === "object") {
+    const inner = root.error as { message?: unknown };
+    if (typeof inner.message === "string" && inner.message.trim()) {
+      return inner.message;
+    }
+  }
+  return "";
+}
+
+/**
+ * The first `"message": "…"` in a body that did not survive truncation.
+ * Matched against the raw text (escapes intact) and unescaped through
+ * `JSON.parse` so `\"` and `\n` come back as themselves; a value that was
+ * itself cut in half simply does not match, and the caller falls back.
+ */
+function messageFromTruncatedJson(body: string): string {
+  const m = /"message"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(body);
+  if (!m || !m[1]) return "";
+  try {
+    const value: unknown = JSON.parse(`"${m[1]}"`);
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
+  }
+}
+
+/** Cap on the provider sentence folded into a chat message. */
+const OPENAI_REASON_MAX_LEN = 220;
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/** Cap on how much of an error body we fold into the message. */
+const OPENAI_ERROR_DETAIL_MAX_LEN = 300;
+
+/**
+ * Bounded retry budget for transient failures, mirroring the llama
+ * client's defaults (`localModels.completionRetries` = 3, 150ms base).
+ * Deliberately not config-driven yet: the knob can follow once the
+ * fallback work settles where such settings live for cloud providers.
+ *
+ * Exported because it is the budget for *one* streaming completion, not
+ * just for one HTTP call: `OpenAiProvider.completeStream` reopens a
+ * stream that died before its first chunk, and that reopen comes out of
+ * this same budget — see `OpenAiAttemptBudget`, which is what actually
+ * makes the sharing true rather than merely intended.
+ */
+export const OPENAI_MAX_ATTEMPTS = 3;
+
+/**
+ * The remaining attempts of ONE logical completion, carried across the
+ * calls that make it up.
+ *
+ * Without this, "shared budget" is a sentence in a comment and nothing
+ * else: every `openAiStartStream` call opens a fresh `runOpenAiWithRetry`
+ * loop with a fresh count, so a `completeStream` that reopens a dead
+ * stream three times, each reopen paying for two 500s first, issues
+ * 3 x 3 = 9 requests for one turn. That is nine billable prompt
+ * submissions and, on a reasoning model that thinks for a minute before
+ * dropping, minutes of frozen UI.
+ *
+ * The budget is a mutable counter rather than a number passed down and
+ * returned because the spending happens inside the retry loop and has to
+ * stay visible to the caller even when that loop throws.
+ */
+export interface OpenAiAttemptBudget {
+  /** Attempts still available. Decremented once per HTTP request made. */
+  remaining: number;
+}
+
+/** A budget for one logical completion: the full `OPENAI_MAX_ATTEMPTS`. */
+export function createOpenAiAttemptBudget(): OpenAiAttemptBudget {
+  return { remaining: OPENAI_MAX_ATTEMPTS };
+}
+const OPENAI_BACKOFF_BASE_MS = 150;
+/**
+ * Ceiling on how long a provider's `retry-after` can stall one attempt.
+ * Interactive turns cannot absorb a "come back in 60s" wait; a provider
+ * asking for more than this gets the capped wait and then the next
+ * attempt (or the typed error, which the caller can act on).
+ */
+const OPENAI_RETRY_AFTER_CAP_MS = 5_000;
+
+export function buildOpenAiHeaders(
+  deps: OpenAiHttpDeps,
+  stream: boolean,
+): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    accept: stream ? "text/event-stream" : "application/json",
+    // Auth (and any service-mandated static headers) come from the one
+    // builder model discovery also uses, so the two request paths cannot
+    // disagree about how this endpoint is authenticated.
+    ...buildOpenAiAuthHeaders(deps.apiKey, {
+      ...(deps.apiKeyHeader ? { apiKeyHeader: deps.apiKeyHeader } : {}),
+      headers: deps.extraHeaders,
+    }),
+  };
+}
+
+export async function openAiGetJson(
+  deps: OpenAiHttpDeps,
+  path: string,
+): Promise<Record<string, unknown>> {
+  return runOpenAiWithRetry(deps, path, undefined, async () => {
+    const res = await openAiFetch(deps, path, null, {}, false, "GET");
+    if (!res.ok) {
+      throw await httpErrorFromResponse(deps, path, res);
+    }
+    return (await res.json()) as Record<string, unknown>;
+  });
+}
+
+export async function openAiPostJson(
+  deps: OpenAiHttpDeps,
+  path: string,
+  body: Record<string, unknown>,
+  request: { signal?: AbortSignal; requestTimeoutMs?: number },
+  onSend?: OnOpenAiRequestBody,
+): Promise<Record<string, unknown>> {
+  return withCreditLimitRetry(deps, body, onSend, (attemptBody) =>
+    runOpenAiWithRetry(deps, path, request.signal, async () => {
+      const res = await openAiFetch(
+        deps,
+        path,
+        attemptBody,
+        request,
+        false,
+        "POST",
+      );
+      if (!res.ok) {
+        throw await httpErrorFromResponse(deps, path, res);
+      }
+      return readJsonBody(res, request.signal);
+    }),
+  );
+}
+
+/**
+ * Read a unary JSON body without going deaf to the caller's abort.
+ *
+ * `openAiFetch` unlinks the caller's signal the moment `fetch` resolves —
+ * it must, because it also opens streams, whose consumer owns the signal
+ * from then on. For a unary request that left the body read unabortable:
+ * a provider that sends headers first and the completion later kept the
+ * socket, the slot and the bill running after the caller had given up
+ * (a memory sub-call's timeout, a cancelled turn). Cancelling the reader
+ * tears the connection down; the caller gets `signal.reason`, which
+ * classifies `cancelled`.
+ *
+ * `res.json()` cannot be used for this: it locks the body, and cancelling
+ * a locked stream from outside is refused. Without a signal nothing can
+ * cancel the read, so that path keeps `res.json()` exactly as before.
+ */
+async function readJsonBody(
+  res: Response,
+  signal: AbortSignal | undefined,
+): Promise<Record<string, unknown>> {
+  if (!signal || !res.body) return (await res.json()) as Record<string, unknown>;
+  const reader = res.body.getReader();
+  const onAbort = (): void => {
+    reader.cancel(signal.reason).catch(() => undefined);
+  };
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    const chunks: Uint8Array[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    if (signal.aborted) {
+      throw signal.reason ?? new DOMException("aborted", "AbortError");
+    }
+    return JSON.parse(
+      new TextDecoder().decode(Buffer.concat(chunks)),
+    ) as Record<string, unknown>;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * Recover the one HTTP failure that is fixable by changing the request
+ * rather than by waiting or switching providers: a 402 that names how
+ * many output tokens the balance can actually afford.
+ *
+ * This sits **outside** `runOpenAiWithRetry` on purpose. A 402 is
+ * deterministic, so the retry budget correctly refuses to replay it; what
+ * is needed is not another attempt at the same request but a *different*
+ * request. Hence exactly one extra send, with a lowered `max_tokens`, and
+ * no wrapping of that send — a second 402 means the balance genuinely
+ * cannot cover a usable turn, and the operator must see the provider's own
+ * message rather than watch the client whittle the ceiling down in a loop.
+ *
+ * Everything else keeps its existing path: the per-provider retry budget
+ * is untouched, and any failure this declines to handle propagates
+ * unchanged so the fallback chain classifies it exactly as before.
+ */
+/**
+ * Told which body a request is about to go out with. The credit-limit
+ * retry re-sends with a lower `max_tokens`, so the body the caller built
+ * is not necessarily the one that produced the response — and the cap
+ * that response ran under is what a truncation has to be judged against.
+ */
+export type OnOpenAiRequestBody = (body: Record<string, unknown>) => void;
+
+async function withCreditLimitRetry<T>(
+  deps: OpenAiHttpDeps,
+  body: Record<string, unknown>,
+  onSend: OnOpenAiRequestBody | undefined,
+  send: (body: Record<string, unknown>) => Promise<T>,
+): Promise<T> {
+  try {
+    onSend?.(body);
+    return await send(body);
+  } catch (err) {
+    if (!(err instanceof OpenAiHttpError)) throw err;
+    const plan = planCreditLimitRetry(err);
+    if (!plan) throw err;
+    warnCreditLimitRetry(deps, plan);
+    const retryBody = { ...body, max_tokens: plan.retryMaxTokens };
+    onSend?.(retryBody);
+    return await send(retryBody);
+  }
+}
+
+function warnCreditLimitRetry(
+  deps: OpenAiHttpDeps,
+  plan: CreditLimitRetryPlan,
+): void {
+  const message = creditLimitRetryMessage(deps.label, plan);
+  const context = creditLimitRetryContext(deps.label, plan);
+  if (deps.logger) {
+    deps.logger.warn(message, context);
+    return;
+  }
+  process.stderr.write(`[atomic-agent] ${message}\n`);
+}
+
+/**
+ * Open a streaming completion and return the raw `Response` once the
+ * server has answered 2xx with a body. Failures to *open* the stream —
+ * connection errors, 429s, 5xxs — happen entirely inside the retry
+ * loop, before the caller has consumed a single chunk, so retrying here
+ * can never duplicate output. Once this resolves, the stream is live
+ * and failures downstream are not retryable at this layer — the caller
+ * owns that window. `OpenAiProvider.completeStream` extends the same
+ * "nothing emitted yet, so a replay is free" argument a little further
+ * by reopening when the body dies before its first chunk.
+ *
+ * Pass `budget` to make those reopens share one completion's attempts
+ * with the opens: without it each call starts a fresh count and the two
+ * layers multiply instead of adding.
+ */
+export async function openAiStartStream(
+  deps: OpenAiHttpDeps,
+  path: string,
+  body: Record<string, unknown>,
+  request: { signal?: AbortSignal },
+  budget?: OpenAiAttemptBudget,
+  onSend?: OnOpenAiRequestBody,
+): Promise<Response & { body: NonNullable<Response["body"]> }> {
+  // The credit-limit retry wraps the open, not the stream: a 402 is
+  // refused before any bytes exist, so re-sending with a lower ceiling
+  // cannot duplicate output — the same argument the open-retry makes.
+  return withCreditLimitRetry(deps, body, onSend, (attemptBody) =>
+    runOpenAiWithRetry(
+      deps,
+      path,
+      request.signal,
+      async () => {
+        const res = await openAiFetch(
+          deps,
+          path,
+          attemptBody,
+          request,
+          true,
+          "POST",
+        );
+        if (!res.ok || !res.body) {
+          throw await httpErrorFromResponse(deps, path, res);
+        }
+        return res as Response & { body: NonNullable<Response["body"]> };
+      },
+      budget,
+    ),
+  );
+}
+
+/**
+ * Wait exactly as long as `runOpenAiWithRetry` would wait before its
+ * next try — same exponential base, same ±20% jitter, same abort-aware
+ * sleep. Exported so the one retry that lives *outside* this file
+ * (`OpenAiProvider.completeStream` reopening a stream that died before
+ * its first chunk) reuses this client's pacing instead of inventing a
+ * second set of magic numbers. `attemptNumber` is the 1-based count of
+ * requests this completion has already made, so the delay keeps growing
+ * across the open/reopen seam instead of restarting at the base.
+ */
+export async function openAiRetryBackoff(
+  attemptNumber: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  // `null` as the error: a body-read death carries no `retry-after`, so
+  // only the plain backoff applies.
+  await sleep(resolveWaitMs(null, attemptNumber), signal);
+}
+
+export async function openAiFetch(
+  deps: OpenAiHttpDeps,
+  path: string,
+  body: Record<string, unknown> | null,
+  request: { signal?: AbortSignal; requestTimeoutMs?: number },
+  stream: boolean,
+  method: "GET" | "POST" = "POST",
+): Promise<Response> {
+  // Built before the try below, which would wrap the throw as a
+  // retryable "network error" and replace its message with a
+  // connectivity hint. Classified as a 401 instead: a key that cannot
+  // form a header is the same class as a dead key — deterministic, never
+  // retried, and a fallback chain advances past it to a link whose key
+  // may work.
+  let headers: Record<string, string>;
+  try {
+    headers = buildOpenAiHeaders(deps, stream);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new OpenAiHttpError(
+      detail,
+      401,
+      `${deps.baseUrl}${path}`,
+      false,
+      null,
+      deps.label,
+      undefined,
+      isAsciiOnly(deps.apiKey) ? undefined : { keyProblem: "non_ascii" },
+    );
+  }
+  const controller = new AbortController();
+  let timedOut = false;
+  // A caller that owns a longer deadline (context compaction) replaces ours.
+  const timeoutMs = request.requestTimeoutMs ?? deps.requestTimeoutMs;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const externalSignal = request.signal;
+  const onAbort = (): void => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+  try {
+    return await deps.fetchImpl(`${deps.baseUrl}${path}`, {
+      method,
+      headers,
+      ...(body && method === "POST" ? { body: JSON.stringify(body) } : {}),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // Caller cancellation must stay a cancellation — rethrow untouched
+    // so the classifier keeps reporting it as `cancelled`, not as a
+    // provider failure.
+    if (externalSignal?.aborted) throw err;
+    if (timedOut) {
+      throw new OpenAiHttpError(
+        `openai provider timed out after ${timeoutMs}ms: ${deps.baseUrl}${path}`,
+        null,
+        `${deps.baseUrl}${path}`,
+        true,
+        null,
+        deps.label,
+        undefined,
+        { cause: err },
+      );
+    }
+    // fetch threw without an HTTP response: DNS failure, refused
+    // connection, TLS error, socket reset. Which of those it was lives
+    // in the errno — keep it, and the original error with it.
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new OpenAiHttpError(
+      `openai provider network error: ${detail}`,
+      null,
+      `${deps.baseUrl}${path}`,
+      false,
+      null,
+      deps.label,
+      readErrnoCode(err),
+      { cause: err },
+    );
+  } finally {
+    clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function httpErrorFromResponse(
+  deps: OpenAiHttpDeps,
+  path: string,
+  res: Response,
+): Promise<OpenAiHttpError> {
+  const text = await res.text().catch(() => "");
+  // The standard `retry-after` header wins; some providers advertise
+  // their cooldown only inside the error JSON (Gemini's OpenAI-compat
+  // endpoint sends `google.rpc.RetryInfo` and no header), so fall back
+  // to that for the throttling statuses the retry loop honors.
+  const retryAfterMs =
+    parseRetryAfterMs(res.headers.get("retry-after")) ??
+    (res.status === 429 || res.status === 503
+      ? parseRetryInfoDelayMs(text)
+      : null);
+  const keyMissing =
+    (res.status === 401 || res.status === 403) && !sentCredential(deps);
+  return new OpenAiHttpError(
+    `openai provider ${res.status}: ${text.slice(0, OPENAI_ERROR_DETAIL_MAX_LEN)}`,
+    res.status,
+    `${deps.baseUrl}${path}`,
+    false,
+    retryAfterMs,
+    deps.label,
+    undefined,
+    {
+      body: parseProviderErrorBody(text),
+      ...(keyMissing ? { keyProblem: "missing" as const } : {}),
+    },
+  );
+}
+
+/**
+ * Whether the request carried a credential at all: the resolved key, or
+ * a header the entry sets by hand whose name looks like one (`key`,
+ * `auth`, `token`: a proxy's own scheme counts too). Keyless servers send
+ * none on purpose, so this only means something next to a 401/403.
+ */
+function sentCredential(deps: OpenAiHttpDeps): boolean {
+  if ((deps.apiKey ?? "").trim().length > 0) return true;
+  const named = deps.apiKeyHeader?.trim().toLowerCase();
+  return Object.entries(deps.extraHeaders ?? {}).some(([name, value]) => {
+    const lower = name.trim().toLowerCase();
+    return (
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      (/key|auth|token/i.test(lower) || lower === named)
+    );
+  });
+}
+
+/**
+ * Transient failures worth another attempt: network blips (status null,
+ * but never our own timeout — replaying one burns another full budget),
+ * server errors, throttling, and request timeouts the *server* reported.
+ * Auth and request-shape errors (401/403/404/400) are deterministic;
+ * retrying them only delays the real message to the user.
+ */
+function isRetryableOpenAiError(err: unknown): boolean {
+  if (!(err instanceof OpenAiHttpError)) return false;
+  if (err.timedOut) return false;
+  if (err.status === null) return true;
+  // A 429 whose body says the account is out of credit is not
+  // throttling: the same request fails the same way until someone tops
+  // up, and three fast retries only multiply the refusals (42 per
+  // worker, once).
+  if (isCreditExhausted(err)) return false;
+  return err.status >= 500 || err.status === 429 || err.status === 408;
+}
+
+/**
+ * Did the provider refuse because the account cannot pay: a billing
+ * refusal (`readProviderErrorReason`'s `credit_exhausted`), as opposed to
+ * a refused key or a rate limit? Nothing about it changes until someone
+ * tops up, so it is never retried, waited out or read as a key problem.
+ */
+export function isCreditExhausted(err: OpenAiHttpError): boolean {
+  return (
+    readProviderErrorReason({
+      status: err.status,
+      body: err.body,
+      message: err.message,
+      retryAfterMs: err.retryAfterMs,
+    })?.kind === "credit_exhausted"
+  );
+}
+
+/**
+ * Run `attempt` under the bounded retry policy, spending `budget`.
+ *
+ * A caller that does not pass a budget gets a private full one, which is
+ * the historical behaviour and stays right for every one-shot call. The
+ * streaming path passes the completion's budget so its opens and its
+ * reopens draw from one pot.
+ */
+async function runOpenAiWithRetry<T>(
+  deps: OpenAiHttpDeps,
+  path: string,
+  signal: AbortSignal | undefined,
+  attempt: () => Promise<T>,
+  budget: OpenAiAttemptBudget = createOpenAiAttemptBudget(),
+): Promise<T> {
+  if (budget.remaining <= 0) {
+    // Only reachable if a caller keeps using an exhausted budget. Fail
+    // typed rather than falling through to a bare `Error("undefined")`.
+    throw new OpenAiHttpError(
+      `openai provider retry budget exhausted: ${deps.baseUrl}${path}`,
+      null,
+      `${deps.baseUrl}${path}`,
+      false,
+      null,
+      deps.label,
+    );
+  }
+  let lastError: unknown;
+  while (budget.remaining > 0) {
+    if (signal?.aborted) {
+      throw new OpenAiHttpError(
+        "completion aborted by caller",
+        null,
+        `${deps.baseUrl}${path}`,
+      );
+    }
+    budget.remaining -= 1;
+    // 1-based index of the request about to be made *within this
+    // completion*, so the backoff keeps growing across a reopen instead
+    // of resetting to the base delay every time the stream is retried.
+    const attemptNumber = OPENAI_MAX_ATTEMPTS - budget.remaining;
+    try {
+      return await attempt();
+    } catch (err) {
+      lastError = err;
+      // A caller-triggered abort is never retryable, whatever shape it
+      // surfaced as.
+      if (signal?.aborted) throw err;
+      if (!isRetryableOpenAiError(err) || budget.remaining <= 0) throw err;
+      await sleep(resolveWaitMs(err, attemptNumber), signal);
+    }
+  }
+  // Unreachable: the loop either returns or throws.
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * Wait between attempts: exponential backoff with ±20% jitter (matching
+ * the llama client), stretched to a provider-requested `retry-after`
+ * when one was sent — capped so a long server-side cooldown cannot
+ * stall an interactive turn.
+ */
+function resolveWaitMs(err: unknown, attemptNumber: number): number {
+  const exp = OPENAI_BACKOFF_BASE_MS * Math.pow(2, attemptNumber - 1);
+  const jitter = exp * (Math.random() * 0.4 - 0.2);
+  const backoff = Math.max(0, Math.round(exp + jitter));
+  const retryAfter =
+    err instanceof OpenAiHttpError && err.retryAfterMs !== null
+      ? Math.min(err.retryAfterMs, OPENAI_RETRY_AFTER_CAP_MS)
+      : 0;
+  return Math.max(backoff, retryAfter);
+}
+
+/**
+ * Cooldown from structured error JSON, for providers that never send a
+ * `retry-after` header. Gemini answers 429/503 with an
+ * `error.details[]` entry of `@type google.rpc.RetryInfo` whose
+ * `retryDelay` is a protobuf Duration string ("39s", "1.5s"). The
+ * duration grammar admits only non-negative seconds, so anything else —
+ * malformed, negative, non-string — is ignored and the caller keeps the
+ * plain exponential backoff. The result flows through the same
+ * `retryAfterMs` field as the header, so `resolveWaitMs` caps it at
+ * `OPENAI_RETRY_AFTER_CAP_MS` exactly like a header-declared wait.
+ */
+function parseRetryInfoDelayMs(body: string): number | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || !isRecord(parsed.error)) return null;
+  const details = parsed.error.details;
+  if (!Array.isArray(details)) return null;
+  for (const detail of details) {
+    if (!isRecord(detail) || typeof detail.retryDelay !== "string") continue;
+    const match = /^(\d+(?:\.\d+)?)s$/.exec(detail.retryDelay);
+    if (!match) continue;
+    const ms = Math.round(Number(match[1]) * 1000);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseRetryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.round(seconds * 1000);
+  }
+  const date = Date.parse(header);
+  if (!Number.isNaN(date)) {
+    return Math.max(0, date - Date.now());
+  }
+  return null;
+}
+
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}

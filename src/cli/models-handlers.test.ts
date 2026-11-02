@@ -1,0 +1,731 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../local-llm/index.js", async () => {
+  const actual = await vi.importActual<typeof import("../local-llm/index.js")>(
+    "../local-llm/index.js",
+  );
+  return {
+    ...actual,
+    maybeAutoUpdateBackend: vi.fn(),
+    resolveManagedDevice: vi.fn(),
+    startChatAndEmbeddingDaemons: vi.fn(),
+    fallBackToCpuBackend: vi.fn(),
+    startEmbeddingDaemon: vi.fn(),
+    getEmbeddingDaemonStatus: vi.fn(),
+    isEmbeddingModelDownloaded: vi.fn(),
+    holdEmbeddingForLowMemory: vi.fn(async () => ({ ok: true })),
+    stopDaemon: vi.fn(),
+    stopChatAndEmbeddingDaemons: vi.fn(),
+  };
+});
+
+vi.mock("../analytics/index.js", async () => ({
+  ...(await vi.importActual<typeof import("../analytics/index.js")>("../analytics/index.js")),
+  reportLocalEngineFailed: vi.fn(async () => {}),
+}));
+
+import {
+  getUserConfigPath,
+  writeUserConfigFileSync,
+} from "../config/config-file.js";
+import { reportLocalEngineFailed } from "../analytics/index.js";
+import { CORE_FALLBACK_LINE } from "../local-llm/core/core-errors.js";
+import { USER_CONFIG_DEFAULTS } from "../config/config-schema.js";
+import {
+  addCustomModel,
+  getConfig,
+  resetConfigCache,
+} from "../config/index.js";
+import * as localLlm from "../local-llm/index.js";
+import {
+  resetLatestReleaseCache,
+  resolveBackendDir,
+  resolveServerBinPath,
+  WINDOWS_ARM64_NO_BACKEND_MESSAGE,
+} from "../local-llm/index.js";
+import { writeBackendVersion } from "../local-llm/backend/backend-version.js";
+import { DaemonHealthError } from "../local-llm/server/daemon-lifecycle.js";
+import {
+  WINDOWS_BACKEND_ASSETS,
+  setConfiguredBackendVariant,
+} from "../local-llm/backend/windows-backend-variant.js";
+import {
+  runLocalModelsPull,
+  runLocalModelsStart,
+  runLocalModelsStartEmbedding,
+  runLocalModelsStop,
+  runLocalModelsUpdate,
+} from "./models-handlers.js";
+
+const healthError = () =>
+  new DaemonHealthError(
+    "llama-server did not become healthy within 30000ms. Log tail:\n(no log)",
+  );
+
+/**
+ * Integration tests for the CPU-backend fallback retry block inside
+ * `runLocalModelsStart` — the CLI twin of the orchestrator wiring
+ * covered in `local-models-orchestrator-cpu-fallback.test.ts`. The pure
+ * pieces have their own tests; these prove the handler actually
+ * consults them, retries on the CPU device, and persists the variant.
+ */
+describe("runLocalModelsStart CPU-backend fallback", () => {
+  let stateDir: string;
+  let stderrChunks: string[];
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-cpufb-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    // The fallback is Windows-only; the real eligibility gate must see
+    // win32 or these tests would silently assert nothing.
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.spyOn(process, "arch", "get").mockReturnValue("x64");
+    resetConfigCache();
+    setConfiguredBackendVariant("auto");
+    stderrChunks = [];
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    vi.mocked(localLlm.maybeAutoUpdateBackend)
+      .mockReset()
+      .mockResolvedValue({ action: "current", tag: "turboquant-win" });
+    vi.mocked(localLlm.resolveManagedDevice)
+      .mockReset()
+      .mockResolvedValue("Vulkan0");
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockReset();
+    vi.mocked(localLlm.fallBackToCpuBackend)
+      .mockReset()
+      .mockResolvedValue({ tag: "turboquant-win" });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    setConfiguredBackendVariant("auto");
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+
+  it("bypasses the throughput benchmark only for an interactive start", async () => {
+    prepareManagedWindowsInstall();
+    // A failure after receipt is enough to inspect launch policy without a daemon.
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockRejectedValue(new Error("test stop"));
+    await runLocalModelsStart({ interactive: true });
+    expect(vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls[0]![0].chat.throughputProbe).toBe(false);
+    expect(vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls[0]![0].chat.healthTimeoutMs).toBe(120_000);
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockClear();
+    await runLocalModelsStart();
+    expect(vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls[0]![0].chat.throughputProbe).toBeUndefined();
+  });
+  it("starts with a one-off context size without writing it to the config (ATO-334)", async () => {
+    prepareManagedWindowsInstall();
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockRejectedValue(new Error("test stop"));
+    const configured = getConfig().localModels.managed.contextSize;
+    await runLocalModelsStart({ interactive: true, contextSize: 65_536 });
+    expect(vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls[0]![0].chat.contextSize).toBe(65_536);
+    // The next plain start is back on the configured window.
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockClear();
+    await runLocalModelsStart();
+    expect(vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls[0]![0].chat.contextSize).toBe(configured);
+  });
+  it("retries once on the CPU device and persists the variant", async () => {
+    const dataDir = prepareManagedWindowsInstall();
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons)
+      .mockRejectedValueOnce(healthError())
+      .mockResolvedValueOnce({
+        chat: { pid: 777 },
+        embedding: { skipped: true },
+      });
+
+    await expect(runLocalModelsStart()).resolves.toBe(0);
+
+    // The download must carry a deadline and progress — the exact
+    // stalled-open-connection hazard the auto-update path guards.
+    expect(localLlm.fallBackToCpuBackend).toHaveBeenCalledTimes(1);
+    const [calledDataDir, dlOpts] = vi.mocked(localLlm.fallBackToCpuBackend)
+      .mock.calls[0]! as [
+      string,
+      { signal?: AbortSignal; onProgress?: unknown },
+    ];
+    expect(calledDataDir).toBe(dataDir);
+    expect(dlOpts.signal).toBeInstanceOf(AbortSignal);
+    expect(dlOpts.onProgress).toBeTypeOf("function");
+
+    // The GPU device picked against the old binary must not leak into
+    // the retry — the CPU build would reject `--device Vulkan0`.
+    const starts = vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls;
+    expect(starts).toHaveLength(2);
+    expect(starts[0]![0].chat.device).toBe("Vulkan0");
+    expect(starts[1]![0].chat.device).toBe("cpu");
+
+    // Loop-guard against auto-update reinstalling the broken GPU build.
+    expect(getConfig().localModels.managed.backendVariant).toBe("cpu");
+    const stderr = stderrChunks.join("");
+    expect(stderr).toContain("falling back to the CPU build");
+    expect(stderr).toContain('recorded backendVariant "cpu"');
+  });
+
+  it("says once that the memory model was held back for low memory (ATO-379)", async () => {
+    prepareManagedWindowsInstall();
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockResolvedValueOnce({
+      chat: { pid: 777 },
+      embedding: { skipped: true, lowMemory: true },
+    } as never);
+
+    await expect(runLocalModelsStart()).resolves.toBe(0);
+
+    const stdout = vi.mocked(process.stdout.write).mock.calls.map(([chunk]) => String(chunk)).join("");
+    expect(stdout.match(/^embedding: skipped \(low memory\) — Low memory: memory search uses keywords only\.$/gm)).toHaveLength(1);
+  });
+
+  it("does not fall back on a pre-spawn failure", async () => {
+    prepareManagedWindowsInstall();
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockRejectedValue(
+      new Error("model qwen not downloaded"),
+    );
+
+    await expect(runLocalModelsStart()).resolves.toBe(1);
+
+    expect(localLlm.fallBackToCpuBackend).not.toHaveBeenCalled();
+    expect(localLlm.startChatAndEmbeddingDaemons).toHaveBeenCalledTimes(1);
+    expect(getConfig().localModels.managed.backendVariant).toBe("auto");
+    expect(stderrChunks.join("")).toContain("model qwen not downloaded");
+  });
+
+  it("surfaces a failed CPU download and exits non-zero", async () => {
+    prepareManagedWindowsInstall();
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockRejectedValue(
+      healthError(),
+    );
+    vi.mocked(localLlm.fallBackToCpuBackend).mockRejectedValue(
+      new Error("HTTP 503"),
+    );
+
+    await expect(runLocalModelsStart()).resolves.toBe(1);
+
+    expect(localLlm.startChatAndEmbeddingDaemons).toHaveBeenCalledTimes(1);
+    expect(stderrChunks.join("")).toContain("HTTP 503");
+  });
+
+  /**
+   * Managed mode over a stub Windows GPU install, so the real
+   * `shouldFallBackToCpuBackend` sees an eligible machine: win32,
+   * variant `auto`, a GPU asset recorded in backend-version.json.
+   */
+  function prepareManagedWindowsInstall(): string {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        mode: "managed",
+        managed: {
+          ...USER_CONFIG_DEFAULTS.localModels.managed,
+          // These tests cover the llama.cpp engine; Atomic Core is the default since config v77.
+          engine: "llama-server",
+          modelId: "qwen-3.5-4b",
+        },
+      },
+    });
+    resetConfigCache();
+    const dataDir = getConfig().paths.localModelsDataDir;
+    mkdirSync(resolveBackendDir(dataDir), { recursive: true });
+    writeBackendVersion(dataDir, {
+      tag: "turboquant-win",
+      downloadedAt: "2026-06-02T00:00:00.000Z",
+      asset: WINDOWS_BACKEND_ASSETS.vulkan,
+      releasedAt: "2026-06-01T00:00:00Z",
+    });
+    return dataDir;
+  }
+});
+
+/**
+ * The foreground `models pull --mmproj` mirrors the background worker:
+ * a projector the repo stopped serving must not read as a failed pull
+ * once the weights are saved.
+ */
+describe("runLocalModelsPull — projector failure after the weights", () => {
+  let stateDir: string;
+  let stdoutChunks: string[];
+  let stderrChunks: string[];
+  let previousFetch: typeof fetch;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-pull-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+    stdoutChunks = [];
+    stderrChunks = [];
+    previousFetch = globalThis.fetch;
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    globalThis.fetch = previousFetch;
+    vi.restoreAllMocks();
+    rmSync(stateDir, { recursive: true, force: true });
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+  });
+
+  it("saves the weights, notes the projector failure and exits 0", async () => {
+    globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.includes("mmproj")) {
+        return new Response(null, { status: 404, statusText: "Not Found" });
+      }
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.enqueue(Buffer.from("gguf"));
+            controller.close();
+          },
+        }),
+        { status: 200, headers: { "content-length": "4" } },
+      );
+    }) as typeof fetch;
+
+    const code = await runLocalModelsPull(["qwen-3.5-4b", "--mmproj"]);
+
+    expect(code).toBe(0);
+    expect(stdoutChunks.join("")).toMatch(/done\. model saved to /);
+    expect(stdoutChunks.join("")).not.toMatch(/mmproj saved/);
+    expect(stderrChunks.join("")).toMatch(
+      /note: projector download failed \(Download failed: HTTP 404 Not Found\) — qwen-3.5-4b is usable text-only; 'models pull --mmproj qwen-3.5-4b'/,
+    );
+  });
+});
+
+describe("runLocalModelsPull — a GGUF added from disk", () => {
+  let stateDir: string;
+  let userDir: string;
+  let stderrChunks: string[];
+  let previousFetch: typeof fetch;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-pull-local-"));
+    userDir = mkdtempSync(join(tmpdir(), "atomic-models-pull-local-user-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+    stderrChunks = [];
+    previousFetch = globalThis.fetch;
+    fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    globalThis.fetch = previousFetch;
+    vi.restoreAllMocks();
+    localLlm.setCustomLocalModels([]);
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(userDir, { recursive: true, force: true });
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+  });
+
+  function addFromDisk(): { id: string; path: string } {
+    const path = join(userDir, "model.gguf");
+    writeFileSync(path, Buffer.alloc(64, 1));
+    const def = localLlm.buildLocalGgufModelDef({ path, sizeBytes: 64 });
+    addCustomModel(def);
+    return { id: def.id, path };
+  }
+
+  it("finds the file and fetches nothing", async () => {
+    const { id, path } = addFromDisk();
+    expect(await runLocalModelsPull([id])).toBe(0);
+    expect(stderrChunks.join("")).toContain(`${id} is a local file: ${path}`);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("a vanished file exits 1 with its path and fetches nothing", async () => {
+    const { id, path } = addFromDisk();
+    rmSync(path);
+    expect(await runLocalModelsPull([id])).toBe(1);
+    expect(stderrChunks.join("")).toContain(
+      `${id}: local file not found: ${path}`,
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `models start-embedding`: the embedding daemon alone, beside a chat
+ * daemon `start` would refuse to touch (the desktop's ATO-126).
+ */
+describe("runLocalModelsStartEmbedding", () => {
+  let stateDir: string;
+  let stdoutChunks: string[];
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-emb-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+    stdoutChunks = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    vi.mocked(localLlm.resolveManagedDevice).mockReset().mockResolvedValue(undefined);
+    vi.mocked(localLlm.startEmbeddingDaemon).mockReset().mockResolvedValue({ pid: 4243 });
+    vi.mocked(localLlm.holdEmbeddingForLowMemory).mockReset().mockResolvedValue({ ok: true });
+    vi.mocked(localLlm.getEmbeddingDaemonStatus).mockReset().mockResolvedValue({
+      running: false, pid: null, port: 19092, healthy: false, loading: false,
+    });
+    vi.mocked(localLlm.isEmbeddingModelDownloaded).mockReset().mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function writeConfig(enabled: boolean): void {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        mode: "managed",
+        managed: { ...USER_CONFIG_DEFAULTS.localModels.managed, engine: "llama-server" },
+        embeddings: {
+          ...USER_CONFIG_DEFAULTS.localModels.embeddings,
+          enabled,
+          modelId: "nomic-embed-text-v1.5",
+        },
+      },
+    });
+    resetConfigCache();
+  }
+
+  it("starts the embedding daemon alone on the configured port", async () => {
+    writeConfig(true);
+    await expect(runLocalModelsStartEmbedding()).resolves.toBe(0);
+    expect(localLlm.startEmbeddingDaemon).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon).mock.calls[0]![0]).toMatchObject({
+      modelId: "nomic-embed-text-v1.5",
+      port: 19092,
+    });
+    expect(stdoutChunks.join("")).toMatch(/^embedding: started pid 4243, healthy on port 19092/m);
+  });
+
+  it("starts nothing when it is already running, or not asked for", async () => {
+    writeConfig(true);
+    vi.mocked(localLlm.getEmbeddingDaemonStatus).mockResolvedValue({
+      running: true, pid: 99, port: 19092, healthy: true, loading: false,
+    });
+    await expect(runLocalModelsStartEmbedding()).resolves.toBe(0);
+    expect(stdoutChunks.join("")).toMatch(/^embedding: already running pid 99/m);
+    writeConfig(false);
+    await expect(runLocalModelsStartEmbedding()).resolves.toBe(0);
+    expect(stdoutChunks.join("")).toMatch(/^embedding: disabled/m);
+    expect(localLlm.startEmbeddingDaemon).not.toHaveBeenCalled();
+  });
+
+  it("holds the memory model back on a machine with little memory (ATO-379)", async () => {
+    writeConfig(true);
+    vi.mocked(localLlm.holdEmbeddingForLowMemory).mockResolvedValue({
+      ok: false, reason: "total-ram", totalBytes: 4 * 1024 ** 3, freeBytes: 1024 ** 3,
+    });
+    await expect(runLocalModelsStartEmbedding()).resolves.toBe(0);
+    expect(localLlm.startEmbeddingDaemon).not.toHaveBeenCalled();
+    // No chat daemon in this state dir: the cloud-route floor is asked for.
+    expect(localLlm.holdEmbeddingForLowMemory).toHaveBeenCalledWith(expect.any(String), { localChatRunning: false });
+    expect(stdoutChunks.join("")).toMatch(/^embedding: skipped \(low memory\) — Low memory: memory search uses keywords only\.$/m);
+  });
+
+  it("exits 1 when the start fails", async () => {
+    writeConfig(true);
+    vi.mocked(localLlm.startEmbeddingDaemon).mockRejectedValue(new Error("port 19092 is already served"));
+    await expect(runLocalModelsStartEmbedding()).resolves.toBe(1);
+  });
+
+  it("refuses EmbeddingGemma 2 on the llama-server engine with the switch command", async () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        mode: "managed",
+        managed: { ...USER_CONFIG_DEFAULTS.localModels.managed, engine: "llama-server" },
+        embeddings: { ...USER_CONFIG_DEFAULTS.localModels.embeddings, enabled: true, modelId: "embeddinggemma-2" },
+      },
+    });
+    resetConfigCache();
+    const stderr = vi.mocked(process.stderr.write);
+    await expect(runLocalModelsStartEmbedding()).resolves.toBe(1);
+    expect(localLlm.startEmbeddingDaemon).not.toHaveBeenCalled();
+    expect(stderr.mock.calls.map(([chunk]) => String(chunk)).join("")).toContain("atomic-agent models engine atomic-core");
+  });
+});
+
+/**
+ * ATO-376: `models stop --chat-only` is the cloud switch's stop. It keeps
+ * the embedding daemon when the operator wants one (switch on, catalog
+ * model, GGUF on disk) and never touches `memory.embeddings.enabled`.
+ */
+describe("runLocalModelsStop --chat-only", () => {
+  let stateDir: string;
+  let stdoutChunks: string[];
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-stop-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+    stdoutChunks = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    vi.mocked(localLlm.stopDaemon).mockReset().mockResolvedValue();
+    vi.mocked(localLlm.stopChatAndEmbeddingDaemons).mockReset().mockResolvedValue();
+    vi.mocked(localLlm.isEmbeddingModelDownloaded).mockReset().mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function writeConfig(enabled: boolean): void {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        mode: "managed",
+        managed: { ...USER_CONFIG_DEFAULTS.localModels.managed, engine: "llama-server" },
+        embeddings: {
+          ...USER_CONFIG_DEFAULTS.localModels.embeddings,
+          enabled,
+          modelId: "nomic-embed-text-v1.5",
+        },
+      },
+      memory: {
+        ...USER_CONFIG_DEFAULTS.memory,
+        embeddings: { ...USER_CONFIG_DEFAULTS.memory.embeddings, enabled },
+      },
+    });
+    resetConfigCache();
+  }
+
+  it("stops only the chat daemon and keeps memory search on", async () => {
+    writeConfig(true);
+    await expect(runLocalModelsStop({ chatOnly: true })).resolves.toBe(0);
+    expect(localLlm.stopDaemon).toHaveBeenCalledTimes(1);
+    expect(localLlm.stopChatAndEmbeddingDaemons).not.toHaveBeenCalled();
+    expect(stdoutChunks.join("")).toMatch(/^stopped chat model; embedding model kept for memory search$/m);
+    expect(getConfig().memory.embeddings.enabled).toBe(true);
+  });
+
+  it("stops both when the embedding model is off or not downloaded", async () => {
+    writeConfig(false);
+    await expect(runLocalModelsStop({ chatOnly: true })).resolves.toBe(0);
+    writeConfig(true);
+    vi.mocked(localLlm.isEmbeddingModelDownloaded).mockReturnValue(false);
+    await expect(runLocalModelsStop({ chatOnly: true })).resolves.toBe(0);
+    expect(localLlm.stopChatAndEmbeddingDaemons).toHaveBeenCalledTimes(2);
+    expect(localLlm.stopDaemon).not.toHaveBeenCalled();
+  });
+
+  it("a plain stop still stops both", async () => {
+    writeConfig(true);
+    await expect(runLocalModelsStop()).resolves.toBe(0);
+    expect(localLlm.stopChatAndEmbeddingDaemons).toHaveBeenCalledTimes(1);
+    expect(localLlm.stopDaemon).not.toHaveBeenCalled();
+  });
+
+  it("exits 1 when the chat stop fails", async () => {
+    writeConfig(true);
+    vi.mocked(localLlm.stopDaemon).mockRejectedValue(new Error("pid 7 belongs to another user"));
+    await expect(runLocalModelsStop({ chatOnly: true })).resolves.toBe(1);
+  });
+});
+
+/**
+ * ATO-252: `models update` on Windows on ARM before any engine release
+ * carries the arm64 zip. With nothing installed it must fail with the
+ * sentence the desktop shows, not exit 0 as "unchanged".
+ */
+describe("runLocalModelsUpdate on Windows arm64 with no arm64 release", () => {
+  let stateDir: string;
+  let stdoutChunks: string[];
+  let stderrChunks: string[];
+  let previousFetch: typeof fetch;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-update-arm64-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+    vi.spyOn(process, "arch", "get").mockReturnValue("arm64");
+    resetConfigCache();
+    resetLatestReleaseCache();
+    stdoutChunks = [];
+    stderrChunks = [];
+    previousFetch = globalThis.fetch;
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    // Releases exist, none with the arm64 zip.
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify([
+          {
+            tag_name: "turboquant-x64-only",
+            published_at: "2026-10-06T00:00:00Z",
+            assets: [
+              {
+                name: WINDOWS_BACKEND_ASSETS.vulkan,
+                browser_download_url: "https://example.com/win.zip",
+              },
+            ],
+          },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ) as typeof fetch;
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        mode: "managed",
+        managed: { ...USER_CONFIG_DEFAULTS.localModels.managed, engine: "llama-server" },
+      },
+    });
+    resetConfigCache();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = previousFetch;
+    vi.restoreAllMocks();
+    resetLatestReleaseCache();
+    rmSync(stateDir, { recursive: true, force: true });
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+  });
+
+  it("fails with the plain Windows on ARM sentence when nothing is installed", async () => {
+    await expect(runLocalModelsUpdate()).resolves.toBe(1);
+    expect(stderrChunks.join("")).toContain(WINDOWS_ARM64_NO_BACKEND_MESSAGE);
+    expect(stdoutChunks.join("")).not.toMatch(/backend unchanged/);
+  });
+
+  it("keeps an installed arm64 backend as it is", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    mkdirSync(resolveBackendDir(dataDir), { recursive: true });
+    writeFileSync(resolveServerBinPath(dataDir, "llama-server.exe"), "x");
+
+    await expect(runLocalModelsUpdate()).resolves.toBe(0);
+    expect(stdoutChunks.join("")).toMatch(/backend unchanged/);
+  });
+});
+
+/**
+ * A computer Atomic Core has no build for (Linux arm64 without NVIDIA:
+ * `no_backend`) must not be left without a local engine: `models start`
+ * reports it, switches to llama.cpp once and starts the model there.
+ */
+describe("runLocalModelsStart on a computer without an Atomic Core build", () => {
+  let stateDir: string;
+  let stderrChunks: string[];
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-models-core-fallback-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+    stderrChunks = [];
+    vi.spyOn(process.stdout, "write").mockReturnValue(true);
+    vi.spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    });
+    vi.mocked(reportLocalEngineFailed).mockClear();
+    vi.mocked(localLlm.resolveManagedDevice).mockReset().mockResolvedValue("cpu");
+    vi.mocked(localLlm.startChatAndEmbeddingDaemons).mockReset().mockResolvedValue({
+      chat: { pid: 4242, tokensPerSecond: null, contextSize: 0, swaFull: { enabled: false, reason: "", estimate: null, slidingLayers: 0 }, prefixReuse: null },
+      embedding: { skipped: true },
+    } as never);
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        mode: "managed",
+        managed: { ...USER_CONFIG_DEFAULTS.localModels.managed, engine: "atomic-core", modelId: "qwen-3.5-4b" },
+      },
+    });
+    resetConfigCache();
+    // llama.cpp is already on disk, so the fallback downloads nothing.
+    const dataDir = getConfig().paths.localModelsDataDir;
+    mkdirSync(resolveBackendDir(dataDir), { recursive: true });
+    writeFileSync(resolveServerBinPath(dataDir, localLlm.resolvePlatformAsset().binaryName), "x");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("switches to llama.cpp once, reports the failure and starts the model in the same call", async () => {
+    vi.mocked(localLlm.maybeAutoUpdateBackend).mockReset().mockResolvedValue({
+      action: "update_failed",
+      error: "Atomic Chat could not install its inference backend.",
+      backendUsable: false,
+      coreFailure: { stage: "backend", reasonCode: "no_backend", retryable: false, reason: "Atomic Chat could not install its inference backend." },
+    });
+    await expect(runLocalModelsStart()).resolves.toBe(0);
+    expect(reportLocalEngineFailed).toHaveBeenCalledTimes(1);
+    expect(stderrChunks.join("")).toContain(CORE_FALLBACK_LINE);
+    resetConfigCache();
+    expect(getConfig().localModels.managed.engine).toBe("llama-server");
+    expect(vi.mocked(localLlm.startChatAndEmbeddingDaemons).mock.calls[0]![0].chat.engine).toBe("llama-server");
+  });
+
+  it("keeps Atomic Core and its retry hint for a retryable failure", async () => {
+    vi.mocked(localLlm.maybeAutoUpdateBackend).mockReset().mockResolvedValue({
+      action: "update_failed",
+      error: "The Atomic Chat engine could not be downloaded: fetch failed. Retry with: atomic-agent models update (TUI: press R in Models).",
+      backendUsable: false,
+      coreFailure: { stage: "download", reasonCode: "network", retryable: true, reason: "The Atomic Chat engine could not be downloaded: fetch failed." },
+    });
+    await expect(runLocalModelsStart()).resolves.toBe(1);
+    expect(stderrChunks.join("")).not.toContain(CORE_FALLBACK_LINE);
+    resetConfigCache();
+    expect(getConfig().localModels.managed.engine).toBe("atomic-core");
+    expect(localLlm.startChatAndEmbeddingDaemons).not.toHaveBeenCalled();
+  });
+});

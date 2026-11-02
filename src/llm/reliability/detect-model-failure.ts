@@ -1,0 +1,306 @@
+import type { CompletionResult } from "../llama-server-client.js";
+import type {
+  ModelFailureReason,
+  ModelFailureStage,
+  TruncationCause,
+  TruncationDetail,
+} from "./failure-category.js";
+import { hasRepetitiveTail } from "./repetitive-tail.js";
+
+export interface DetectedModelFailure {
+  reason: ModelFailureReason;
+  message: string;
+  /** Present only when `reason === "truncated"`. */
+  truncation?: TruncationDetail;
+}
+
+export interface DetectModelFailureOptions {
+  /**
+   * The `max_tokens` / `n_predict` cap the request carried. Without it a
+   * truncated reply cannot be told apart from a full context window, so
+   * the message can only say "truncated".
+   *
+   * `null` means the request carried NO cap at all — the provider applied
+   * its own output limit. That is its own wall (`provider_limit`): a
+   * message naming a cap of ours would name a number nobody sent.
+   */
+  requestedMaxTokens?: number | null;
+  /**
+   * The cap the runtime would have applied had it sent one — the step's
+   * reply cap. Consulted only when no cap was sent and no window is
+   * known, where it keeps the old split: a reply cut short of it is
+   * judged the context window (a local OpenAI-compatible server filling
+   * an unknown window still gets the window retry), a reply cut at or
+   * past it the provider's own limit.
+   */
+  defaultReplyCap?: number;
+  /**
+   * Which attempt produced the completion. The repair pass runs under
+   * its own cap, and the message names that instead of the config key.
+   */
+  stage?: ModelFailureStage;
+  /**
+   * The context window the runtime believes in (catalogue or learned),
+   * when it knows one. A reply cut short of the cap with prompt + reply
+   * well inside this window is the provider's output limit, not the
+   * window — and must not be learned as one.
+   */
+  contextWindow?: number | null;
+}
+
+/**
+ * Inspect a completion for model-side defects that make a retry on the
+ * same prompt pointless:
+ *
+ *  - `truncated`: the server cut the reply off — either the reply cap
+ *    the request carried (`max_tokens` / `n_predict`) ran out, or the
+ *    server's context window filled up mid-generation. Re-running the
+ *    same prompt under the same cap just reproduces the wall; the agent
+ *    loop retries with a *different* request (see `truncation`).
+ *  - `empty`:     neither `content` nor `reasoningContent` carry usable
+ *    text. Most often a misrouted grammar or a model that stopped
+ *    immediately after the first token.
+ *  - `no_stop`:   the stream ended without the model emitting a stop
+ *    token, while the body is still non-empty. Treated as soft evidence
+ *    of a cut-off response. Only reported when the content does not
+ *    already look like a complete JSON object, to avoid false positives
+ *    on fully-parseable outputs that happened to race with stream close.
+ *
+ * Returns `null` when the completion looks healthy enough to hand off to
+ * the grammar parser.
+ */
+export function detectModelFailure(
+  completion: CompletionResult,
+  options: DetectModelFailureOptions = {},
+): DetectedModelFailure | null {
+  if (completion.truncated) {
+    const classified = classifyTruncation(
+      completion,
+      options.requestedMaxTokens,
+      options.contextWindow ?? null,
+      options.defaultReplyCap,
+    );
+    // The stream watcher already cut this reply for looping: it is a
+    // repetitive truncation whatever the tail check below would say, and
+    // no cap or window was hit, so the message names neither.
+    if (completion.earlyStop?.reason === "repetition") {
+      return {
+        reason: "truncated",
+        message: REPETITION_STOP_MESSAGE,
+        truncation: { ...classified, repetitive: true },
+      };
+    }
+    // A model that thought in circles loops in its reasoning; one that
+    // wrote in circles loops in the body. The body is the later text.
+    const truncation: TruncationDetail = hasRepetitiveTail(
+      completion.content.length > 0
+        ? completion.content
+        : completion.reasoningContent,
+    )
+      ? { ...classified, repetitive: true }
+      : classified;
+    return {
+      reason: "truncated",
+      message: formatTruncatedMessage(truncation, options.stage),
+      truncation,
+    };
+  }
+  // The grammar parser runs over `content` only — `reasoningContent` is a
+  // CoT sidechannel. A model that thought but never produced a tool-call
+  // body counts as empty from the runtime's perspective.
+  const trimmedContent = completion.content.trim();
+  if (trimmedContent.length === 0) {
+    return {
+      reason: "empty",
+      message: "model returned empty content",
+    };
+  }
+  if (!completion.stop && !looksLikeClosedJsonObject(trimmedContent)) {
+    return {
+      reason: "no_stop",
+      message:
+        "model stream ended without a stop token and output is incomplete",
+    };
+  }
+  return null;
+}
+
+/** What the user reads when a looping reply was cut and its retry failed too. */
+export const REPETITION_STOP_MESSAGE =
+  "model response stopped: the model kept repeating the same text over and over. " +
+  "Try again, or use a larger model";
+
+/**
+ * A reply that stopped this close to the cap spent the cap. Servers
+ * count the cap in decoded tokens and some stop one short of it
+ * (llama.cpp checks `n_decoded >= n_predict` after the stop-token
+ * test), and a proxy's tokenizer may disagree by a token or two.
+ */
+const REPLY_CAP_SLACK_TOKENS = 16;
+
+/**
+ * Prompt + reply this far under a known window is not the window: the
+ * provider clamped the reply at its own output limit for the model.
+ */
+const WINDOW_FILL_RATIO = 0.9;
+
+/**
+ * Which wall a truncated completion hit, decided from the provider's
+ * usage block against the cap the request carried.
+ *
+ * The walls all arrive as the same `finish_reason: "length"`, and they
+ * want different remedies: a reply that spent the whole cap needs a
+ * bigger cap; a reply that stopped short of it ran into the server's
+ * context window and needs a *smaller prompt* (or a bigger window) —
+ * unless the runtime knows the window and prompt + reply sit well
+ * inside it, in which case the provider's own output limit for the
+ * model is the wall and only a lower cap helps. A provider that reports
+ * no usage leaves them indistinguishable.
+ *
+ * llama-server never sends `usage`, only `timings`, and its `truncated`
+ * flag has one meaning — the context overflowed — so a timings-only
+ * completion is the window whatever the count says. The exception is a
+ * reply llama-server itself reports as stopped by `n_predict`
+ * (`stop_type: "limit"` without an overflow, surfaced by the client as
+ * `finishReason: "length"`): that one spent the reply cap, and its prompt
+ * + reply must not be learned as the window.
+ *
+ * A request that carried no cap (`requestedMaxTokens === null`) cannot
+ * have spent one. Seen live: an OpenRouter request with no `max_tokens`
+ * cut at 33,678 tokens was reported as having "spent the reply cap of
+ * 8192". Without a cap the provider stopped at its own output limit —
+ * unless a known window shows prompt + reply filling it, or, with no
+ * window known, the reply is shorter than the cap the runtime would have
+ * sent (`defaultReplyCap`), which is how an unknown local window has
+ * always been recognised.
+ */
+export function classifyTruncation(
+  completion: CompletionResult,
+  requestedMaxTokens?: number | null,
+  contextWindow: number | null = null,
+  defaultReplyCap?: number,
+): TruncationDetail {
+  const completionTokens =
+    completion.usage?.completionTokens ??
+    completion.timing?.predictedTokens ??
+    0;
+  const promptTokens =
+    completion.usage?.promptTokens ?? completion.timing?.promptTokens ?? 0;
+  const requested = requestedMaxTokens ?? 0;
+  const windowKnown = contextWindow !== null && contextWindow > 0;
+  let cause: TruncationCause = "unknown";
+  if (isLlamaReplyCapStop(completion)) {
+    cause = "reply_cap";
+  } else if (completion.usage === undefined && completionTokens > 0) {
+    cause = "context_window";
+  } else if (requestedMaxTokens === null) {
+    if (windowKnown) {
+      cause =
+        completionTokens > 0 &&
+        promptTokens + completionTokens >= contextWindow * WINDOW_FILL_RATIO
+          ? "context_window"
+          : "provider_limit";
+    } else {
+      cause =
+        completionTokens > 0 &&
+        defaultReplyCap !== undefined &&
+        defaultReplyCap > 0 &&
+        completionTokens + REPLY_CAP_SLACK_TOKENS < defaultReplyCap
+          ? "context_window"
+          : "provider_limit";
+    }
+  } else if (completionTokens > 0 && requested > 0) {
+    if (completionTokens + REPLY_CAP_SLACK_TOKENS >= requested) {
+      cause = "reply_cap";
+    } else if (
+      windowKnown &&
+      promptTokens + completionTokens < contextWindow * WINDOW_FILL_RATIO
+    ) {
+      cause = "output_limit";
+    } else {
+      cause = "context_window";
+    }
+  }
+  return {
+    cause,
+    completionTokens,
+    promptTokens,
+    ...(requested > 0 ? { requestedMaxTokens: requested } : {}),
+  };
+}
+
+/** llama-server stopped the reply at `n_predict`, not at the window. */
+function isLlamaReplyCapStop(completion: CompletionResult): boolean {
+  return (
+    completion.usage === undefined &&
+    completion.stopType === "limit" &&
+    completion.finishReason === "length"
+  );
+}
+
+/**
+ * The sentence the user reads when a truncated reply ends the turn.
+ * Names the wall and the knob — "model response truncated" on its own
+ * sent people to change models, which cannot help either cause.
+ */
+export function formatTruncatedMessage(
+  truncation: TruncationDetail,
+  stage?: ModelFailureStage,
+): string {
+  const at =
+    truncation.completionTokens > 0
+      ? ` at ${truncation.completionTokens} tokens`
+      : "";
+  const capName =
+    stage === "repair"
+      ? "the repair pass's reply cap"
+      : "the reply cap (localModels.completionMaxTokens)";
+  switch (truncation.cause) {
+    case "reply_cap":
+      return (
+        `model response truncated${at}: it spent ${capName}` +
+        ((truncation.requestedMaxTokens ?? 0) > 0
+          ? ` of ${truncation.requestedMaxTokens}`
+          : "") +
+        ` — raise it, or use a model that thinks less before answering`
+      );
+    case "context_window":
+      return (
+        `model response truncated${at}: the model server ran out of context ` +
+        `after a ${truncation.promptTokens}-token prompt — start it with a larger ` +
+        `context size, or start a new session`
+      );
+    case "output_limit":
+      return (
+        `model response truncated${at}: the provider stopped the reply below ${capName} ` +
+        `of ${truncation.requestedMaxTokens} — this model's output limit is about ` +
+        `${truncation.completionTokens} tokens; lower the cap to it, or pick another model`
+      );
+    case "provider_limit":
+      return truncation.completionTokens > 0
+        ? `model response truncated: the provider stopped at its own output limit after ` +
+            `${truncation.completionTokens} tokens (no reply cap was sent)`
+        : "model response truncated: the provider stopped at its own output limit " +
+            "(no reply cap was sent, and it reported no token counts)";
+    default: {
+      const walls =
+        (truncation.requestedMaxTokens ?? 0) > 0
+          ? `the ${truncation.requestedMaxTokens}-token reply cap (localModels.completionMaxTokens) or the model server's context window`
+          : "the reply cap (localModels.completionMaxTokens) or the model server's context window";
+      return `model response truncated${at}: it hit ${walls}; the provider reported no token counts`;
+    }
+  }
+}
+
+/**
+ * Cheap structural check — does the content look like it closed a JSON
+ * object? Used only as a tie-breaker for `no_stop`: when the content
+ * already ends with `}` the parser will either succeed or throw a
+ * grammar error, which is the more useful signal.
+ */
+function looksLikeClosedJsonObject(text: string): boolean {
+  if (text.length === 0) return false;
+  const lastBrace = text.lastIndexOf("}");
+  if (lastBrace === -1) return false;
+  return lastBrace >= text.length - 3;
+}

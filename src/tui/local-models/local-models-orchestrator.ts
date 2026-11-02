@@ -1,0 +1,3756 @@
+import { selectManagedEngine } from "../../local-llm/engine-selection.js";
+import { retireIdleCore } from "../../local-llm/core/core-sessions.js";
+import { CORE_FALLBACK_LINE, CoreUnavailableError, shouldFallBackFromCore, type CoreFailureInfo } from "../../local-llm/core/core-errors.js";
+import { ModelOperationQueue } from "./model-operation-queue.js";
+import { totalmem } from "node:os";
+
+import { getConfig, resetConfigCache } from "../../config/index.js";
+import {
+  addCustomModel,
+  removeCustomModel,
+} from "../../config/custom-models-store.js";
+import { hasOtherLiveSessions } from "../../local-llm/server/session-registry.js";
+import { apiKeyForUrl } from "../../local-llm/server/managed-api-key.js";
+import {
+  DEFAULT_EMBEDDING_MODEL_ID,
+  DEFAULT_LLAMACPP_MODEL_ID,
+  downloadBackend,
+  downloadJobId,
+  listDownloadJobs,
+  isDownloadJobStale,
+  looksLikeDownloadWorker,
+  readDownloadJob,
+  readDownloadNotify,
+  removeDownloadJob,
+  writeDownloadJob,
+  writeDownloadNotify,
+  spawnDownloadWorker,
+  stopDownloadWorker,
+  type DownloadJob,
+  type DownloadNotifyChannel,
+  type DownloadJobKind,
+  type DownloadJobMode,
+  type SpawnDownloadWorkerInput,
+  type SpawnDownloadWorkerResult,
+  type StopDownloadWorkerResult,
+  EMBEDDING_MODELS_CATALOG,
+  CORE_CPU_FALLBACK_LINE,
+  CORE_CPU_RECORDED_LINE,
+  coreCpuFallbackApplies,
+  fallBackToCoreCpuBuild,
+  revertCoreCpuFallback,
+  type CoreCpuSwap,
+  fallBackToCpuBackend,
+  getConfiguredBackendVariant,
+  getDaemonStatus,
+  getEmbeddingDaemonStatus,
+  getEmbeddingModelDef,
+  getLocalModelDef,
+  GithubRateLimitedError,
+  isBackendDownloaded,
+  isEmbeddingModelDownloaded,
+  isKnownEmbeddingModelId,
+  isKnownLocalModelId,
+  isMmprojDownloaded,
+  isModelDownloaded,
+  buildCustomModelDef,
+  buildLocalGgufModelDef,
+  describeMissingLocalGguf,
+  listLocalModels,
+  looksLikeLocalGgufPath,
+  resolveLocalGgufFile,
+  resolveModelsDir,
+  listVulkanDevices,
+  managedDeviceSource,
+  AUTO_UPDATE_RECHECK_MS,
+  checkForBackendUpdateForPanel,
+  maybeAutoUpdateBackend,
+  probeNvidiaVramMiB,
+  readBackendVersion,
+  readLogTail,
+  removeEmbeddingModel as removeEmbeddingModelFiles,
+  removeModel,
+  resolveChatTemplatePath,
+  resolveEmbeddingLogFilePath,
+  resolveGpuBudgetGb,
+  resolveLogFilePath,
+  resolveManagedDevice,
+  resolveMmprojFilePath,
+  resolvePlatformAsset,
+  resolveHuggingFaceGgufChoices,
+  resolveServerBinPath,
+  shouldFallBackToCpuBackend,
+  claimLowMemoryEmbeddingNote,
+  holdEmbeddingForLowMemory,
+  LOW_MEMORY_EMBEDDING_NOTE,
+  startChatAndEmbeddingDaemons,
+  startEmbeddingDaemon,
+  stopChatAndEmbeddingDaemons,
+  stopDaemon as stopChatDaemonProcess,
+  stopEmbeddingDaemon,
+  type EmbeddingDaemonStartOptions,
+  type EmbeddingModelDef,
+  type EmbeddingModelId,
+  type GpuDevice,
+  type HuggingFaceRepoChoices,
+  type LocalModelDef,
+  type LocalModelId,
+  fetchServedModelIds,
+  describeServerFault,
+  readRunningPid,
+} from "../../local-llm/index.js";
+import {
+  classifyVramFit,
+  estimateModelVramNeedGb,
+  type EmbeddingDaemonInfo,
+  type EmbeddingModelRow,
+  type MmprojStatus,
+} from "./local-models-panel-state.js";
+import {
+  persistEmbeddingHybridRecall,
+  persistMemoryEmbeddingsEnabled,
+} from "../persist-embedding-hybrid-recall.js";
+import { persistUserLocalModelsConfig } from "../persist-user-local-models-config.js";
+import { isDownloadNotifyChannelReady } from "../../notifications/index.js";
+import { persistDownloadNotifyChannel } from "./persist-download-notify.js";
+import type { LocalModelsNotifyChoice } from "./local-models-panel-state.js";
+import { restartLocalDaemon } from "./local-models-daemon-restart.js";
+import { DaemonSupervisor } from "./daemon-supervisor.js";
+import {
+  clearChatPort,
+  clearEmbeddingPort,
+  type PortClearanceDeps,
+} from "./local-models-port-clearance.js";
+import { formatDaemonNotice } from "./format-daemon-notice.js";
+import { probeEndpoint, WedgeWatch } from "./daemon-wedge-watch.js";
+import { roundTokensPerSecond } from "../../prompt/fusion-machine-facts.js";
+import {
+  resolveLocalLegRole,
+  resolveRunMode,
+} from "../../llm/run-mode/index.js";
+import { resolveLlmConfig } from "../../llm/provider/registry/provider-types.js";
+import { activeTextProviderIsLlamaServer } from "../../llm/provider/registry/active-text-provider.js";
+import { ChatPullMirror, downloadProgressFor } from "../local-turn-gate.js";
+import { capLocalContextGrowth, growLocalContext, planLocalContextGrowth } from "./local-context-growth.js";
+import type { TuiEventBus } from "../tui-app.js";
+
+/**
+ * Human-readable summary of how the configured device preference
+ * resolved. `configured` is the raw config value (`auto` / `cpu` / a
+ * device id); `resolved` is what `resolveManagedDevice` returned
+ * (`undefined` ⇒ no GPU picked → llama.cpp default / CPU fallback).
+ * `multiGpu` (a configured tensor split) relabels the unresolved-`auto`
+ * case: there it means "all GPUs, split", not "no GPU detected".
+ */
+function describeDeviceChoice(
+  configured: string,
+  resolved: string | undefined,
+  multiGpu = false,
+): string {
+  if (configured === "cpu") return "cpu (forced)";
+  if (configured === "auto") {
+    if (resolved) return `auto → ${resolved}`;
+    return multiGpu
+      ? "auto → all GPUs (tensor split)"
+      : "auto → CPU (no GPU detected)";
+  }
+  return resolved ?? configured;
+}
+
+/** Log-tail poll cadence while the LLM logs tab is active. */
+/**
+ * Deadline for the backend asset download on the auto-update path. The
+ * zip is 27-39 MB, so this is generous for any working link; it exists
+ * because a stalled-but-open TCP connection otherwise never resolves
+ * and the update hangs for the life of the process. A timeout is
+ * reported like any other update failure and retried on the next start.
+ */
+const BACKEND_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
+
+const LOGS_POLL_MS = 1000;
+
+/** Snapshot refresh cadence while the Models tab is idle. */
+const SNAPSHOT_POLL_MS = 5000;
+
+/**
+ * Faster refresh cadence while the user is actively waiting on the
+ * daemon to come up. The normal 5s interval is too laggy for the
+ * "⟳ starting…" indicator to feel responsive.
+ */
+const SNAPSHOT_POLL_MS_ACTIVE = 1000;
+
+export interface LocalModelsOrchestratorHooks {
+  /** Fired when the operator picks a managed chat model (before daemon I/O). */
+  onManagedModelSelected?: (modelId: LocalModelId) => void;
+  /** Fired after a successful chat daemon (re)start for the active model. */
+  onManagedDaemonRestarted?: () => void;
+  /**
+   * Fired after the operator changed which embedding model memory should
+   * use (picked, pulled, removed, turned on or off) and the daemon side
+   * has settled. The runtime reattaches memory to the configured model
+   * here instead of at the next restart (ATO-351).
+   */
+  onEmbeddingModelChanged?: () => void;
+  /**
+   * The managed chat port moved because another process holds the
+   * configured one (already persisted): rebuild the route's provider and
+   * point the health poller at `url`.
+   */
+  onManagedPortMoved?: (url: string) => void | Promise<void>;
+  /**
+   * Fired when the operator deliberately puts a local model live and it
+   * actually serves — an explicit setup act, never the launch-time
+   * `autoStartIfReady` adoption of a model configured long ago.
+   */
+  onManagedModelActivated?: () => void;
+  /**
+   * Atomic Core could not be installed or started, and the panel now
+   * offers "download again". For `local_engine_failed`.
+   */
+  onLocalEngineFailed?: (failure: CoreFailureInfo) => void;
+  /**
+   * Test seams for the download worker. The defaults launch a detached
+   * copy of this program; a test substitutes an in-process runner so
+   * no child is spawned from under vitest.
+   */
+  spawnDownload?: (
+    input: SpawnDownloadWorkerInput,
+  ) => SpawnDownloadWorkerResult;
+  stopDownload?: (
+    dataDir: string,
+    job: DownloadJob,
+  ) => Promise<StopDownloadWorkerResult>;
+  /** How often the worker's record is re-read. Default 300ms. */
+  downloadPollMs?: number;
+  /** Grace before a silent `running` record is declared dead. Default 60s. */
+  staleGraceMs?: number;
+  /** Whether a pid is one of our workers. Test seam. */
+  isDownloadWorkerPid?: (pid: number) => boolean;
+  /**
+   * Send the operator to one integration's setup screen with a note
+   * saying why. The hub lives in another slice; the composition root
+   * knows how to get there.
+   */
+  openIntegration?: (id: string, message: string) => void;
+}
+
+export class LocalModelsOrchestrator {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private logsTimer: ReturnType<typeof setInterval> | null = null;
+  private activeTimer: ReturnType<typeof setInterval> | null = null;
+  private supervised = false;
+  /**
+   * The chat daemon was stopped for a cloud route and the embedding
+   * daemon kept (`stopChatForCloudSelection`). Ownership of the chat side
+   * is dropped so the supervisor does not bring it back, but the kept
+   * embedding daemon is still ours to tear down at exit.
+   */
+  private embeddingKeptForCloud = false;
+  /**
+   * True while a daemon the TUI owns is running; used by `shutdown()`.
+   * Taking ownership — a start, or adopting a running daemon, by any
+   * path — is also what arms the supervisor: its timer must run from
+   * the moment there is something to watch, not from whenever the LLM
+   * pane happens to be opened.
+   */
+  private get daemonSupervised(): boolean {
+    return this.supervised;
+  }
+  private set daemonSupervised(owned: boolean) {
+    this.supervised = owned;
+    if (owned) this.supervisor.start();
+  }
+  /**
+   * Chat and embedding pulls are independent channels, one watched
+   * worker each. A new pull of a kind detaches the watch on the previous
+   * one; the previous worker itself keeps running.
+   */
+  private readonly watchedDownloads = new Map<
+    DownloadJobKind,
+    { jobId: string; detach: () => void }
+  >();
+  /**
+   * A ping the operator asked for on a channel that had no credentials
+   * yet. Armed the moment the Integrations hub has them — the watch
+   * loop checks on every tick — so setting up Telegram mid-download
+   * ends with the message they wanted, not with a second trip here.
+   */
+  private pendingNotify: {
+    channel: DownloadNotifyChannel;
+    label: string;
+  } | null = null;
+  /**
+   * Single-flight guard for the backend download. Both `pullModel` and
+   * `pullEmbeddingModel` `await this.pullBackend()` when the backend is
+   * missing; without this a chat pull and an embedding pull started at the
+   * same time would launch two concurrent `downloadBackend()` calls that
+   * race on the same `<dataDir>/backend.next` staging dir — each clears it
+   * before extracting, so the loser's tree is deleted mid-write and the
+   * winner can swap in a partial install. Concurrent callers share the
+   * same in-flight promise.
+   */
+  private backendPullInFlight: Promise<void> | null = null;
+  /**
+   * Single-flight guard for `restartDaemon`. See that method for why a
+   * second concurrent restart is not merely redundant but leaks a
+   * `llama-server` process nothing can stop afterwards.
+   */
+  private restartInFlight: Promise<boolean> | null = null;
+  /**
+   * The auto window this process grew the model to (`growContextForPrompt`),
+   * recorded only once a start at that size came up: later starts of the
+   * same model begin there instead of back at the small start window.
+   * Another model starts small again.
+   */
+  private grownContext: { modelId: string; atLeast: number } | null = null;
+  /** The bigger window a growth restart is trying, read by that start only. */
+  private growthAttempt: number | null = null;
+  /**
+   * The window an out-of-memory restart settled on (ATO-334): growth of
+   * that model stops there for the rest of this process, so a later
+   * plain start does not climb back into the window that ran out.
+   */
+  private outOfMemoryCeiling: { modelId: string; atMost: number } | null = null;
+  private readonly operations = new ModelOperationQueue();
+  private selectionRevision = 0;
+  private closing = false;
+  private chatReadyError: string | null = null;
+  private selectedRequest: { id: LocalModelId; revision: number; done: Promise<void> } | null = null;
+  get isSwitching(): boolean { return this.operations.switching; }
+  async waitForSwitch(signal: AbortSignal): Promise<void> {
+    await this.operations.waitForSwitch(signal);
+    signal.throwIfAborted();
+    if (this.chatReadyError) throw new Error(this.chatReadyError);
+  }
+  /** Tells a wedged live daemon from a busy one (see `WedgeWatch`). */
+  private readonly wedgeWatch = new WedgeWatch();
+  /** Restarts a daemon this TUI owns when it dies or wedges (`autoRestart`). */
+  private readonly supervisor = new DaemonSupervisor({
+    enabled: () => {
+      const cfg = getConfig();
+      return !this.isSwitching && !this.closing && cfg.localModels.mode === "managed" && cfg.localModels.managed.autoRestart;
+    },
+    owns: () => this.daemonSupervised,
+    pidAlive: async () => readRunningPid(getConfig().paths.localModelsDataDir) !== null,
+    restart: () => this.restartOwnedDaemon(),
+    say: (line) => this.bus.emit({ type: "runtime_info", line }),
+    // The chat is where the operator is looking when a turn goes quiet;
+    // the feed line above stays for the per-attempt detail.
+    notify: (notice) =>
+      this.bus.emit({ type: "system_message", ...formatDaemonNotice(notice) }),
+    describeFault: () => {
+      try {
+        const log = readLogTail(resolveLogFilePath(getConfig().paths.localModelsDataDir));
+        return describeServerFault(log.text)?.summary ?? null;
+      } catch {
+        return null;
+      }
+    },
+    checkWedge: async () => {
+      const cfg = getConfig();
+      const base = `http://127.0.0.1:${cfg.localModels.managed.port}`;
+      const [health, slots] = await Promise.all([
+        probeEndpoint(`${base}/health`, 2_000),
+        probeEndpoint(`${base}/slots`, 5_000, fetch, apiKeyForUrl(base, cfg)),
+      ]);
+      return this.wedgeWatch.observe({ at: Date.now(), health, slots });
+    },
+    resetWedge: () => this.wedgeWatch.reset(),
+  });
+  /**
+   * Devices enumerated via `llama-server --list-devices`, cached for the
+   * process lifetime. `null` until a successful enumeration with the
+   * backend present — the device table does not change at runtime, so we
+   * avoid spawning the binary on every 5s snapshot refresh. macOS never
+   * populates this (its GPU budget comes from unified RAM, no spawn).
+   */
+  private cachedDevices: GpuDevice[] | null = null;
+  /**
+   * Pre-download NVIDIA VRAM fallback (MiB), cached for the process
+   * lifetime. `undefined` until the first probe; `null` once probed and
+   * no NVIDIA GPU / `nvidia-smi` was found. Only consulted on
+   * Linux/Windows when the backend is not yet on disk so the onboarding
+   * model list can still flag oversized models without first downloading
+   * llama.cpp. Once the backend lands, `cachedDevices` (Vulkan
+   * enumeration, all vendors) takes over and this is ignored.
+   */
+  private cachedNvidiaVramMiB: number | null | undefined = undefined;
+
+  /**
+   * Live view of the non-embedding pull this orchestrator itself emits,
+   * mirrored off the bus (one tap covers every emit site — GGUF, mmproj,
+   * backend, HF custom). Lets the "not downloaded" errors embed the real
+   * download progress instead of pretending nothing is happening.
+   */
+  private readonly chatPull = new ChatPullMirror();
+  /**
+   * The Hugging Face lookup currently in flight, if any. Cancelling
+   * replaces the ref, so a response that lands afterwards finds itself
+   * stale and dispatches nothing — the identity comparison is what
+   * makes Escape trustworthy; the abort merely frees the socket.
+   * Mirrors `use-onboarding-huggingface.ts`, which does the same for
+   * the first-run flow.
+   */
+  private hfLookup: AbortController | null = null;
+
+  constructor(
+    private readonly bus: TuiEventBus & { emit(action: unknown): void },
+    private readonly hooks?: LocalModelsOrchestratorHooks,
+  ) {
+    this.chatPull.attach(bus);
+  }
+
+  startAutoRefresh(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      void this.refresh();
+    }, SNAPSHOT_POLL_MS);
+    void this.refresh();
+  }
+
+  startLogsAutoRefresh(): void {
+    if (this.logsTimer) return;
+    this.logsTimer = setInterval(() => this.readLogsTail(), LOGS_POLL_MS);
+    this.readLogsTail();
+  }
+
+  stopLogsAutoRefresh(): void {
+    if (this.logsTimer) clearInterval(this.logsTimer);
+    this.logsTimer = null;
+  }
+
+  private stopGeneration = 0;
+
+  /** Keep an entire composer change cancelled after Stop, across its own starts. */
+  captureStopGuard(): () => boolean {
+    const generation = this.stopGeneration;
+    return () => !this.closing && generation === this.stopGeneration;
+  }
+  private backendAbort: AbortController | null = null;
+  private readonly coreStarts = new Map<Promise<unknown>, AbortController>();
+
+  /** Core loads are cancelled by the owning queue operation and also by Stop,
+   * which must reach a non-replacing embedding start the queue would not abort. */
+  private async trackCoreStart<T>(outer: AbortSignal | undefined, start: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+    if (getConfig().localModels.managed.engine !== "atomic-core") return start(outer);
+    const abort = new AbortController();
+    const pending = start(outer ? AbortSignal.any([outer, abort.signal]) : abort.signal);
+    this.coreStarts.set(pending, abort);
+    try { return await pending; } finally { this.coreStarts.delete(pending); }
+  }
+
+  private async cancelCoreStarts(): Promise<void> {
+    for (const abort of this.coreStarts.values()) abort.abort();
+    await Promise.allSettled(this.coreStarts.keys());
+  }
+
+  async shutdown(): Promise<void> {
+    this.closing = true;
+    if (getConfig().localModels.managed.engine === "atomic-core") this.backendAbort?.abort();
+    // close() aborts every queued operation synchronously, so an owned start
+    // sees its own signal first and exits quietly; then reach the rest.
+    const closed = this.operations.close();
+    await this.cancelCoreStarts();
+    await closed;
+    this.supervisor.stop();
+    if (getConfig().localModels.managed.engine === "atomic-core") await this.backendPullInFlight;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    // The workers are on their own: quitting must not stop a download.
+    // Only the watches end here; the next launch re-adopts the jobs.
+    for (const watch of this.watchedDownloads.values()) watch.detach();
+    this.watchedDownloads.clear();
+    if (this.activeTimer) clearInterval(this.activeTimer);
+    this.activeTimer = null;
+    this.stopLogsAutoRefresh();
+    // Best-effort tear down the daemon we started. Anything the user
+    // launched via `atomic-agent models start` in another terminal has
+    // its own pid file and is not our responsibility.
+    //
+    // Awaited (not fire-and-forget): the daemon is spawned `detached`, so
+    // it has its own process group and never receives the terminal SIGINT
+    // on Ctrl+C — the only thing that stops it is this explicit kill. If we
+    // do not wait for it, the host process exits before the kill lands and
+    // llama-server is orphaned in the background.
+    let retired = false;
+    if (this.daemonSupervised || this.embeddingKeptForCloud) {
+      this.daemonSupervised = false;
+      this.embeddingKeptForCloud = false;
+      const cfg = getConfig();
+      // `stopOnExit: false` keeps the model warm between sessions (the
+      // operator owns teardown via `models stop`). With it on, only the
+      // LAST live session stops the daemon — a second TUI window still
+      // chatting must not lose its model because this one closed first.
+      if (
+        cfg.localModels.managed.stopOnExit &&
+        !hasOtherLiveSessions(cfg.paths.localModelsDataDir)
+      ) {
+        await this.stopDaemonSilent();
+        retired = true;
+      }
+    }
+    // An idle Atomic Core exits with the TUI whether or not this session
+    // started a model (a failed load, an install, a status check all start
+    // Core). Core itself refuses while any model session or other client
+    // remains, so a warm `models start` model keeps it. Bounded, no signal.
+    if (!retired && getConfig().localModels.managed.engine === "atomic-core") {
+      await retireIdleCore(getConfig().paths.localModelsDataDir);
+    }
+  }
+
+  async refresh(): Promise<void> {
+    this.bus.emit({ type: "local_models_refresh_started" });
+    // A `models pull --background` started in another terminal shows
+    // up here as a live job nobody in this process is watching.
+    this.adoptBackgroundDownloads({ onlyRunning: true });
+    try {
+      const cfg = getConfig();
+      const dataDir = cfg.paths.localModelsDataDir;
+      // The full model list — curated catalog plus the operator's own
+      // Hugging Face additions — so a model added on first run has a
+      // panel row to be marked active, re-pulled or deleted from.
+      const rows = listLocalModels().map((def) => ({
+        id: def.id,
+        def,
+        downloaded: isModelDownloaded(dataDir, def),
+        mmprojStatus: resolveMmprojStatus(dataDir, def),
+        active:
+          cfg.localModels.mode === "managed" &&
+          cfg.localModels.managed.modelId === def.id,
+      }));
+      const ver = readBackendVersion(dataDir, getConfig().localModels.managed.engine);
+      let updateAvailable: boolean | null = null;
+      let latestTag: string | null = null;
+      try {
+        // An update shown here is one the next start asks for too: it
+        // drops the record a start would otherwise trust for hours.
+        const u = await checkForBackendUpdateForPanel(dataDir, getConfig().localModels.managed.engine);
+        updateAvailable = u.updateAvailable;
+        latestTag = u.latestTag;
+      } catch {
+        updateAvailable = null;
+        latestTag = null;
+      }
+      const daemon = await getDaemonStatus(
+        dataDir,
+        cfg.localModels.managed.port,
+      );
+      const activeModelId: LocalModelId | null =
+        cfg.localModels.managed.modelId &&
+        isKnownLocalModelId(cfg.localModels.managed.modelId)
+          ? cfg.localModels.managed.modelId
+          : null;
+      const embeddingActiveId: EmbeddingModelId | null =
+        cfg.localModels.embeddings.modelId &&
+        isKnownEmbeddingModelId(cfg.localModels.embeddings.modelId)
+          ? cfg.localModels.embeddings.modelId
+          : null;
+      const embeddingRows: readonly EmbeddingModelRow[] =
+        EMBEDDING_MODELS_CATALOG.map((def) => ({
+          id: def.id,
+          def,
+          downloaded: isEmbeddingModelDownloaded(dataDir, def),
+          active: def.id === embeddingActiveId,
+        }));
+      const embeddingDaemon: EmbeddingDaemonInfo =
+        await this.collectEmbeddingDaemonInfo(dataDir, embeddingActiveId);
+      this.reconcileHybridRecallFromDaemon(embeddingDaemon);
+      const gpuBudgetGb = await this.resolveGpuBudget(cfg, dataDir);
+      this.bus.emit({
+        type: "local_models_snapshot_loaded",
+        rows,
+        backend: {
+          engine: cfg.localModels.managed.engine ?? "atomic-core",
+          // Core is the engine and the choice is not part of the normal UI: llama.cpp is offered by the
+          // core failure notice (R/L) and `/model engine`, so the composer draws no engine control.
+          atomicCoreChoice: false,
+          currentTag: ver?.tag ?? null,
+          latestTag,
+          updateAvailable,
+          autoUpdate: cfg.localModels.managed.engine === "atomic-core" ? false : cfg.localModels.managed.autoUpdate,
+        },
+        daemon: {
+          running: daemon.running,
+          healthy: daemon.healthy,
+          loading: daemon.loading,
+          ...(daemon.authMismatch ? { authMismatch: true } : {}),
+          pid: daemon.pid,
+          port: daemon.port,
+        },
+        configMode: cfg.localModels.mode,
+        activeModelId,
+        totalRamGb: detectHostRamGb(),
+        gpuBudgetGb,
+        dataDir,
+        embeddingRows,
+        embeddingDaemon,
+        at: Date.now(),
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({ type: "local_models_error_set", message: msg });
+    }
+  }
+
+  /**
+   * Download a GGUF model and (when applicable) its mmproj projector.
+   * If the llama.cpp backend is not yet on disk it is fetched first —
+   * users shouldn't need to press a separate key for the backend
+   * prerequisite. On success the model is set as the active managed
+   * model and the daemon is (re)started so the user lands in a
+   * ready-to-chat state.
+   *
+   * The bytes are fetched by a detached worker process (see
+   * `local-llm/download-spawn.ts`), not by this process: quitting the
+   * TUI leaves the download running, and the next launch picks it up
+   * again (`adoptBackgroundDownloads`). This method only watches the
+   * worker's job record and turns it into the panel's pull events.
+   *
+   * Modes:
+   * - `"with-mmproj"` (default for vision-capable rows): pull GGUF and
+   *   mmproj together under one download banner whose bytes are their
+   *   sum. If the GGUF is already on disk only the projector is fetched.
+   * - `"gguf-only"` (`g` hotkey): pull the GGUF only, even for
+   *   vision-capable models — used when the operator wants a fast
+   *   text-only smoke test.
+   * - `"mmproj-only"` (Enter on a row whose GGUF is downloaded but
+   *   projector is missing): pull the projector only, do not restart
+   *   the daemon (operator must restart with `--mmproj` themselves).
+   */
+  async pullModel(
+    id: LocalModelId,
+    mode: "with-mmproj" | "gguf-only" | "mmproj-only" = "with-mmproj",
+    opts?: PullOptions,
+  ): Promise<void> {
+    const selectionRevision = this.selectionRevision;
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+
+    const def = getLocalModelDef(id);
+    if (mode === "mmproj-only" && !def.supportsVision) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${def.name} is not vision-capable — nothing to pull`,
+      });
+      return;
+    }
+
+    // Added from disk: nothing to download, so a missing file is the
+    // whole story — say where it was expected rather than spawn a worker
+    // that can only fail (or fetch a backend for a model that cannot run).
+    if (
+      mode !== "mmproj-only" &&
+      def.localPath &&
+      !isModelDownloaded(dataDir, def)
+    ) {
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "chat",
+        error: describeMissingLocalGguf(def.localPath),
+      });
+      return;
+    }
+
+    if (mode !== "mmproj-only" && !isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: backend missing — downloading llama.cpp first…",
+      });
+      await this.pullBackend();
+      if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) return;
+    }
+
+    try {
+      const wantGguf = mode !== "mmproj-only";
+      const wantMmproj =
+        def.supportsVision &&
+        (mode === "with-mmproj" || mode === "mmproj-only");
+      const needGguf = wantGguf && !isModelDownloaded(dataDir, def);
+      const needMmproj = wantMmproj && !isMmprojDownloaded(dataDir, def);
+
+      let projectorError: string | null = null;
+      if (needGguf || needMmproj) {
+        const workerMode: DownloadJobMode = needGguf
+          ? needMmproj
+            ? "with-mmproj"
+            : "gguf-only"
+          : "mmproj-only";
+        const watched = await this.runDownloadJob("chat", id, workerMode, opts);
+        if (watched.outcome === "detached") return;
+        if (watched.outcome === "cancelled") {
+          this.bus.emit({
+            type: "local_models_pull_failed",
+            kind: "chat",
+            error: describeCancelledPull(watched.job),
+          });
+          return;
+        }
+        projectorError = watched.job.mmprojError ?? null;
+      }
+
+      if (projectorError && mode === "mmproj-only") {
+        // Only the projector was asked for and it did not come. The
+        // model is untouched — the key layer already made it live —
+        // so this reports where a failed pull reports, and the record
+        // goes: Enter on the row is the retry.
+        this.bus.emit({
+          type: "local_models_pull_failed",
+          kind: "chat",
+          error: describeProjectorFailure(def, projectorError),
+        });
+        removeDownloadJob(dataDir, downloadJobId("chat", id));
+        return;
+      }
+
+      this.bus.emit({ type: "local_models_pull_finished", kind: "chat" });
+      await this.finishChatPull(def, mode, projectorError, selectionRevision);
+      // The record has served its purpose: the files are on disk and
+      // the follow-up ran. Leaving it would make the next launch run
+      // the follow-up again.
+      removeDownloadJob(dataDir, downloadJobId("chat", id));
+    } catch (e) {
+      if (isAbortError(e)) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "chat",
+        error: msg,
+      });
+    }
+  }
+
+  /**
+   * What happens once a chat model's files are on disk: activate it,
+   * offer the embedding model on a first install, start the daemon.
+   * Split from `pullModel` so a download that finished while no TUI was
+   * watching (the operator quit and came back) gets the same landing.
+   * `projectorError` is the worker's `mmprojError`: the weights landed
+   * but the projector did not, so the landing says why vision is off
+   * and the daemon comes up text-only. Never set for `mmproj-only`.
+   */
+  private async finishChatPull(
+    def: LocalModelDef,
+    mode: "with-mmproj" | "gguf-only" | "mmproj-only",
+    projectorError: string | null = null,
+    selectionRevision = this.selectionRevision,
+  ): Promise<void> {
+    return this.operations.run(async () => {
+      if (selectionRevision !== this.selectionRevision) {
+        await this.refresh();
+        return;
+      }
+      await this.finishChatPullNow(def, mode, projectorError);
+    }, undefined, false);
+  }
+
+  private async finishChatPullNow(
+    def: LocalModelDef,
+    mode: "with-mmproj" | "gguf-only" | "mmproj-only",
+    projectorError: string | null,
+  ): Promise<void> {
+    if (mode === "mmproj-only") {
+      await this.refresh();
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${def.name} mmproj installed — restart the daemon to enable vision`,
+      });
+      return;
+    }
+    if (projectorError) {
+      // The weights are on disk and work without the projector: say
+      // why vision is off, then land the model as any finished pull
+      // (the daemon comes up text-only by itself — it keys on the
+      // projector file, not on the catalog).
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${describeProjectorFailure(def, projectorError)}`,
+      });
+    }
+
+    persistUserLocalModelsConfig({
+      mode: "managed",
+      managed: { modelId: def.id },
+    });
+    resetConfigCache();
+    await this.refresh();
+
+    // Memory-v2 phase 1B onboarding: if the operator has just
+    // pulled their first chat model and there is no embedding on
+    // disk yet, show a y/n prompt offering to download the default
+    // embedding model in the same flow. The chat daemon still starts
+    // immediately so the downloaded model is usable right away.
+    if (this.shouldOfferEmbeddingOnboarding()) {
+      const embDef = getEmbeddingModelDef(DEFAULT_EMBEDDING_MODEL_ID);
+      this.bus.emit({
+        type: "local_models_embedding_onboarding_opened",
+        modelId: embDef.id,
+        name: embDef.name,
+        sizeLabel: embDef.sizeLabel,
+      });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${def.name} installed → offering embedding model for hybrid recall`,
+      });
+      await this.startChatDaemonAfterPull(def);
+      return;
+    }
+
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: ${def.name} installed → starting daemon…`,
+    });
+    if (await this.startChatDaemonAfterPull(def)) {
+      this.bus.emit({ type: "ui_mode_set", mode: "chat" });
+    }
+  }
+
+  /**
+   * Launch (or adopt) the detached worker for one job and mirror its
+   * record onto the bus until it ends. One watch per kind: a new pull
+   * of the same kind detaches the previous watch — the previous worker
+   * keeps downloading in the background, nothing is thrown away. The
+   * first `pull_started` carries whatever the partial already holds, so
+   * a resumed download opens the bar where it left off; a change of
+   * label (GGUF → mmproj) re-emits `pull_started` so the banner is
+   * honest about which file it draws.
+   *
+   * Resolves for `done` / `cancelled` / `detached`; rejects when the
+   * worker failed or died, with its own message.
+   */
+  private async runDownloadJob(
+    kind: DownloadJobKind,
+    modelId: string,
+    mode: DownloadJobMode,
+    opts?: PullOptions,
+  ): Promise<{ outcome: "done" | "cancelled" | "detached"; job: DownloadJob }> {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    const spawn = this.hooks?.spawnDownload ?? spawnDownloadWorker;
+    let launched = spawn({ dataDir, kind, modelId, mode });
+    const jobId = launched.job.id;
+
+    this.watchedDownloads.get(kind)?.detach();
+    let detached = false;
+    const watch = {
+      jobId,
+      detach: () => {
+        detached = true;
+      },
+    };
+    this.watchedDownloads.set(kind, watch);
+
+    const emitStarted = (job: DownloadJob): void => {
+      this.bus.emit({
+        type: "local_models_pull_started",
+        pull: {
+          kind,
+          modelId: job.modelId as LocalModelId,
+          label: job.label,
+          percent: job.percent,
+          transferredBytes: job.transferredBytes,
+          totalBytes: job.totalBytes,
+          error: null,
+        },
+      });
+    };
+    let last = launched.job;
+    emitStarted(last);
+    this.offerNotify(jobId, last.label, opts);
+    const pollMs = this.hooks?.downloadPollMs ?? DOWNLOAD_POLL_MS;
+    const staleGraceMs = this.hooks?.staleGraceMs ?? STALE_GRACE_MS;
+    // A `running` record the worker has stopped writing. The pid may
+    // still answer — after a reboot it can be anyone's — so the record
+    // is watched for a grace period first: a laptop back from sleep
+    // shows a stale record until the worker's next heartbeat, and
+    // spawning a second worker onto the same partial would be far worse
+    // than a minute of patience.
+    let staleSince: number | null = null;
+    let respawned = false;
+    try {
+      for (;;) {
+        await new Promise((r) => setTimeout(r, pollMs));
+        if (detached || this.closing) return { outcome: "detached", job: last };
+        this.armPendingNotify();
+        let job = readDownloadJob(dataDir, jobId);
+        if (!job) throw new Error("download record disappeared");
+        if (job.status === "running" && isDownloadJobStale(job)) {
+          staleSince ??= Date.now();
+          if (Date.now() - staleSince >= staleGraceMs) {
+            // A worker that is alive but silent (stopped, starved, stuck
+            // on a hung disk) must not get a sibling on the same partial:
+            // stop it first, and only then declare the job interrupted.
+            // A pid that is not ours — recycled after a reboot — is left
+            // alone; the record is simply wrong about it.
+            const isOurs =
+              this.hooks?.isDownloadWorkerPid ?? looksLikeDownloadWorker;
+            if (isOurs(job.pid)) {
+              const stop = this.hooks?.stopDownload ?? stopDownloadWorker;
+              await stop(dataDir, job);
+            }
+            job = {
+              ...job,
+              status: "interrupted",
+              error: "worker stopped reporting",
+              finishedAt: job.updatedAt,
+            };
+            writeDownloadJob(dataDir, job);
+            staleSince = null;
+          }
+        } else {
+          staleSince = null;
+        }
+        if (job.label !== last.label) {
+          emitStarted(job);
+        } else if (
+          job.transferredBytes !== last.transferredBytes ||
+          job.percent !== last.percent ||
+          job.waiting?.nextRetryAt !== last.waiting?.nextRetryAt
+        ) {
+          this.bus.emit({
+            type: "local_models_pull_progress",
+            kind,
+            percent: job.percent,
+            transferredBytes: job.transferredBytes,
+            totalBytes: job.totalBytes,
+            waiting: job.waiting
+              ? {
+                  reason: job.waiting.reason,
+                  attempt: job.waiting.attempt,
+                  nextRetryAt: job.waiting.nextRetryAt,
+                }
+              : null,
+          });
+        }
+        last = job;
+        if (job.status === "running") continue;
+        this.reportNotified(job);
+        if (job.status === "interrupted" && !respawned) {
+          // Once: the worker died (or went silent) under a watcher that
+          // still wants the model. Relaunch it onto the partial rather
+          // than hand the operator an error to press Enter on.
+          respawned = true;
+          this.bus.emit({
+            type: "runtime_info",
+            line: `local-llm: download worker ${job.error ?? "died"} at ${job.percent}% — relaunching it`,
+          });
+          launched = spawn({ dataDir, kind, modelId, mode });
+          last = launched.job;
+          continue;
+        }
+        if (job.status === "done") return { outcome: "done", job };
+        if (job.status === "cancelled") return { outcome: "cancelled", job };
+        throw new Error(
+          job.status === "interrupted"
+            ? `download worker died (${job.error ?? "no reason recorded"}) — press Enter to resume`
+            : (job.error ?? "download failed"),
+        );
+      }
+    } finally {
+      if (this.watchedDownloads.get(kind) === watch) {
+        this.watchedDownloads.delete(kind);
+      }
+      // A ping that never got its credentials was about *these*
+      // downloads; it must not fire, months later, for some other one.
+      if (this.watchedDownloads.size === 0) this.pendingNotify = null;
+    }
+  }
+
+  /**
+   * When a pull starts: ask "tell me when it lands?" if nobody has
+   * answered yet, or arm the remembered channel. A remembered channel
+   * whose credentials have since gone (token cleared) is reported, not
+   * silently skipped — the operator believes they will be pinged.
+   */
+  private offerNotify(jobId: string, label: string, opts?: PullOptions): void {
+    if (opts?.askNotify === false) return;
+    const cfg = getConfig();
+    // A ping already armed on this job — `models pull --notify`, or a
+    // relaunch onto a partial — is the operator's word; keep it.
+    const armed = readDownloadNotify(cfg.paths.localModelsDataDir, jobId);
+    if (armed) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${channelName(armed)} ping armed for ${cleanLabel(label)} · N to change`,
+      });
+      return;
+    }
+    const remembered = cfg.notifications.downloads.channel;
+    if (remembered === null) {
+      this.bus.emit({
+        type: "local_models_notify_prompt_opened",
+        prompt: { label: cleanLabel(label), current: null },
+      });
+      return;
+    }
+    if (remembered === "off") return;
+    if (isDownloadNotifyChannelReady(remembered, cfg)) {
+      writeDownloadNotify(cfg.paths.localModelsDataDir, jobId, remembered);
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${channelName(remembered)} ping armed for ${cleanLabel(label)} · N to change`,
+      });
+    } else {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${channelName(remembered)} ping is set but ${channelName(remembered)} is not configured — press N to change, or set it up in Integrations`,
+      });
+    }
+  }
+
+  /** The answer to the prompt: `t`, `d` or `n`. */
+  chooseDownloadNotify(choice: LocalModelsNotifyChoice): void {
+    this.bus.emit({ type: "local_models_notify_prompt_closed" });
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const watched = [...this.watchedDownloads.values()];
+    const label = describeWatched(
+      watched
+        .map((w) => readDownloadJob(dataDir, w.jobId)?.label ?? "")
+        .filter(Boolean),
+    );
+    if (choice === "off") {
+      persistDownloadNotifyChannel("off");
+      for (const w of watched) writeDownloadNotify(dataDir, w.jobId, null);
+      this.pendingNotify = null;
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: no ping when downloads land · N to change",
+      });
+      return;
+    }
+    persistDownloadNotifyChannel(choice);
+    if (isDownloadNotifyChannelReady(choice, cfg)) {
+      for (const w of watched) writeDownloadNotify(dataDir, w.jobId, choice);
+      this.pendingNotify = null;
+      this.bus.emit({
+        type: "runtime_info",
+        line:
+          watched.length > 0
+            ? `local-llm: ${channelName(choice)} ping armed for ${label}`
+            : `local-llm: ${channelName(choice)} ping armed for the next download`,
+      });
+      return;
+    }
+    // No credentials yet: send them to the hub, and finish the job the
+    // moment the hub reports the channel configured.
+    this.pendingNotify = { channel: choice, label };
+    const why = label
+      ? `Set up ${channelName(choice)} to get pinged when ${label} lands — the download keeps going meanwhile.`
+      : `Set up ${channelName(choice)} to get pinged when downloads land.`;
+    if (this.hooks?.openIntegration) {
+      this.hooks.openIntegration(integrationIdFor(choice), why);
+    } else {
+      this.bus.emit({ type: "runtime_info", line: `local-llm: ${why}` });
+    }
+  }
+
+  /** Esc on the prompt: nothing remembered, asked again next time. */
+  dismissDownloadNotify(): void {
+    this.bus.emit({ type: "local_models_notify_prompt_closed" });
+  }
+
+  /** `N`: reopen the prompt for the download in flight, or for the next ones. */
+  openDownloadNotifyPrompt(): void {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const watched = [...this.watchedDownloads.values()];
+    const job = watched[0] ? readDownloadJob(dataDir, watched[0].jobId) : null;
+    const remembered = cfg.notifications.downloads.channel;
+    this.bus.emit({
+      type: "local_models_notify_prompt_opened",
+      prompt: {
+        label: job ? cleanLabel(job.label) : "future downloads",
+        current: remembered,
+      },
+    });
+  }
+
+  /** One line about the ping once the job ended: sent, or why not. */
+  private reportNotified(job: DownloadJob): void {
+    const n = job.notified;
+    if (!n) return;
+    const name = channelName(n.channel);
+    this.bus.emit({
+      type: "runtime_info",
+      line:
+        n.outcome === "sent"
+          ? `local-llm: ${name} ping sent for ${cleanLabel(job.label)}`
+          : `local-llm: ${name} ping not sent for ${cleanLabel(job.label)} — ${n.reason ?? n.outcome}`,
+    });
+  }
+
+  /** Called on every watch tick: arm a ping that was waiting for credentials. */
+  private armPendingNotify(): void {
+    const pending = this.pendingNotify;
+    if (!pending) return;
+    const cfg = getConfig();
+    if (!isDownloadNotifyChannelReady(pending.channel, cfg)) return;
+    this.pendingNotify = null;
+    const dataDir = cfg.paths.localModelsDataDir;
+    for (const w of this.watchedDownloads.values()) {
+      writeDownloadNotify(dataDir, w.jobId, pending.channel);
+    }
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: ${channelName(pending.channel)} is set up — ping armed for ${pending.label || "the download"}`,
+    });
+  }
+
+  /** What the operator will be told about, for tests and the hub hop. */
+  notifyArmedFor(kind: DownloadJobKind): DownloadNotifyChannel | null {
+    const watch = this.watchedDownloads.get(kind);
+    if (!watch) return null;
+    return readDownloadNotify(
+      getConfig().paths.localModelsDataDir,
+      watch.jobId,
+    );
+  }
+
+  /**
+   * `x` in the Models tab: stop the download being watched, keeping
+   * its partial file. The watcher sees the worker's `cancelled` record
+   * and reports it with the resume hint.
+   */
+  async cancelPull(kind: DownloadJobKind): Promise<void> {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    const watch = this.watchedDownloads.get(kind);
+    const job = watch ? readDownloadJob(dataDir, watch.jobId) : null;
+    if (!job || job.status !== "running") {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: no ${kind} download in flight`,
+      });
+      return;
+    }
+    const stop = this.hooks?.stopDownload ?? stopDownloadWorker;
+    const result = await stop(dataDir, job);
+    if (result.outcome === "still-running" || result.outcome === "foreign") {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: could not stop download worker pid ${job.pid} (${result.outcome})`,
+      });
+    }
+  }
+
+  /**
+   * Pick up downloads this process did not start — or started in an
+   * earlier life. Called once at launch and on every snapshot refresh:
+   *
+   * - `running`: a worker is alive (a previous TUI's, or a `models pull
+   *   --background` in another terminal). Watch it; when it lands, run
+   *   the same follow-up a pull started here would.
+   * - `interrupted`: the worker died with the operator still wanting
+   *   the model (nobody cancelled). Relaunch it — it resumes from the
+   *   partial — and watch.
+   * - `done`: finished while no TUI was watching. Run the follow-up
+   *   (activate, start the daemon) so the operator lands where they
+   *   would have.
+   *
+   * - `failed` + `resumable`: the worker gave up on an outage (offline
+   *   for a week, or it hit its own lifetime cap) or a 0.5.6 worker ran
+   *   out of retries — the file was never the problem. Relaunch it.
+   *
+   * `cancelled` and a non-resumable `failed` (a 404, a full disk) are the
+   * operator's to act on and are left alone; `models downloads` still
+   * lists them.
+   */
+  adoptBackgroundDownloads(opts?: { onlyRunning?: boolean }): void {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    for (const job of listDownloadJobs(dataDir)) {
+      // One watch per kind. A running job of a kind that is already
+      // being watched is left to the next adoption after that watch
+      // ends — re-adopting it here would detach the current watch
+      // (`runDownloadJob`), and the two would then keep detaching each
+      // other on every refresh, the first to land switching the model.
+      if (job.status === "running" && this.watchedDownloads.has(job.kind))
+        continue;
+      if (this.watchedDownloads.get(job.kind)?.jobId === job.id) continue;
+      const adoptable = opts?.onlyRunning
+        ? job.status === "running"
+        : job.status === "running" ||
+          job.status === "interrupted" ||
+          job.status === "done" ||
+          (job.status === "failed" && job.resumable);
+      if (!adoptable) continue;
+      if (job.kind === "chat") {
+        if (!isKnownLocalModelId(job.modelId)) {
+          removeDownloadJob(dataDir, job.id);
+          continue;
+        }
+        const def = getLocalModelDef(job.modelId);
+        if (job.status === "done" && !isModelDownloaded(dataDir, def)) {
+          // Finished, then removed by the operator: nothing to land.
+          removeDownloadJob(dataDir, job.id);
+          continue;
+        }
+        this.bus.emit({
+          type: "runtime_info",
+          line: describeAdoptedJob(job, def.name),
+        });
+        if (job.status === "done") {
+          void this.landAdoptedChatJob(def, job);
+          continue;
+        }
+        // The job's own ping (a CLI `--notify`, or whatever was armed in
+        // an earlier life) stands; a job nobody just started is not a
+        // moment to ask.
+        void this.pullModel(job.modelId, job.mode, { askNotify: false });
+      } else {
+        if (!isKnownEmbeddingModelId(job.modelId)) {
+          removeDownloadJob(dataDir, job.id);
+          continue;
+        }
+        const def = getEmbeddingModelDef(job.modelId);
+        if (
+          job.status === "done" &&
+          !isEmbeddingModelDownloaded(dataDir, def)
+        ) {
+          removeDownloadJob(dataDir, job.id);
+          continue;
+        }
+        this.bus.emit({
+          type: "runtime_info",
+          line: describeAdoptedJob(job, def.name),
+        });
+        void this.pullEmbeddingModel(job.modelId, { askNotify: false });
+      }
+    }
+  }
+
+  /**
+   * A chat job that finished while no TUI was watching: land it the way
+   * the watching pull would have, without spawning anything — the files
+   * it fetched are on disk, and a projector it could not fetch is
+   * reported, not retried, at every launch (Enter on the row retries).
+   */
+  private async landAdoptedChatJob(
+    def: LocalModelDef,
+    job: DownloadJob,
+  ): Promise<void> {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    const projectorError = job.mmprojError ?? null;
+    try {
+      if (projectorError && job.mode === "mmproj-only") {
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: ${describeProjectorFailure(def, projectorError)}`,
+        });
+        return;
+      }
+      await this.finishChatPull(def, job.mode, projectorError);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "chat",
+        error: msg,
+      });
+    } finally {
+      removeDownloadJob(dataDir, job.id);
+    }
+  }
+
+  /**
+   * Memory-v2 phase 1B onboarding. True when the operator has not yet
+   * picked an embedding model AND none of the catalog rows are
+   * downloaded. Catches the "fresh install" case after the first
+   * chat-model pull. Does NOT fire when:
+   *
+   *  - vision/embeddings master switch left at v6 defaults but the
+   *    operator already configured an embedding model explicitly,
+   *  - any embedding GGUF already lives in the data dir (re-prompting
+   *    on every chat pull would be noise),
+   *  - the embedding catalog is empty (defensive guard for a future
+   *    catalog-disable mode that does not exist yet).
+   */
+  private shouldOfferEmbeddingOnboarding(): boolean {
+    const cfg = getConfig();
+    if (cfg.localModels.embeddings.modelId !== null) return false;
+    if (EMBEDDING_MODELS_CATALOG.length === 0) return false;
+    const dataDir = cfg.paths.localModelsDataDir;
+    return !EMBEDDING_MODELS_CATALOG.some((def) =>
+      isEmbeddingModelDownloaded(dataDir, def),
+    );
+  }
+
+  /**
+   * Memory-v2 phase 1B onboarding. Resolution of the y/n prompt
+   * surfaced after a successful chat-model pull. `accept=true`
+   * downloads the default embedding model and then starts the paired
+   * daemon; `accept=false` only starts the chat daemon (no embedding
+   * row to wire). Either branch routes the operator back to chat on
+   * success — the modal is a one-shot detour, not a sticky state.
+   */
+  async resolveEmbeddingOnboarding(accept: boolean): Promise<void> {
+    this.bus.emit({ type: "local_models_embedding_onboarding_dismissed" });
+    if (accept) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: pulling default embedding model (${DEFAULT_EMBEDDING_MODEL_ID})…`,
+      });
+      await this.pullEmbeddingModel(DEFAULT_EMBEDDING_MODEL_ID, {
+        askNotify: false,
+      });
+      return;
+    } else {
+      persistEmbeddingHybridRecall({ enabled: false });
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: embedding model skipped — hybrid recall stays off (can be enabled later from this panel)",
+      });
+    }
+    if (await this.ensureChatDaemonRunningAfterOnboarding()) {
+      this.bus.emit({ type: "ui_mode_set", mode: "chat" });
+    }
+  }
+
+  private async ensureChatDaemonRunningAfterOnboarding(): Promise<boolean> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const chat = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+    // Already serving because the pull auto-started it moments ago —
+    // still this operator finishing setup, so it counts the same.
+    if (chat.running) {
+      this.hooks?.onManagedModelActivated?.();
+      return true;
+    }
+    const started = await this.startDaemon();
+    if (started) this.hooks?.onManagedModelActivated?.();
+    return started;
+  }
+
+  private async startChatDaemonAfterPull(def: LocalModelDef): Promise<boolean> {
+    return this.operations.run(() => this.startChatDaemonAfterPullNow(def), false, false);
+  }
+
+  private async startChatDaemonAfterPullNow(def: LocalModelDef): Promise<boolean> {
+    const cfg = getConfig();
+    if (cfg.localModels.managed.modelId !== def.id) return false;
+    const dataDir = cfg.paths.localModelsDataDir;
+    const running = await getDaemonStatus(
+      dataDir,
+      cfg.localModels.managed.port,
+    );
+    if (running.running) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: restarting daemon with ${def.name}…`,
+      });
+      await this.stopProcessesForRestart({ silent: true });
+    }
+    const started = await this.startDaemon();
+    // A model the operator just pulled came up serving: setup, not the
+    // launch-time adoption of a backend configured long ago.
+    if (started) this.hooks?.onManagedModelActivated?.();
+    return started;
+  }
+
+  private async startEmbeddingDaemonAfterPull(
+    def: EmbeddingModelDef,
+  ): Promise<void> {
+    return this.operations.run(() => this.startEmbeddingDaemonAfterPullNow(def), undefined, false);
+  }
+
+  private async startEmbeddingDaemonAfterPullNow(
+    def: EmbeddingModelDef,
+  ): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const chat = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+    if (chat.running) {
+      await this.startEmbeddingPairing();
+      return;
+    }
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: ${def.name} ready → starting chat+embedding daemons…`,
+    });
+    if (await this.startDaemon()) {
+      this.bus.emit({ type: "ui_mode_set", mode: "chat" });
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Add a model from Hugging Face — the Models pane's own branch of the
+   * flow the first-run screen already had. Same resolver, same catalog
+   * write, same pull; what is new is that it is reachable after
+   * onboarding, when adding a second model is the actual task.
+   * ------------------------------------------------------------------ */
+
+  /**
+   * Ask Hugging Face what GGUFs the reference names. Every failure — a
+   * typo, a gated repo, a repo holding no GGUF at all — comes back as a
+   * sentence and is shown on the editor that asked for the reference.
+   */
+  async resolveHuggingFaceReference(raw: string): Promise<void> {
+    if (looksLikeLocalGgufPath(raw)) {
+      // A path supersedes whatever was being looked up before it: drop
+      // that socket so a late answer cannot land over the local add.
+      this.hfLookup?.abort();
+      this.hfLookup = null;
+      await this.addLocalGgufFile(raw);
+      return;
+    }
+    const controller = new AbortController();
+    this.hfLookup?.abort();
+    this.hfLookup = controller;
+    this.bus.emit({ type: "local_models_hf_lookup_started" });
+    try {
+      const repo = await resolveHuggingFaceGgufChoices(raw, {
+        signal: controller.signal,
+      });
+      if (this.hfLookup !== controller) return;
+      this.hfLookup = null;
+      this.bus.emit({ type: "local_models_hf_repo_resolved", repo });
+    } catch (err) {
+      if (this.hfLookup !== controller) return;
+      this.hfLookup = null;
+      this.bus.emit({
+        type: "local_models_hf_lookup_failed",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** Escape while the lookup runs: drop the socket, keep what was typed. */
+  cancelHuggingFaceLookup(): void {
+    if (!this.hfLookup) return;
+    this.hfLookup.abort();
+    this.hfLookup = null;
+    this.bus.emit({ type: "local_models_hf_lookup_cancelled" });
+  }
+
+  /**
+   * Record the chosen file as a catalog entry, then hand it to the very
+   * pull the curated rows use — which is what lands an added model on
+   * the ordinary download screen rather than a second one built for it.
+   */
+  async addHuggingFaceChoice(
+    repo: HuggingFaceRepoChoices,
+    index: number,
+  ): Promise<void> {
+    const choice = repo.choices[index];
+    if (!choice) return;
+    let id: LocalModelId;
+    try {
+      const def = buildCustomModelDef({
+        repoId: repo.repoId,
+        revision: repo.revision,
+        file: { path: choice.path, sizeBytes: choice.sizeBytes },
+        mmproj: repo.mmproj,
+      });
+      // Written before the pull starts: `pullModel` resolves the id
+      // through the catalog registry, and the registry is loaded from
+      // the file this call writes.
+      addCustomModel(def);
+      id = def.id;
+    } catch (err) {
+      this.bus.emit({
+        type: "local_models_hf_lookup_failed",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    this.bus.emit({ type: "local_models_hf_closed" });
+    await this.pullModel(id);
+  }
+
+  /**
+   * The reference was a path to a GGUF already on disk (issue #631):
+   * validate it, register it where it lies — no copy, no download — and
+   * hand it to the same pull the Hugging Face rows use. That pull finds
+   * the weights present and goes straight to activate-and-start. A bad
+   * path stays on the reference editor with the reason.
+   */
+  private async addLocalGgufFile(raw: string): Promise<void> {
+    let id: LocalModelId;
+    try {
+      const dataDir = getConfig().paths.localModelsDataDir;
+      const def = buildLocalGgufModelDef(
+        resolveLocalGgufFile(raw, {
+          managedModelsDir: resolveModelsDir(dataDir),
+        }),
+      );
+      addCustomModel(def);
+      id = def.id;
+    } catch (err) {
+      this.bus.emit({
+        type: "local_models_hf_lookup_failed",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    this.bus.emit({ type: "local_models_hf_closed" });
+    await this.pullModel(id);
+  }
+
+  async pullBackend(): Promise<void> {
+    // Coalesce concurrent callers onto one download. If a backend pull is
+    // already running (e.g. a chat pull triggered it and an embedding pull
+    // arrives while it is in flight), both await the same promise instead of
+    // racing two `downloadBackend()` calls on the same directory.
+    if (this.backendPullInFlight) {
+      return this.backendPullInFlight;
+    }
+    const inFlight = this.runBackendPull().finally(() => {
+      this.backendPullInFlight = null;
+    });
+    this.backendPullInFlight = inFlight;
+    return inFlight;
+  }
+
+  private async runBackendPull(): Promise<void> {
+    const controller = new AbortController();
+    this.backendAbort = controller;
+    const dataDir = getConfig().paths.localModelsDataDir;
+    this.clearCoreFailure();
+    this.bus.emit({
+      type: "local_models_pull_started",
+      pull: {
+        kind: "backend",
+        modelId: "_backend",
+        label: getConfig().localModels.managed.engine === "atomic-core" ? "Atomic Core engine" : "llama.cpp backend",
+        percent: 0,
+        transferredBytes: 0,
+        totalBytes: 0,
+        error: null,
+      },
+    });
+    try {
+      let lastProgress = { percent: 0, transferred: 0, total: 0 };
+      await downloadBackend(dataDir, {
+        engine: getConfig().localModels.managed.engine,
+        signal: controller.signal,
+        onProgress: (percent, transferred, total) => {
+          lastProgress = { percent, transferred, total };
+          this.bus.emit({
+            type: "local_models_pull_progress",
+            kind: "backend",
+            percent,
+            transferredBytes: transferred,
+            totalBytes: total,
+            waiting: null,
+          });
+        },
+        // The zip is fetched in-process, so the banner must be told about
+        // an outage here; nothing else will.
+        onRetry: (info) => {
+          this.bus.emit({
+            type: "local_models_pull_progress",
+            kind: "backend",
+            percent: lastProgress.percent,
+            transferredBytes: lastProgress.transferred,
+            totalBytes: lastProgress.total,
+            waiting: {
+              reason: info.error.message,
+              attempt: info.attempt,
+              nextRetryAt: new Date(Date.now() + info.delayMs).toISOString(),
+            },
+          });
+        },
+      });
+      this.bus.emit({ type: "local_models_pull_finished", kind: "backend" });
+      await this.refresh();
+    } catch (e) {
+      const msg =
+        e instanceof GithubRateLimitedError
+          ? `${e.message} Wait a few minutes and try again, or run with GITHUB_TOKEN=…`
+          : e instanceof Error
+            ? e.message
+            : String(e);
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "backend",
+        error: msg,
+      });
+      const failure = e instanceof CoreUnavailableError ? e.info : null;
+      if (!(await this.fallBackFromCore(failure))) this.reportCoreFailure(e);
+    }
+  }
+
+  /**
+   * This computer has no Atomic Core build (`no_backend`, `unsupported`):
+   * report `local_engine_failed`, switch it to the llama-server engine once
+   * with one feed line, and leave the next backend pull to install
+   * llama.cpp. A retryable failure keeps Core and its "download again"
+   * notice. False when nothing was switched.
+   */
+  private async fallBackFromCore(failure: CoreFailureInfo | null | undefined): Promise<boolean> {
+    const cfg = getConfig();
+    if (this.closing || cfg.localModels.managed.engine !== "atomic-core" || !failure || !shouldFallBackFromCore(failure)) return false;
+    this.hooks?.onLocalEngineFailed?.(failure);
+    try {
+      await selectManagedEngine(cfg.paths.localModelsDataDir, cfg.localModels.managed.port, cfg.localModels.embeddings.port,
+        () => persistUserLocalModelsConfig({ managed: { engine: "llama-server" } }));
+    } catch {
+      return false;
+    }
+    this.clearCoreFailure();
+    this.bus.emit({ type: "runtime_info", line: `local-llm: ${CORE_FALLBACK_LINE}` });
+    await retireIdleCore(cfg.paths.localModelsDataDir);
+    return true;
+  }
+
+  /**
+   * `R` on the Core notice: download Atomic Core again, then start the
+   * configured model when it is ready to run, so one key gets the operator
+   * back to a working model.
+   */
+  async retryCoreEngine(): Promise<void> {
+    await this.pullBackend();
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    if (this.closing || cfg.localModels.managed.engine === "llama-server") return;
+    if (!isBackendDownloaded(dataDir, cfg.localModels.managed.engine)) return;
+    const mid = cfg.localModels.managed.modelId;
+    if (cfg.localModels.mode !== "managed" || !mid || !isKnownLocalModelId(mid)) return;
+    if (!isModelDownloaded(dataDir, getLocalModelDef(mid))) return;
+    if ((await getDaemonStatus(dataDir, cfg.localModels.managed.port)).running) return;
+    await this.startDaemon();
+  }
+
+  /**
+   * Show a CoreUnavailableError as the panel notice (R download again),
+   * say it in the feed and report it. Anything else, and a
+   * cancellation, is left to the caller's existing reporting.
+   */
+  private reportCoreFailure(err: unknown, info?: CoreFailureInfo): boolean {
+    const failure = info ?? (err instanceof CoreUnavailableError ? err.info : null);
+    if (!failure || this.closing) return false;
+    this.bus.emit({ type: "local_models_core_failure_set", failure });
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: ${failure.reason} Press R in Models to download it again.`,
+    });
+    this.hooks?.onLocalEngineFailed?.(failure);
+    return true;
+  }
+
+  private clearCoreFailure(): void {
+    this.bus.emit({ type: "local_models_core_failure_set", failure: null });
+  }
+
+  /**
+   * Persist `localModels.mode: "managed"` on its own. `setActive` is
+   * the usual writer of that mode, but the composer can switch the
+   * route to "local" while nothing is downloaded yet — no model id to
+   * set active — and without this the config would still say
+   * `external`, so the backend control would mislabel the route
+   * `custom` on the very next frame.
+   */
+  async useManagedMode(): Promise<void> {
+    if (getConfig().localModels.mode === "managed") return;
+    persistUserLocalModelsConfig({ mode: "managed" });
+    resetConfigCache();
+    await this.refresh();
+  }
+
+  /**
+   * Persist the active managed model and restart the daemon so the new
+   * model is actually served. If the daemon was not running before we
+   * still start it — the user's intent in selecting a model is "make
+   * this one live".
+   */
+  async setActive(id: LocalModelId): Promise<void> {
+    if (this.closing) return;
+    if (this.selectedRequest?.id === id && this.selectedRequest.revision === this.operations.revision) return this.selectedRequest.done;
+    this.selectionRevision++;
+    this.chatReadyError = "The selected model is not ready. Choose a ready model and retry the message.";
+    this.bus.emit({ type: "composer_notice", text: `Loading ${getLocalModelDef(id).name}… You can choose another model while it starts.` });
+    const done = this.operations.run(signal => this.applySelectedModel(id, () => !signal.aborted), undefined);
+    const request = { id, revision: this.operations.revision, done };
+    this.selectedRequest = request;
+    try { await done; } finally { if (this.selectedRequest === request) this.selectedRequest = null; }
+  }
+
+  private async applySelectedModel(id: LocalModelId, current: () => boolean): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    persistUserLocalModelsConfig({ mode: "managed", managed: { modelId: id } });
+    resetConfigCache();
+    this.hooks?.onManagedModelSelected?.(id);
+    await this.refresh();
+    if (!current()) return;
+    const selectedDef = getLocalModelDef(id);
+    if (!isModelDownloaded(dataDir, selectedDef)) {
+      if (selectedDef.localPath) {
+        // Nothing to download for a file added from disk; the honest
+        // message is where it was expected.
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: ${selectedDef.name}: ${describeMissingLocalGguf(selectedDef.localPath)}`,
+        });
+        return;
+      }
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: model ${id} not downloaded — downloading now…`,
+      });
+      // The detached download must not hold the launch queue. Completion
+      // activates it only if no newer model was selected in the meantime.
+      void this.pullModel(id).catch(() => {});
+      return;
+    }
+    const running = await getDaemonStatus(
+      dataDir,
+      cfg.localModels.managed.port,
+    );
+    if (!current()) return;
+    if (running.running) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: restarting daemon for ${id}…`,
+      });
+      await this.stopProcessesForRestart({ silent: true });
+    }
+    if (!current()) return;
+    if (await this.startDaemon() && current()) {
+      // Tray refresh (optimistic id + `/props` re-read) is now fired by
+      // `startDaemon` on success, so no explicit hook call is needed here.
+      // This branch is the operator choosing a model and it coming up —
+      // the local counterpart of a verified cloud key.
+      this.hooks?.onManagedModelActivated?.();
+    }
+  }
+
+  /**
+   * Delete a model's on-disk files. If the daemon is currently serving
+   * the model we are about to remove, stop it first — otherwise the
+   * server keeps the GGUF mmap'd, the next refresh races against a
+   * partially-deleted directory, and the operator is left staring at a
+   * frozen UI while `rm` churns through gigabytes. Status lines flow
+   * into the runtime feed so it is obvious what is happening even
+   * though the modal closes immediately.
+   */
+  async removeLocalModel(id: LocalModelId): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const def = getLocalModelDef(id);
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: removing ${def.name}…`,
+    });
+    if (
+      cfg.localModels.mode === "managed" &&
+      cfg.localModels.managed.modelId === id
+    ) {
+      const st = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+      if (st.running) {
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: stopping daemon (was serving ${def.name})…`,
+        });
+        await this.stopDaemon({ silent: true });
+      }
+    }
+    try {
+      await removeModel(dataDir, id);
+      // A curated row survives its files' deletion — the catalog is the
+      // product. A custom row exists only because the operator added it,
+      // so deleting the model undoes the add too; otherwise the row
+      // would linger with no other way to drop it from the list. A row
+      // added from disk only loses its entry: `removeModel` leaves the
+      // operator's own file alone.
+      if (def.family === "custom") removeCustomModel(id);
+      this.bus.emit({
+        type: "runtime_info",
+        line: def.localPath
+          ? `local-llm: ${def.name} removed from the list (file kept at ${def.localPath})`
+          : `local-llm: ${def.name} removed`,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({
+        type: "local_models_error_set",
+        message: `remove failed: ${msg}`,
+      });
+    } finally {
+      await this.refresh();
+    }
+  }
+
+  /**
+   * Start the daemon for the currently configured managed model. Emits
+   * `daemon_phase_set` + runtime info lines so the user sees the
+   * transition even before the health probe catches up. Safe to call
+   * when the daemon is already running — the underlying `startDaemon`
+   * throws and we surface the message.
+   *
+   * @returns Whether the managed daemon was started successfully (pid acquired).
+   */
+  /**
+   * Cycle the managed daemon's GPU preference through
+   * `auto → <each enumerated device> → cpu → auto`, persisting the
+   * choice to `config.json`. Enumeration is best-effort: when the
+   * backend is missing or reports no devices the cycle collapses to
+   * `auto → cpu → auto`. Does not restart the daemon — the operator
+   * presses `s` to apply.
+   */
+  /**
+   * Choose the managed engine. Refused while a local model runs; never
+   * stops a model or starts a download (`selectManagedEngine`).
+   */
+  async chooseEngine(engine: "atomic-core" | "llama-server", opts: { quietIfSelected?: boolean } = {}): Promise<boolean> {
+    // Queued behind any start or stop instead of racing it, and without
+    // replacing it: a load in progress finishes, then the running check in
+    // selectManagedEngine refuses the change. Choosing never cancels a model.
+    // Stop does cancel the choice: not being the queue's latest operation, it
+    // is not aborted by Stop, so it checks the Stop guard before saving.
+    const wanted = this.captureStopGuard();
+    return this.operations.run(() => this.chooseEngineNow(engine, wanted, opts.quietIfSelected === true), false, false);
+  }
+
+  private async chooseEngineNow(engine: "atomic-core" | "llama-server", wanted: () => boolean, quietIfSelected: boolean): Promise<boolean> {
+    if (!wanted()) return false;
+    const cfg = getConfig();
+    if ((cfg.localModels.managed.engine ?? "atomic-core") === engine) {
+      // The composer's one local row carries the engine already selected: picking it names no engine.
+      if (!quietIfSelected) this.bus.emit({ type: "composer_notice", text: `${engine === "atomic-core" ? "Atomic Chat" : "Local llama"} is already selected.` });
+      return true;
+    }
+    try {
+      let saved = false;
+      await selectManagedEngine(cfg.paths.localModelsDataDir, cfg.localModels.managed.port, cfg.localModels.embeddings.port,
+        () => { if (!wanted()) return; persistUserLocalModelsConfig({ managed: { engine } }); saved = true; });
+      if (!saved) return false;
+      this.bus.emit({ type: "runtime_info", line: `Local engine: ${engine}. Start your model; a missing engine is installed first (B in Models installs it now).` });
+      this.bus.emit({ type: "composer_notice", text: `Inference engine: ${engine === "atomic-core" ? "Atomic Chat" : "Local llama"}.` });
+      await this.refresh();
+      return true;
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      this.bus.emit({ type: "runtime_info", line: text });
+      this.bus.emit({ type: "composer_notice", text });
+      return false;
+    }
+  }
+
+  /**
+   * Flip `localModels.managed.autoUpdate`. The flag is on by default and
+   * governs a background download, so it needs a way out that is not
+   * "hand-edit config.json" — the CLI equivalent takes the whole file.
+   * Takes effect on the next start; nothing in flight is cancelled.
+   */
+  async toggleBackendAutoUpdate(): Promise<void> {
+    if (getConfig().localModels.managed.engine === "atomic-core") {
+      this.bus.emit({ type: "runtime_info", line: "Atomic Core checks for updates in the model panel. Press B to install; running models must be stopped first." });
+      return;
+    }
+    const next = !getConfig().localModels.managed.autoUpdate;
+    persistUserLocalModelsConfig({ managed: { autoUpdate: next } });
+    resetConfigCache();
+    this.bus.emit({
+      type: "runtime_info",
+      line: next
+        ? "local-llm: backend auto-update on — a newer llama.cpp is fetched after start"
+        : "local-llm: backend auto-update off — update manually with 'B'",
+    });
+    await this.refresh();
+  }
+
+  async cycleManagedDevice(): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    let ids: string[] = [];
+    if (isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      // Under Atomic Core: Core's own llama-server, run as Core runs it.
+      const source = managedDeviceSource(dataDir, getConfig().localModels.managed.engine);
+      ids = source ? (await listVulkanDevices(source.binPath, source.spawn)).map((d) => d.id) : [];
+    }
+    const order = ["auto", ...ids, "cpu"];
+    const current = cfg.localModels.managed.device;
+    const idx = order.indexOf(current);
+    const next = order[(idx + 1) % order.length];
+    persistUserLocalModelsConfig({ managed: { device: next } });
+    resetConfigCache();
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: device → ${next} (press 's' to restart and apply)`,
+    });
+    await this.refresh();
+  }
+
+  /**
+   * Resolve the GPU memory budget (decimal GB) the active model would
+   * have to fit into, or `null` when there is no meaningful budget (CPU
+   * forced, no GPU, unsupported platform). On macOS the budget comes
+   * from unified RAM without spawning anything; on Linux/Windows it
+   * reads the chosen device's VRAM from a cached `--list-devices`
+   * enumeration so the 5s refresh never re-spawns the binary.
+   */
+  private async resolveGpuBudget(
+    cfg: ReturnType<typeof getConfig>,
+    dataDir: string,
+  ): Promise<number | null> {
+    const platform = process.platform;
+    const configuredDevice = cfg.localModels.managed.device;
+    // macOS budget comes from unified RAM — no enumeration, no fallback.
+    if (platform === "darwin") {
+      return resolveGpuBudgetGb({
+        platform,
+        totalRamBytes: totalmem(),
+        devices: [],
+        configuredDevice,
+      });
+    }
+    // No discrete GPU offload when forced to CPU; skip enumeration.
+    if (configuredDevice === "cpu") return null;
+    // Preferred source: Vulkan devices reported by the backend
+    // (covers NVIDIA / AMD / Intel). Requires the binary on disk.
+    if (this.cachedDevices === null && isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      const source = managedDeviceSource(dataDir, getConfig().localModels.managed.engine);
+      this.cachedDevices = source ? await listVulkanDevices(source.binPath, source.spawn) : [];
+    }
+    const budget = resolveGpuBudgetGb({
+      platform,
+      totalRamBytes: totalmem(),
+      devices: this.cachedDevices ?? [],
+      configuredDevice,
+    });
+    if (budget !== null) return budget;
+    // Fallback before the backend exists (onboarding): probe NVIDIA
+    // VRAM directly via nvidia-smi so the model list can flag oversized
+    // models without first downloading llama.cpp. NVIDIA-only; other
+    // vendors stay null until the backend lands. Routed through the same
+    // `resolveGpuBudgetGb` (as a synthetic discrete device, `auto` pick)
+    // so the MiB -> decimal-GB conversion matches the backend path.
+    if (this.cachedNvidiaVramMiB === undefined) {
+      this.cachedNvidiaVramMiB = await probeNvidiaVramMiB();
+    }
+    if (this.cachedNvidiaVramMiB === null) return null;
+    return resolveGpuBudgetGb({
+      platform,
+      totalRamBytes: totalmem(),
+      devices: [
+        {
+          id: "nvidia-smi",
+          description: "NVIDIA (nvidia-smi)",
+          totalMemMiB: this.cachedNvidiaVramMiB,
+          freeMemMiB: this.cachedNvidiaVramMiB,
+        },
+      ],
+      configuredDevice: "auto",
+    });
+  }
+
+  /**
+   * @param opts.backendAlreadyChecked set by callers that ran
+   * `applyBackendAutoUpdate` themselves. Without it a TUI launch
+   * checks GitHub twice per start — two hits against the ~60 req/h
+   * anonymous budget, and two passes racing on the same
+   * `backend.next` staging dir.
+   */
+  async startDaemon(opts?: {
+    backendAlreadyChecked?: boolean;
+    cpuFallbackAttempted?: boolean;
+    /**
+     * `--ctx-size` for this start only, in place of
+     * `localModels.managed.contextSize` (the out-of-memory restart,
+     * ATO-334). Never written to the config.
+     */
+    contextSize?: number;
+  }): Promise<boolean> {
+    return this.operations.run(async signal => {
+      this.chatReadyError = "The model did not start. Choose a ready model and retry the message.";
+      const started = await this.startDaemonNow({ ...opts, signal });
+      if (started && !signal.aborted) this.chatReadyError = null;
+      return started;
+    }, false);
+  }
+
+  private async startDaemonNow(opts?: {
+    signal?: AbortSignal;
+    backendAlreadyChecked?: boolean;
+    /**
+     * Set by the retry the Windows CPU-backend fallback issues, so a
+     * start that fails even on the CPU build cannot recurse forever.
+     */
+    cpuFallbackAttempted?: boolean;
+    /** See `startDaemon`. */
+    contextSize?: number;
+  }): Promise<boolean> {
+    if (this.closing) return false;
+    // Re-read after the backend step: a computer without an Atomic Core
+    // build is switched to llama.cpp there (`fallBackFromCore`).
+    let cfg = getConfig();
+    if (cfg.localModels.mode !== "managed") {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: external mode — nothing to start",
+      });
+      return false;
+    }
+    const mid = cfg.localModels.managed.modelId;
+    if (!mid || !isKnownLocalModelId(mid)) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: pick a model first",
+      });
+      return false;
+    }
+    const dataDir = cfg.paths.localModelsDataDir;
+    const def = getLocalModelDef(mid);
+    let justPulledBackend = false;
+    if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: backend missing — downloading…",
+      });
+      const engineBefore = getConfig().localModels.managed.engine;
+      await this.pullBackend();
+      // Switched to llama.cpp by the failed Core install: install that now.
+      if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine) &&
+          getConfig().localModels.managed.engine !== engineBefore) await this.pullBackend();
+      if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) return false;
+      justPulledBackend = true;
+    }
+    if (!isModelDownloaded(dataDir, def) && def.localPath) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ${def.name} cannot start — ${describeMissingLocalGguf(def.localPath)}`,
+      });
+      return false;
+    }
+    if (!isModelDownloaded(dataDir, def)) {
+      // With a pull already in flight the honest message is the live
+      // progress, not a bare "cannot start" that reads like a dead end.
+      const progress = downloadProgressFor(this.chatPull.current, def.id);
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: model ${def.name} not downloaded — cannot start (${
+          progress ?? "press Enter on it to download"
+        })`,
+      });
+      return false;
+    }
+    if (opts?.signal?.aborted) return false;
+    if (!justPulledBackend && !opts?.backendAlreadyChecked) {
+      const updated = await this.applyBackendAutoUpdate(dataDir);
+      if (!updated || opts?.signal?.aborted) return false;
+    }
+    cfg = getConfig();
+    this.bus.emit({ type: "local_models_daemon_phase_set", phase: "starting" });
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: starting ${def.name} on port ${cfg.localModels.managed.port}…`,
+    });
+    this.beginActiveRefresh();
+    try {
+      const tpl = resolveChatTemplatePath(def) ?? undefined;
+      const mmprojFile =
+        cfg.vision.enabled &&
+        def.supportsVision &&
+        def.mmprojFilename &&
+        isMmprojDownloaded(dataDir, def)
+          ? resolveMmprojFilePath(dataDir, def.id, def.mmprojFilename)
+          : undefined;
+      // Memory-v2 phase 1B: piggy-back the embedding daemon on the
+      // same "start" action via the atomic-pair orchestrator. The
+      // embedding side fails non-fatally — its outcome is reported as
+      // an info line so the operator sees what happened, while the
+      // chat side stays the source of truth for `daemonPhase`.
+      const embedding = this.buildEmbeddingStartOptions(cfg, dataDir);
+      // Resolve the GPU preference once so chat + embedding land on the
+      // same device and the operator sees which one was picked. A
+      // configured tensor split keeps `auto` from pinning one device —
+      // the chat daemon needs every GPU visible to spread layers.
+      const tensorSplit = cfg.localModels.managed.tensorSplit;
+      const multiGpu = tensorSplit.length > 0;
+      const { binaryName } = resolvePlatformAsset();
+      const binPath = resolveServerBinPath(dataDir, binaryName, getConfig().localModels.managed.engine);
+      // Under Atomic Core its llama-server needs the environment Core runs it with.
+      const spawn = managedDeviceSource(dataDir, getConfig().localModels.managed.engine)?.spawn;
+      // The CPU-build retry runs on the CPU: a device picked for (or
+      // configured against) the crashing GPU build means nothing to it.
+      const device = opts?.cpuFallbackAttempted
+        ? "cpu"
+        : await resolveManagedDevice(
+            binPath,
+            cfg.localModels.managed.device,
+            { multiGpu, ...(spawn ? { spawn } : {}) },
+          );
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: device ${describeDeviceChoice(cfg.localModels.managed.device, device, multiGpu)}`,
+      });
+      const gpuBudgetGb = await this.resolveGpuBudget(cfg, dataDir);
+      if (classifyVramFit(def, gpuBudgetGb) === "insufficient") {
+        const needGb = estimateModelVramNeedGb(def);
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: ${def.name} needs ~${needGb.toFixed(1)} GB but GPU budget ~${gpuBudgetGb!.toFixed(1)} GB — may fail to load / OOM`,
+        });
+      }
+      // What `parallel: "auto"` means depends on which way fusion is
+      // pointing (see `resolveLocalLegRole`): serving a fan-out wants
+      // every slot the context fits, orchestrating wants exactly one.
+      // Resolved from the `cfg` this call read, so a restart after the
+      // operator swaps the legs in Manage → LLM picks the new role up —
+      // `restartDaemon` comes back through here, and nothing about the
+      // role is captured at boot.
+      const resolvedLlm = resolveLlmConfig(cfg);
+      const runMode = resolveRunMode(resolvedLlm, { managedModelId: mid });
+      const localLegRole = resolveLocalLegRole(resolvedLlm, runMode);
+      // ATO-848: only a plain local chat route has someone to grow the
+      // window between turns (`growContextForPrompt`); a Fusion leg is
+      // served by turns this path never sees, so it gets the fixed window.
+      // A one-run window (`opts.contextSize`, the out-of-memory restart)
+      // is a fixed size and does not grow either.
+      const growContext = activeTextProviderIsLlamaServer(resolvedLlm) && runMode.effective !== "fusion" && opts?.contextSize === undefined;
+      const clearance = this.portClearanceDeps();
+      opts?.signal?.throwIfAborted();
+      const chatClear = await clearChatPort(cfg, mid, clearance);
+      opts?.signal?.throwIfAborted();
+      if (chatClear.adoptedPid !== null) {
+        this.daemonSupervised = true;
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: ready — pid ${chatClear.adoptedPid} on http://127.0.0.1:${chatClear.port}`,
+        });
+        await this.ensureEmbeddingPaired();
+        opts?.signal?.throwIfAborted();
+        this.hooks?.onManagedModelSelected?.(mid);
+        this.hooks?.onManagedDaemonRestarted?.();
+        return true;
+      }
+      const embClear = await clearEmbeddingPort(
+        cfg,
+        embedding,
+        chatClear.port,
+        clearance,
+      );
+      opts?.signal?.throwIfAborted();
+      const grown = this.grownContext;
+      const contextAtLeast = growContext
+        ? (this.growthAttempt ?? (grown !== null && grown.modelId === mid ? grown.atLeast : null))
+        : null;
+      const result = await this.trackCoreStart(opts?.signal, signal => startChatAndEmbeddingDaemons({
+        chat: {
+          engine: cfg.localModels.managed.engine,
+          signal,
+          throughputProbe: false,
+          healthTimeoutMs: 120_000,
+          dataDir,
+          modelId: mid,
+          port: chatClear.port,
+          chatTemplateFile: tpl,
+          mmprojFile,
+          contextSize: opts?.contextSize ?? cfg.localModels.managed.contextSize,
+          ...(growContext ? { growContext: true } : {}),
+          ...(contextAtLeast !== null ? { autoContextAtLeast: contextAtLeast } : {}),
+          parallel: cfg.localModels.managed.parallel,
+          localLegRole,
+          swaFull: cfg.localModels.managed.swaFull,
+          ...(device ? { device } : {}),
+          // No multi-GPU split on the CPU-build retry.
+          ...(multiGpu && device !== "cpu" ? { tensorSplit } : {}),
+        },
+        embedding: embClear.options
+          ? { ...embClear.options, signal, engine: cfg.localModels.managed.engine, ...(device ? { device } : {}) }
+          : undefined,
+      }));
+      this.daemonSupervised = true;
+      opts?.signal?.throwIfAborted();
+      this.supervisor.noteStarted();
+      this.clearCoreFailure();
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: ready — pid ${result.chat.pid} on http://127.0.0.1:${chatClear.port}${
+          result.chat.tokensPerSecond === null
+            ? ""
+            : ` · ~${roundTokensPerSecond(result.chat.tokensPerSecond)} tok/s`
+        }`,
+      });
+      if (def.supportsVision) {
+        this.bus.emit({
+          type: "runtime_info",
+          line: mmprojFile && result.chat.projectorDropped
+            ? `local-llm: vision disabled — Atomic Chat could not load ${def.mmprojFilename}; the model runs text-only`
+            : mmprojFile
+            ? `local-llm: vision enabled (${def.mmprojFilename})`
+            : `local-llm: vision disabled — mmproj not downloaded for ${def.id}`,
+        });
+      }
+      this.reportEmbeddingStartOutcome(
+        embClear.adoptedPid !== null
+          ? { pid: embClear.adoptedPid }
+          : result.embedding,
+        embClear.adoptedPid !== null ? embedding : embClear.options,
+      );
+      // Refresh the tray / prompt model label for EVERY start path
+      // (pull auto-start, `s`, autoStart, setActive). The health poller
+      // caches the model name per URL (`modelFetchedForUrl`) and would
+      // otherwise keep showing the previous model after an in-place
+      // restart on the same URL. `onManagedModelSelected` updates the
+      // tray optimistically with the catalog id; `onManagedDaemonRestarted`
+      // re-reads `/props` so it aligns with what llama-server reports.
+      this.hooks?.onManagedModelSelected?.(mid);
+      this.hooks?.onManagedDaemonRestarted?.();
+      return true;
+    } catch (e) {
+      if (opts?.signal?.aborted) {
+        // A paired embedding start may be cancelled after chat is healthy.
+        // The next selection/stop owns cleanup; retain shutdown ownership.
+        if (readRunningPid(dataDir) !== null) this.daemonSupervised = true;
+        return false;
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      // ATO-344/372: Atomic Core's GPU build crashed loading the model.
+      if (
+        !opts?.cpuFallbackAttempted &&
+        getConfig().localModels.managed.engine === "atomic-core" &&
+        coreCpuFallbackApplies(dataDir, e)
+      ) {
+        return await this.fallBackToCoreCpuBuildAndRetry(dataDir, msg, opts?.signal, opts?.contextSize);
+      }
+      if (
+        !opts?.cpuFallbackAttempted &&
+        getConfig().localModels.managed.engine !== "atomic-core" &&
+        shouldFallBackToCpuBackend({
+          installedAsset: readBackendVersion(dataDir, getConfig().localModels.managed.engine)?.asset,
+          configuredVariant: getConfiguredBackendVariant(),
+          error: e,
+        })
+      ) {
+        return await this.fallBackToCpuBackendAndRetry(dataDir, msg, opts?.signal, opts?.contextSize);
+      }
+      this.bus.emit({ type: "local_models_daemon_error_set", message: msg });
+      if (!this.reportCoreFailure(e)) {
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: start failed — ${msg}`,
+        });
+      }
+      return false;
+    } finally {
+      this.endActiveRefresh();
+      await this.refresh();
+    }
+  }
+
+  /**
+   * Atomic Core's twin of the rescue below (ATO-344/372): Core's GPU build
+   * crashed loading the model, so install Core's CPU build and retry the
+   * start once on device cpu. `coreBackendVariant = "cpu"` is recorded
+   * only when that retry serves the model; when it does not, the swap is
+   * undone (`revertCoreCpuFallback`) and the original failure is the one
+   * shown, since the GPU build was not the cause.
+   */
+  private async fallBackToCoreCpuBuildAndRetry(
+    dataDir: string,
+    failureMsg: string,
+    signal?: AbortSignal,
+    /** A one-run window (out-of-memory restart) the retry keeps. */
+    contextSize?: number,
+  ): Promise<boolean> {
+    this.bus.emit({ type: "runtime_info", line: `local-llm: ${CORE_CPU_FALLBACK_LINE}` });
+    this.bus.emit({
+      type: "local_models_pull_started",
+      pull: {
+        kind: "backend",
+        modelId: "_backend",
+        label: "Atomic Core CPU build",
+        percent: 0,
+        transferredBytes: 0,
+        totalBytes: 0,
+        error: null,
+      },
+    });
+    let swap: CoreCpuSwap;
+    try {
+      swap = await fallBackToCoreCpuBuild(dataDir, {
+        // A deadline, as for every backend download here.
+        signal: AbortSignal.timeout(BACKEND_DOWNLOAD_TIMEOUT_MS),
+        onProgress: (percent: number, transferred: number, total: number) => {
+          this.bus.emit({
+            type: "local_models_pull_progress",
+            kind: "backend",
+            percent,
+            transferredBytes: transferred,
+            totalBytes: total,
+          });
+        },
+      });
+      this.bus.emit({ type: "local_models_pull_finished", kind: "backend" });
+    } catch (dlErr) {
+      const msg = dlErr instanceof Error ? dlErr.message : String(dlErr);
+      const combined = `${failureMsg} (the CPU build could not be installed: ${msg})`;
+      this.bus.emit({ type: "local_models_pull_failed", kind: "backend", error: msg });
+      this.bus.emit({ type: "local_models_daemon_error_set", message: combined });
+      this.bus.emit({ type: "runtime_info", line: `local-llm: start failed — ${combined}` });
+      return false;
+    }
+    this.bus.emit({ type: "runtime_info", line: "local-llm: CPU build installed — retrying start…" });
+    const started = await this.startDaemonNow({
+      signal,
+      backendAlreadyChecked: true,
+      cpuFallbackAttempted: true,
+      ...(contextSize !== undefined ? { contextSize } : {}),
+    });
+    if (!started) {
+      // Undo the swap on a cancelled retry too (a model picked while it
+      // loaded): left in place, the CPU build stays installed with
+      // nothing recorded, and no later start rescues it back.
+      revertCoreCpuFallback(dataDir, swap);
+      if (signal?.aborted) return false;
+      const combined = `${failureMsg} (the CPU build failed too, so the GPU build stays selected)`;
+      this.bus.emit({ type: "local_models_daemon_error_set", message: combined });
+      this.bus.emit({ type: "runtime_info", line: `local-llm: start failed — ${combined}` });
+      return false;
+    }
+    try {
+      persistUserLocalModelsConfig({ managed: { coreBackendVariant: "cpu" } });
+      this.bus.emit({ type: "runtime_info", line: `local-llm: ${CORE_CPU_RECORDED_LINE}` });
+    } catch (persistErr) {
+      const msg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: could not persist coreBackendVariant — ${msg}; the CPU build is used for this session only`,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Windows iGPU-only rescue: the installed GPU llama.cpp build spawned
+   * but never became healthy (the compute backend cannot load a model on
+   * this machine — e.g. Vulkan on an AMD APU), so swap in the CPU build
+   * the nightly also publishes and retry the start once. The choice is
+   * persisted as `localModels.managed.backendVariant = "cpu"` — without
+   * that, the next auto-update's variant-staleness check would reinstall
+   * the GPU build and re-break the machine.
+   */
+  private async fallBackToCpuBackendAndRetry(
+    dataDir: string,
+    failureMsg: string,
+    signal?: AbortSignal,
+    /** A one-run window (out-of-memory restart) the retry keeps. */
+    contextSize?: number,
+  ): Promise<boolean> {
+    this.bus.emit({
+      type: "runtime_info",
+      line:
+        "local-llm: the GPU llama.cpp build failed to serve on this machine — " +
+        "falling back to the CPU build…",
+    });
+    try {
+      persistUserLocalModelsConfig({ managed: { backendVariant: "cpu" } });
+      this.bus.emit({
+        type: "runtime_info",
+        line:
+          'local-llm: recorded backendVariant "cpu" in config.json — set it to ' +
+          '"auto" or "vulkan" to try the GPU build again (e.g. after a driver update)',
+      });
+    } catch (persistErr) {
+      const msg =
+        persistErr instanceof Error ? persistErr.message : String(persistErr);
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: could not persist backendVariant — ${msg}; the CPU build is used for this session only`,
+      });
+    }
+    this.bus.emit({
+      type: "local_models_pull_started",
+      pull: {
+        kind: "backend",
+        modelId: "_backend",
+        label: getConfig().localModels.managed.engine === "atomic-core" ? "Atomic Core engine" : "llama.cpp backend",
+        percent: 0,
+        transferredBytes: 0,
+        totalBytes: 0,
+        error: null,
+      },
+    });
+    try {
+      await fallBackToCpuBackend(dataDir, {
+        // Same hazard as the auto-update path above: without a deadline
+        // a stalled-open connection would pin the start on "starting"
+        // for the life of the process.
+        signal: AbortSignal.timeout(BACKEND_DOWNLOAD_TIMEOUT_MS),
+        onProgress: (percent: number, transferred: number, total: number) => {
+          this.bus.emit({
+            type: "local_models_pull_progress",
+            kind: "backend",
+            percent,
+            transferredBytes: transferred,
+            totalBytes: total,
+          });
+        },
+      });
+      this.bus.emit({ type: "local_models_pull_finished", kind: "backend" });
+    } catch (dlErr) {
+      const msg = dlErr instanceof Error ? dlErr.message : String(dlErr);
+      const combined = `CPU backend fallback failed — ${msg} (original start failure: ${failureMsg})`;
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "backend",
+        error: msg,
+      });
+      this.bus.emit({
+        type: "local_models_daemon_error_set",
+        message: combined,
+      });
+      this.bus.emit({ type: "runtime_info", line: `local-llm: ${combined}` });
+      return false;
+    }
+    this.bus.emit({
+      type: "runtime_info",
+      line: "local-llm: CPU build installed — retrying start…",
+    });
+    return await this.startDaemonNow({
+      signal,
+      backendAlreadyChecked: true,
+      cpuFallbackAttempted: true,
+      ...(contextSize !== undefined ? { contextSize } : {}),
+    });
+  }
+
+  /**
+   * Stop chat + embedding processes without clearing the operator's
+   * embedding master switch. Used when swapping the active chat model.
+   */
+  private async stopProcessesForRestart(opts?: {
+    silent?: boolean;
+  }): Promise<void> {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    this.bus.emit({ type: "local_models_daemon_phase_set", phase: "stopping" });
+    if (!opts?.silent) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: stopping daemon for model swap…",
+      });
+    }
+    this.beginActiveRefresh();
+    try {
+      await stopChatAndEmbeddingDaemons(dataDir);
+      this.daemonSupervised = false;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({ type: "local_models_daemon_error_set", message: msg });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: stop failed — ${msg}`,
+      });
+    } finally {
+      this.endActiveRefresh();
+      await this.refresh();
+    }
+  }
+
+  async stopDaemon(opts?: { silent?: boolean }): Promise<void> {
+    this.stopGeneration++;
+    this.chatReadyError = "The model was stopped. Start a model and retry the message.";
+    const core = getConfig().localModels.managed.engine === "atomic-core";
+    if (core) this.backendAbort?.abort();
+    // run() aborts the waiting or running start synchronously, so that start
+    // sees its own signal and ends without reporting a failure. Core loads the
+    // queue does not replace (embedding pairing) are cancelled after it.
+    const stopped = this.operations.run(async () => {
+      // A Core install holds the engine lock that the stop below needs.
+      if (core) await this.backendPullInFlight;
+      return this.stopDaemonNow(opts);
+    }, undefined);
+    // Observed here; the caller still receives the rejection below.
+    stopped.catch(() => {});
+    await this.cancelCoreStarts();
+    return stopped;
+  }
+
+  private async stopDaemonNow(opts?: { silent?: boolean }): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    this.bus.emit({ type: "local_models_daemon_phase_set", phase: "stopping" });
+    if (!opts?.silent) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: stopping daemon…",
+      });
+    }
+    this.beginActiveRefresh();
+    try {
+      // Stops both chat and embedding daemons. Either side may raise a
+      // `ForeignDaemonError` (cross-user daemon we cannot signal);
+      // `stopChatAndEmbeddingDaemons` still stops the other side and
+      // re-throws the combined message, surfaced via the bus below.
+      await stopChatAndEmbeddingDaemons(dataDir);
+      this.daemonSupervised = false;
+      persistMemoryEmbeddingsEnabled(false);
+      if (!opts?.silent) {
+        this.bus.emit({
+          type: "runtime_info",
+          line: "local-llm: daemons stopped — hybrid recall off (embedding switch unchanged)",
+        });
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({ type: "local_models_daemon_error_set", message: msg });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: stop failed — ${msg}`,
+      });
+    } finally {
+      this.endActiveRefresh();
+      await this.refresh();
+    }
+  }
+
+  /**
+   * Bounce a wedged local model server: stop the chat daemon, start it
+   * again, leaving the embedding side (and hybrid recall) untouched. The
+   * decision table — managed / external / a cloud route is live — lives
+   * in `local-models-daemon-restart.ts`; this method is only the wiring.
+   *
+   * Single-flight, for the same reason `pullBackend` is: `R` is one
+   * keypress with no on-pane feedback until the phase flips, so it gets
+   * pressed twice. Two restarts running at once both clear the pid file
+   * on their stop, both find it empty at the top of `startDaemon`, and
+   * both spawn — the pid-file guard in `daemon-lifecycle.startDaemon` is
+   * read a whole backend-update-and-device-probe before the file is
+   * written. The loser's `llama-server` is then orphaned: no pid file
+   * points at it, so nothing in the TUI can ever stop it, and it keeps
+   * the port and the VRAM. Concurrent callers share the one restart.
+   */
+  /**
+   * The supervisor's restart: the same single-flight slot and stop-first
+   * order as `restartDaemon`, without its route check — a daemon this
+   * TUI owns keeps serving Fusion workers and the fallback chain's local
+   * link while a cloud route is active, and a dead one helps neither.
+   */
+  private restartOwnedDaemon(): Promise<boolean> {
+    if (this.restartInFlight) return this.restartInFlight;
+    const inFlight = this.operations.run(async () => {
+      const stopped = await this.stopChatDaemonOnly({
+        stoppedLine: "local-llm: chat daemon stopped — bringing it back up…",
+      });
+      return stopped ? await this.startDaemon() : false;
+    }, false).finally(() => {
+      this.restartInFlight = null;
+    });
+    this.restartInFlight = inFlight;
+    return inFlight;
+  }
+
+  /**
+   * ATO-848: before a turn, grow the auto window of a daemon on a GPU
+   * with memory of its own when the conversation's last prompt
+   * (`session.contextUsage.tokens`) has filled three quarters of the
+   * prompt's room — one doubling, held to what fits the card
+   * (`decideContextGrowth`), through the ordinary restart. A no-op for a
+   * pinned context, unified memory, CPU, external mode and while a model
+   * change or restart is running. Never throws: a failed growth leaves
+   * the turn to run on the window it has.
+   */
+  async growContextForPrompt(promptTokens: number | null | undefined): Promise<boolean> {
+    if (typeof promptTokens !== "number" || !(promptTokens > 0)) return false;
+    if (this.closing || this.restartInFlight || this.isSwitching) return false;
+    try {
+      return await growLocalContext({
+        plan: () => capLocalContextGrowth(planLocalContextGrowth(getConfig(), promptTokens), this.outOfMemoryCeiling),
+        setAttempt: (atLeast) => { this.growthAttempt = atLeast; },
+        commit: (step) => { this.grownContext = { modelId: step.modelId, atLeast: step.to }; },
+        restart: () => this.restartDaemon(),
+        startAgain: () => this.startDaemon(),
+        emit: (line) => this.bus.emit({ type: "runtime_info", line }),
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The model ran out of memory (ATO-334): bring it back with
+   * `contextSize` for this run only. The config keeps its value, so the
+   * next start sizes the window as before. Same single-flight slot and
+   * stop-first order as the other restarts; registered with the runtime
+   * as its `setLocalModelRestarter`.
+   */
+  restartWithContextSize(contextSize: number): Promise<boolean> {
+    if (this.restartInFlight) return this.restartInFlight;
+    // The window grown between turns (ATO-848) is what ran out of
+    // memory: a later restart or growth must not bring it back.
+    this.grownContext = null;
+    this.growthAttempt = null;
+    const modelId = getConfig().localModels.managed.modelId;
+    this.outOfMemoryCeiling = modelId ? { modelId, atMost: contextSize } : null;
+    const inFlight = this.operations.run(async () => {
+      const stopped = await this.stopChatDaemonOnly({
+        stoppedLine: `local-llm: the model ran out of memory — restarting it with a context window of ${contextSize} tokens…`,
+      });
+      return stopped ? await this.startDaemon({ contextSize }) : false;
+    }, false).finally(() => {
+      this.restartInFlight = null;
+    });
+    this.restartInFlight = inFlight;
+    return inFlight;
+  }
+
+  async restartDaemon(): Promise<boolean> {
+    if (this.restartInFlight) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: a restart is already running — waiting for it",
+      });
+      return this.restartInFlight;
+    }
+    const inFlight = this.operations.run(() => restartLocalDaemon({
+      emit: (action) => this.bus.emit(action),
+      stopChatDaemonOnly: () =>
+        this.stopChatDaemonOnly({
+          // The default line is written for the external-URL switch and
+          // would claim, mid-restart, that an external server is the
+          // route now. Nothing external is involved here.
+          stoppedLine: "local-llm: chat daemon stopped — bringing it back up…",
+        }),
+      startDaemon: () => this.startDaemon(),
+    }), false).finally(() => {
+      this.restartInFlight = null;
+    });
+    this.restartInFlight = inFlight;
+    return inFlight;
+  }
+
+  /**
+   * The chat route moved to a cloud model (ATO-376): stop only the chat
+   * daemon and keep the embedding daemon, so memory search keeps its
+   * meaning-based half. `memory.embeddings.enabled` is left alone.
+   *
+   * Falls back to the full `stopDaemon` when there is nothing worth
+   * keeping (embeddings off, no catalog model, GGUF not on disk) or the
+   * chat daemon is not up yet, since a start in flight must be cancelled
+   * as before. Ownership of the chat side is dropped so the supervisor
+   * does not restart it on the cloud route. The `s` key and Stop keep
+   * calling `stopDaemon`.
+   */
+  async stopChatForCloudSelection(): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const chat = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+    if (!chat.running || !this.buildEmbeddingStartOptions(cfg, dataDir)) {
+      return this.stopDaemon();
+    }
+    // Ownership goes before the kill: a supervisor tick that sees the chat
+    // pid dead while the stop is still refreshing would otherwise restart
+    // the chat daemon on the cloud route. A failed stop gives it back.
+    const owned = this.daemonSupervised;
+    this.daemonSupervised = false;
+    if (owned) this.embeddingKeptForCloud = true;
+    const stopped = await this.stopChatDaemonOnly({
+      stoppedLine: "local-llm: chat server stopped, memory search stays on",
+    });
+    if (stopped) return;
+    if (owned) {
+      this.embeddingKeptForCloud = false;
+      this.daemonSupervised = true;
+    }
+  }
+
+  /**
+   * Stop only the managed *chat* daemon, leaving the embedding daemon —
+   * and therefore hybrid recall — running. Used when the chat route moves
+   * to an external llama-server: the managed chat process is the one that
+   * got replaced, and it would otherwise sit on its VRAM forever.
+   *
+   * A no-op when nothing is running, so callers can fire it
+   * unconditionally without emitting a misleading "stopped" line.
+   * `daemonSupervised` is deliberately left alone: the embedding side may
+   * still be ours to tear down at exit.
+   *
+   * @param opts.stoppedLine overrides the feed line for callers that are
+   * not switching to an external server (the restart, which brings the
+   * managed daemon straight back).
+   * @returns whether the chat daemon is down afterwards — `false` only
+   * when the stop itself failed (a `ForeignDaemonError`, say). The
+   * failure is reported here rather than thrown, so a caller that means
+   * to start a server on top of the stop has to read this instead: the
+   * only guard in `daemon-lifecycle.startDaemon` is a pid file the dead
+   * process still owns.
+   */
+  async stopChatDaemonOnly(opts?: { stoppedLine?: string }): Promise<boolean> {
+    return this.operations.run(() => this.stopChatDaemonOnlyNow(opts), false);
+  }
+
+  private async stopChatDaemonOnlyNow(opts?: { stoppedLine?: string }): Promise<boolean> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const status = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+    if (!status.running) {
+      await this.refresh();
+      return true;
+    }
+    this.bus.emit({ type: "local_models_daemon_phase_set", phase: "stopping" });
+    this.beginActiveRefresh();
+    try {
+      await stopChatDaemonProcess(dataDir);
+      this.bus.emit({
+        type: "runtime_info",
+        line:
+          opts?.stoppedLine ??
+          "local-llm: managed chat daemon stopped — the external URL is the chat route now",
+      });
+      return true;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({ type: "local_models_daemon_error_set", message: msg });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: stop failed — ${msg}`,
+      });
+      return false;
+    } finally {
+      this.endActiveRefresh();
+      await this.refresh();
+    }
+  }
+
+  /**
+   * Silent stop for shutdown paths. No bus events are emitted (the TUI
+   * is already unmounting), just the underlying process kill. Memory-v2
+   * phase 1B: stops both daemons atomically.
+   */
+  private async stopDaemonSilent(): Promise<void> {
+    const cfg = getConfig();
+    try {
+      await stopChatAndEmbeddingDaemons(cfg.paths.localModelsDataDir, {
+        timeoutMs: 2000,
+      });
+    } catch {
+      /* best-effort during shutdown */
+    }
+    // With the models unloaded, the idle Atomic Core daemon goes too. Core
+    // itself refuses while any model session or other client remains.
+    if (cfg.localModels.managed.engine === "atomic-core") {
+      await retireIdleCore(cfg.paths.localModelsDataDir);
+    }
+  }
+
+  /**
+   * Resolve the optional `embedding` argument for `startChatAndEmbeddingDaemons`.
+   * Returns `undefined` when embeddings are disabled, no model is selected, an
+   * unknown model id is configured, or the model file isn't on disk — every
+   * one of these is a "skip embedding" condition by design (graceful
+   * degradation, see ../../memory/docs/retrieval.md).
+   */
+  private buildEmbeddingStartOptions(
+    cfg: ReturnType<typeof getConfig>,
+    dataDir: string,
+  ): EmbeddingDaemonStartOptions | undefined {
+    const emb = cfg.localModels.embeddings;
+    if (!emb.enabled) return undefined;
+    if (!emb.modelId || !isKnownEmbeddingModelId(emb.modelId)) return undefined;
+    const def = getEmbeddingModelDef(emb.modelId);
+    if (!isEmbeddingModelDownloaded(dataDir, def)) return undefined;
+    return { dataDir, modelId: emb.modelId, port: emb.port };
+  }
+
+  /**
+   * Surface the embedding-side outcome to the runtime feed without
+   * promoting it to a `daemon_error_set` — the chat daemon already
+   * succeeded, so the panel-level error slot stays clear. Memory-v2
+   * phase 1B: embedding failure ⇒ FTS5-only fallback, not a fatal stop.
+   *
+   * A *failed* start is reported but never persisted: this runs from
+   * `startDaemon`, which `autoStartIfReady` calls at TUI launch with no
+   * user action, so a one-off start failure must not erase the
+   * operator's durable hybrid-recall opt-in (issue #465). Fallback is
+   * already handled at runtime — `bootstrap` probes the daemon and
+   * degrades to FTS5 when it is unreachable, flag or no flag.
+   */
+  private reportEmbeddingStartOutcome(
+    embedding: { pid: number } | { error: string } | { skipped: true; lowMemory?: true },
+    requested: EmbeddingDaemonStartOptions | undefined,
+  ): void {
+    if ("pid" in embedding) {
+      const id = requested?.modelId ?? "embedding";
+      persistMemoryEmbeddingsEnabled(true);
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding daemon up (${id}, pid ${embedding.pid}) — hybrid recall on`,
+      });
+    } else if ("error" in embedding) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding daemon failed — hybrid recall unavailable until it starts, FTS5 recall still works (${embedding.error})`,
+      });
+    } else if ("lowMemory" in embedding) {
+      // Held back, not failed: the opt-in stays as it is (issue #465).
+      this.noteLowMemoryEmbedding();
+    } else if (!requested) {
+      // skipped is also returned when no embedding was requested;
+      // only emit a hint when the operator has enabled embeddings but
+      // the runtime found a reason to skip (e.g. model not downloaded).
+      const emb = getConfig().localModels.embeddings;
+      if (emb.enabled && emb.modelId) {
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: embedding skipped — model ${emb.modelId} not on disk`,
+        });
+      }
+    }
+  }
+
+  /** ATO-379: the memory model was held back for low memory; one short note per process. */
+  private noteLowMemoryEmbedding(): void {
+    if (!claimLowMemoryEmbeddingNote()) return;
+    this.bus.emit({ type: "runtime_info", line: `local-llm: ${LOW_MEMORY_EMBEDDING_NOTE}` });
+  }
+
+  /**
+   * Memory-v2 phase 1B pairing invariant: if the chat daemon is alive,
+   * the embedding daemon should be alive **iff** `embeddings.enabled`
+   * + `modelId` is a known catalog entry + the GGUF is on disk.
+   *
+   * This helper reconciles the embedding side to that invariant
+   * without touching the chat daemon. It is called from every code
+   * path that mutates embedding-side config outside the main
+   * `startDaemon` / `stopDaemon` flows (pull / activate / toggle /
+   * adopt). When the chat daemon is not running we no-op — the next
+   * `startDaemon` call will pair both sides atomically via
+   * `startChatAndEmbeddingDaemons`, which is the cheaper path.
+   *
+   * @param opts.hotSwap when true, restart the embedding daemon even
+   *   if it is already running. Used by `setActiveEmbedding` /
+   *   `pullEmbeddingModel` where the model id (and possibly dim) has
+   *   just changed and the running server is now stale.
+   */
+  private async ensureEmbeddingPaired(opts?: {
+    hotSwap?: boolean;
+  }): Promise<void> {
+    return this.operations.run(() => this.ensureEmbeddingPairedNow(opts), undefined, false);
+  }
+
+  private async ensureEmbeddingPairedNow(opts?: {
+    hotSwap?: boolean;
+  }): Promise<void> {
+    if (this.closing) return;
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+
+    const chat = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+    if (!chat.running) return;
+
+    const desired = this.buildEmbeddingStartOptions(cfg, dataDir);
+    const embStatus = await getEmbeddingDaemonStatus(
+      dataDir,
+      cfg.localModels.embeddings.port,
+    );
+
+    if (!desired) {
+      if (embStatus.running) {
+        const reason = !cfg.localModels.embeddings.enabled
+          ? "disabled"
+          : !cfg.localModels.embeddings.modelId
+            ? "no model selected"
+            : "model not on disk";
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: stopping embedding daemon (${reason})`,
+        });
+        try {
+          await stopEmbeddingDaemon(dataDir, { timeoutMs: 4000 });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          this.bus.emit({
+            type: "runtime_info",
+            line: `local-llm: embedding stop failed — ${msg}`,
+          });
+        }
+      }
+      // Unlike the start-failure paths above, `!desired` is not a
+      // transient sample of a daemon: it means the master switch is
+      // off, no model is selected, or the GGUF is not on disk. Those
+      // are durable config/disk facts, so persisting `false` here is
+      // reconciliation, not the intent-clobber of issue #465.
+      if (cfg.memory.embeddings.enabled) {
+        persistMemoryEmbeddingsEnabled(false);
+      }
+      return;
+    }
+
+    if (embStatus.running && !opts?.hotSwap) return;
+
+    // ATO-379: not started on a machine with little memory; recall stays on
+    // keywords. Transient, so the opt-in is not touched (issue #465).
+    if (!embStatus.running && !(await holdEmbeddingForLowMemory(dataDir)).ok) {
+      this.noteLowMemoryEmbedding();
+      return;
+    }
+
+    if (embStatus.running && opts?.hotSwap) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: hot-swapping embedding daemon → ${desired.modelId}…`,
+      });
+      try {
+        await stopEmbeddingDaemon(dataDir, { timeoutMs: 4000 });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: embedding stop failed — ${msg}`,
+        });
+        return;
+      }
+    } else {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: starting embedding daemon (${desired.modelId})…`,
+      });
+    }
+
+    const wanted = this.captureStopGuard();
+    try {
+      const { pid } = await this.trackCoreStart(this.operations.signal, signal =>
+        startEmbeddingDaemon({ ...desired, signal, engine: cfg.localModels.managed.engine }));
+      this.operations.signal?.throwIfAborted();
+      persistMemoryEmbeddingsEnabled(true);
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding daemon up (${desired.modelId}, pid ${pid}) — hybrid recall on`,
+      });
+    } catch (e) {
+      // Cancelled by Stop, shutdown or a newer choice: nothing failed.
+      if (this.operations.signal?.aborted || !wanted()) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      // Not persisted: `autoStartIfReady` reaches this at TUI launch
+      // with no user action, and a transient start failure must not
+      // erase the operator's opt-in (issue #465). `bootstrap` probes
+      // the daemon on every boot and falls back to FTS5 by itself.
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding daemon failed — hybrid recall unavailable until it starts, FTS5 recall still works (${msg})`,
+      });
+    }
+  }
+
+  /**
+   * Latch `memory.embeddings.enabled` **on** once the operator enabled
+   * embeddings, a model is on disk and the daemon is running. Does not
+   * flip `localModels.embeddings.enabled` — that is the operator master
+   * switch (`E` hotkey).
+   *
+   * One-way by design. This runs off the snapshot timer (5s, 1s while a
+   * daemon is starting), so `emb.running` is a transient observation: a
+   * single sample taken while the daemon starts, restarts or auto-updates
+   * would otherwise write `false` to disk permanently and silently drop
+   * the runtime to FTS5-only recall at every later boot — in `serve` mode
+   * nothing ever writes the flag back. Writing `false` buys nothing
+   * anyway: `bootstrap` already probes the daemon and degrades gracefully
+   * when the flag is on but the daemon is unreachable. Turning hybrid
+   * recall off stays with the user-initiated paths (stop daemon, master
+   * switch, model teardown).
+   */
+  private reconcileHybridRecallFromDaemon(emb: EmbeddingDaemonInfo): void {
+    const cfg = getConfig();
+    if (cfg.memory.embeddings.enabled) return;
+    const dataDir = cfg.paths.localModelsDataDir;
+    const modelId = cfg.localModels.embeddings.modelId;
+    const hasModel =
+      modelId !== null &&
+      isKnownEmbeddingModelId(modelId) &&
+      isEmbeddingModelDownloaded(dataDir, getEmbeddingModelDef(modelId));
+    const shouldEnable =
+      cfg.localModels.embeddings.enabled && hasModel && emb.running;
+    if (!shouldEnable) return;
+    persistMemoryEmbeddingsEnabled(true);
+  }
+
+  /**
+   * Memory-v2 phase 1B. Pull an embedding GGUF through the detached
+   * worker (see `pullModel`), mark it active for hybrid recall and, when
+   * the chat daemon is up, bring the embedding daemon up beside it.
+   */
+  async pullEmbeddingModel(
+    id: EmbeddingModelId,
+    opts?: PullOptions,
+  ): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const def = getEmbeddingModelDef(id);
+
+    if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: backend missing — downloading llama.cpp first…",
+      });
+      await this.pullBackend();
+      if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) return;
+    }
+
+    try {
+      if (!isEmbeddingModelDownloaded(dataDir, def)) {
+        const watched = await this.runDownloadJob(
+          "embedding",
+          id,
+          "gguf-only",
+          opts,
+        );
+        if (watched.outcome === "detached") return;
+        if (watched.outcome === "cancelled") {
+          this.bus.emit({
+            type: "local_models_pull_failed",
+            kind: "embedding",
+            error: describeCancelledPull(watched.job),
+          });
+          return;
+        }
+      }
+      this.bus.emit({ type: "local_models_pull_finished", kind: "embedding" });
+      persistEmbeddingHybridRecall({ enabled: true, modelId: id });
+      await this.refresh();
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding model ${def.name} ready`,
+      });
+      await this.startEmbeddingDaemonAfterPull(def);
+      this.hooks?.onEmbeddingModelChanged?.();
+      removeDownloadJob(dataDir, downloadJobId("embedding", id));
+    } catch (e) {
+      if (isAbortError(e)) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "embedding",
+        error: msg,
+      });
+    }
+  }
+
+  /**
+   * Memory-v2 phase 1B. Persist the operator's embedding-model choice
+   * and refresh. If the chat daemon is running, hot-swap the embedding
+   * daemon to the newly selected model so the pairing invariant holds
+   * (see `ensureEmbeddingPaired`). When the new model is not yet on
+   * disk, only the config is persisted — the next pull will pair on
+   * success.
+   */
+  async setActiveEmbedding(id: EmbeddingModelId): Promise<void> {
+    return this.operations.run(() => this.setActiveEmbeddingNow(id), undefined, false);
+  }
+
+  private async setActiveEmbeddingNow(id: EmbeddingModelId): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const def = getEmbeddingModelDef(id);
+    if (!isEmbeddingModelDownloaded(dataDir, def)) {
+      persistEmbeddingHybridRecall({ enabled: false, modelId: id });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding ${def.name} selected (Enter to pull)`,
+      });
+      await this.refresh();
+      // Embeddings are off until the pull: memory stops writing vectors
+      // for the previous model now.
+      this.hooks?.onEmbeddingModelChanged?.();
+      return;
+    }
+    persistEmbeddingHybridRecall({ enabled: true, modelId: id });
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: embedding ${def.name} selected`,
+    });
+    await this.refresh();
+    await this.startEmbeddingPairing();
+    // After the hot swap, so the runtime probes the daemon that now
+    // serves the new model, not the one being replaced.
+    this.hooks?.onEmbeddingModelChanged?.();
+  }
+
+  /**
+   * Memory-v2 phase 1B. Toggle `localModels.embeddings.enabled` — the
+   * master switch. The pairing invariant is honoured: enabling spins
+   * the embedding daemon up (when chat is alive + model is on disk),
+   * disabling stops it. Chat daemon is never touched.
+   */
+  /**
+   * Start (or hot-swap) the embedding daemon for the configured
+   * active model. No-op when chat is down — the operator must press
+   * `s` first so pairing can run.
+   */
+  async startEmbeddingPairing(): Promise<void> {
+    return this.operations.run(() => this.startEmbeddingPairingNow(), undefined, false);
+  }
+
+  private async startEmbeddingPairingNow(): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    if (!cfg.localModels.embeddings.modelId) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: pick an embedding model first (j/k + Enter on a row)",
+      });
+      return;
+    }
+    if (!cfg.localModels.embeddings.enabled) {
+      persistUserLocalModelsConfig({
+        embeddings: {
+          enabled: true,
+          modelId: cfg.localModels.embeddings.modelId,
+        },
+      });
+      resetConfigCache();
+    }
+    const chat = await getDaemonStatus(dataDir, cfg.localModels.managed.port);
+    if (!chat.running) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: "local-llm: chat daemon is down — press s to start chat+embedding together",
+      });
+      return;
+    }
+    await this.ensureEmbeddingPaired({ hotSwap: true });
+    await this.refresh();
+  }
+
+  async toggleEmbeddingEnabled(): Promise<void> {
+    return this.operations.run(() => this.toggleEmbeddingEnabledNow(), undefined, false);
+  }
+
+  private async toggleEmbeddingEnabledNow(): Promise<void> {
+    const cfg = getConfig();
+    const next = !cfg.localModels.embeddings.enabled;
+    if (next) {
+      // Master switch on — hybrid recall flips on once the daemon is
+      // actually running (`reconcileHybridRecallFromDaemon`).
+      persistUserLocalModelsConfig({
+        embeddings: {
+          enabled: true,
+          modelId: cfg.localModels.embeddings.modelId,
+        },
+      });
+    } else {
+      persistEmbeddingHybridRecall({ enabled: false });
+    }
+    resetConfigCache();
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: embeddings ${next ? "enabled" : "disabled"}`,
+    });
+    await this.refresh();
+    if (next) {
+      await this.startEmbeddingPairing();
+    } else {
+      await this.ensureEmbeddingPaired();
+      await this.refresh();
+    }
+    this.hooks?.onEmbeddingModelChanged?.();
+  }
+
+  async disableEmbedding(): Promise<void> {
+    return this.operations.run(() => this.disableEmbeddingNow(), undefined, false);
+  }
+
+  private async disableEmbeddingNow(): Promise<void> {
+    const cfg = getConfig();
+    const wasEnabled = cfg.localModels.embeddings.enabled;
+    const dataDir = cfg.paths.localModelsDataDir;
+    const status = await getEmbeddingDaemonStatus(
+      dataDir,
+      cfg.localModels.embeddings.port,
+    );
+    if (!wasEnabled && !status.running) return;
+    persistEmbeddingHybridRecall({ enabled: false });
+    resetConfigCache();
+    this.bus.emit({
+      type: "runtime_info",
+      line: "local-llm: local embeddings disabled for cloud embedding route",
+    });
+    await this.ensureEmbeddingPaired();
+    await this.refresh();
+    this.hooks?.onEmbeddingModelChanged?.();
+  }
+
+  /**
+   * Memory-v2 phase 1B. Delete an embedding model's GGUF from disk.
+   * If the deleted model is the one currently configured as active,
+   * the embedding daemon is stopped first so we never race against
+   * a partially-deleted file the server still has mmap'd, and hybrid
+   * recall is turned off explicitly: removing the active model is a
+   * user action that ends the opt-in. This used to be left to the
+   * snapshot reconciler's `hasModel` branch, which no longer writes
+   * `false` at all (issue #465) — the master switch is deliberately
+   * untouched, exactly as the reconciler left it.
+   */
+  async removeEmbeddingModel(id: EmbeddingModelId): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const def = getEmbeddingModelDef(id);
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: removing embedding ${def.name}…`,
+    });
+    if (
+      cfg.localModels.embeddings.modelId === id &&
+      cfg.localModels.embeddings.enabled
+    ) {
+      const st = await getEmbeddingDaemonStatus(
+        dataDir,
+        cfg.localModels.embeddings.port,
+      );
+      if (st.running) {
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: stopping embedding daemon (was serving ${def.name})…`,
+        });
+        // Atomic stop is cheaper than calling stopEmbeddingDaemon
+        // alone and keeps invariants consistent — but here we only
+        // want the embedding side down. The atomic stop also stops
+        // chat, which is a usability problem mid-conversation. Use
+        // the embedding-only stop path instead.
+        try {
+          await stopEmbeddingDaemon(dataDir, { timeoutMs: 4000 });
+        } catch {
+          /* best-effort; removal proceeds either way */
+        }
+      }
+    }
+    try {
+      await removeEmbeddingModelFiles(dataDir, id);
+      if (cfg.localModels.embeddings.modelId === id) {
+        persistMemoryEmbeddingsEnabled(false);
+      }
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: embedding ${def.name} removed`,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({
+        type: "local_models_error_set",
+        message: `remove failed: ${msg}`,
+      });
+    } finally {
+      await this.refresh();
+      this.hooks?.onEmbeddingModelChanged?.();
+    }
+  }
+
+  /**
+   * Build an `EmbeddingDaemonInfo` snapshot for the panel. Reads live
+   * pid/health from `getEmbeddingDaemonStatus` so the indicator stays
+   * accurate even when the daemon was started outside the TUI (e.g.
+   * `atomic-agent models start` in another terminal).
+   */
+  private async collectEmbeddingDaemonInfo(
+    dataDir: string,
+    activeId: EmbeddingModelId | null,
+  ): Promise<EmbeddingDaemonInfo> {
+    const cfg = getConfig();
+    const st = await getEmbeddingDaemonStatus(
+      dataDir,
+      cfg.localModels.embeddings.port,
+    );
+    return {
+      enabled: cfg.localModels.embeddings.enabled,
+      running: st.running,
+      healthy: st.healthy,
+      loading: st.loading,
+      ...(st.authMismatch ? { authMismatch: true } : {}),
+      pid: st.pid,
+      port: st.port,
+      activeModelId: activeId,
+    };
+  }
+
+  /**
+   * Check GitHub Releases and replace the llama.cpp zip when a newer
+   * tag exists. Returns whether the caller may proceed to start.
+   *
+   * Every update failure is fire-safe: the installer stages the new
+   * build and only swaps it in once it is complete, so a failed check,
+   * stop or download leaves the previous binary on disk and start
+   * continues on it. `false` is reserved for the one case that cannot
+   * be papered over — the daemon was stopped for an update and no
+   * usable backend remains.
+   */
+  private async applyBackendAutoUpdate(
+    dataDir: string,
+    opts?: { keepDaemonRunning?: boolean },
+  ): Promise<boolean> {
+    try {
+      const result = await maybeAutoUpdateBackend(dataDir, {
+        engine: getConfig().localModels.managed.engine,
+        enabled: getConfig().localModels.managed.autoUpdate,
+        keepDaemonRunning: opts?.keepDaemonRunning,
+        // A check from the last few hours stands, whichever process made
+        // it (the desktop's `models start`, another TUI).
+        recheckAfterMs: AUTO_UPDATE_RECHECK_MS,
+        // The zip is small (27-39 MB) but the link may not be. Without a
+        // deadline a stalled-open connection pins the download for the
+        // life of the process; the next start retries from scratch.
+        signal: AbortSignal.any([AbortSignal.timeout(BACKEND_DOWNLOAD_TIMEOUT_MS), ...(this.operations.signal ? [this.operations.signal] : [])]),
+        onWillDownload: () => {
+          this.bus.emit({
+            type: "local_models_pull_started",
+            pull: {
+              kind: "backend",
+              modelId: "_backend",
+              label: getConfig().localModels.managed.engine === "atomic-core" ? "Atomic Core engine" : "llama.cpp backend",
+              percent: 0,
+              transferredBytes: 0,
+              totalBytes: 0,
+              error: null,
+            },
+          });
+        },
+        onProgress: (percent: number, transferred: number, total: number) => {
+          this.bus.emit({
+            type: "local_models_pull_progress",
+            kind: "backend",
+            percent,
+            transferredBytes: transferred,
+            totalBytes: total,
+          });
+        },
+      });
+      if (this.operations.signal?.aborted) return false;
+      if (result.action === "updated") {
+        this.bus.emit({ type: "local_models_pull_finished", kind: "backend" });
+        this.bus.emit({
+          type: "runtime_info",
+          line: getConfig().localModels.managed.engine === "atomic-core"
+            ? `local-llm: installed ${result.to}${result.from ? ` (was ${result.from})` : ""}`
+            : `local-llm: updated llama.cpp ${result.from ?? "none"} → ${result.to}`,
+        });
+      } else if (result.action === "check_failed") {
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: backend update check failed — starting current binary (${result.error})`,
+        });
+      } else if (result.action === "deferred") {
+        this.bus.emit({
+          type: "runtime_info",
+          line:
+            result.reason === "daemon_live"
+              ? "local-llm: backend update deferred — will install on next start"
+              : "local-llm: backend update deferred — another session is using the current binary",
+        });
+      } else if (result.action === "update_failed") {
+        this.bus.emit({
+          type: "local_models_pull_failed",
+          kind: "backend",
+          error: result.error,
+        });
+        if (!result.backendUsable) {
+          if (await this.fallBackFromCore(result.coreFailure)) {
+            // Now on llama.cpp: install it and go on with the start.
+            await this.pullBackend();
+            return isBackendDownloaded(dataDir, getConfig().localModels.managed.engine);
+          }
+          if (!result.coreFailure || !this.reportCoreFailure(undefined, result.coreFailure)) {
+            this.bus.emit({
+              type: "runtime_info",
+              line: `local-llm: backend update failed and no usable backend remains — ${result.error}`,
+            });
+          }
+          return false;
+        }
+        this.bus.emit({
+          type: "runtime_info",
+          line: `local-llm: backend update failed — starting current binary (${result.error})`,
+        });
+      }
+      return true;
+    } catch (e) {
+      if (this.operations.signal?.aborted) return false;
+      const msg = e instanceof Error ? e.message : String(e);
+      this.bus.emit({
+        type: "local_models_pull_failed",
+        kind: "backend",
+        error: msg,
+      });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: backend auto-update failed — ${msg}`,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Called once at TUI startup. If the user is in managed mode AND the
+   * backend + model are already on disk AND no daemon is currently
+   * running, start the daemon so the user lands in a ready state
+   * without needing an extra keypress.
+   *
+   * The backend auto-update runs **after** the daemon is up, never
+   * before. Checking first meant the user got a rendered TUI they
+   * could type into while no model was loaded — a prompt that silently
+   * does nothing reads as a broken agent, and the download (27-39 MB,
+   * unbounded on a stalled link) sat on that path. Starting first
+   * costs one session on the previous binary; the swap is picked up on
+   * the next start. A daemon already serving a model is left alone for
+   * the same reason.
+   */
+  async autoStartIfReady(): Promise<void> {
+    return this.operations.run(() => this.autoStartIfReadyNow(), undefined);
+  }
+
+  private async autoStartIfReadyNow(): Promise<void> {
+    const cfg = getConfig();
+    if (
+      cfg.llm?.activeTextProvider &&
+      cfg.llm.activeTextProvider !== "local-llama"
+    ) {
+      return;
+    }
+    if (cfg.localModels.mode !== "managed") return;
+    const mid = cfg.localModels.managed.modelId;
+    if (!mid || !isKnownLocalModelId(mid)) return;
+    const dataDir = cfg.paths.localModelsDataDir;
+    const def = getLocalModelDef(mid);
+    if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      // llama.cpp is never fetched at launch. Atomic Core is the default
+      // engine, and a model that served yesterday must not silently stay
+      // down because its engine changed: install it with progress, then
+      // start. A failure leaves the panel's retry / llama.cpp notice.
+      // A server still running from before the engine changed is adopted
+      // below as it is; the install waits for the next start.
+      if (getConfig().localModels.managed.engine !== "atomic-core" || !isModelDownloaded(dataDir, def)) return;
+      if (!(await getDaemonStatus(dataDir, cfg.localModels.managed.port)).running) {
+        this.bus.emit({ type: "runtime_info", line: "local-llm: installing the Atomic Chat engine…" });
+        await this.pullBackend();
+        if (this.operations.signal?.aborted || !isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) return;
+      }
+    }
+    if (!isModelDownloaded(dataDir, def)) return;
+    const running = await getDaemonStatus(
+      dataDir,
+      cfg.localModels.managed.port,
+    );
+    if (this.operations.signal?.aborted) return;
+    if (running.running && !(await this.servesConfiguredModel(mid))) {
+      // Ours by pid, but it serves another model (the config moved on
+      // while it ran). Adopting it would answer every turn with the
+      // wrong weights — bounce it onto the configured one.
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: the running server is not ${def.name} — restarting it`,
+      });
+      if (await this.stopChatDaemonOnly()) {
+        await this.startDaemon({ backendAlreadyChecked: true });
+      }
+      this.scheduleBackendAutoUpdate(dataDir);
+      return;
+    }
+    if (this.operations.signal?.aborted) return;
+    if (running.running) {
+      // Already started by a previous TUI session; adopt it.
+      this.daemonSupervised = true;
+      this.supervisor.noteStarted();
+      // The chat daemon may have been started before the embedding
+      // model was downloaded / configured. Reconcile the embedding
+      // side to the current intent so the pairing invariant holds
+      // (see `ensureEmbeddingPaired`).
+      await this.ensureEmbeddingPaired();
+      await this.refresh();
+      this.scheduleBackendAutoUpdate(dataDir);
+      return;
+    }
+    // `startDaemon` owns the pre-start check on the path where the
+    // backend has to be replaced before a daemon exists; here it must
+    // not run one, because the deferred pass below owns it.
+    await this.startDaemon({ backendAlreadyChecked: true });
+    this.scheduleBackendAutoUpdate(dataDir);
+  }
+
+  /** How a start reports and persists what it did to a held port. */
+  private portClearanceDeps(): PortClearanceDeps {
+    return {
+      say: (line) => this.bus.emit({ type: "runtime_info", line }),
+      onChatPortMoved: (url) => this.hooks?.onManagedPortMoved?.(url),
+    };
+  }
+
+  /**
+   * Whether the managed port serves `modelId` (`/v1/models` lists the
+   * `-a` alias). A server that does not answer the route — still
+   * loading, or a build without it — is given the benefit of the doubt:
+   * only a positive "something else" is a mismatch.
+   */
+  private async servesConfiguredModel(modelId: string): Promise<boolean> {
+    const served = await fetchServedModelIds(getConfig().localModels.managed.port);
+    return served === null || served.includes(modelId);
+  }
+
+  /**
+   * The mid-session half of `autoStartIfReady`'s adoption. Launch with a
+   * cloud provider active skips adoption (the early return above), so a
+   * daemon left running by a previous session, or by `models start`,
+   * belonged to nobody after the operator moved the route onto it with
+   * `/llm provider local-llama`, the Cloud pane, `/model`, a session's
+   * restored provider or a run-mode change: a `kill -9` was never
+   * restarted, and `stopOnExit` never stopped it at quit.
+   *
+   * Called on every change of the active text provider and on every
+   * run-mode change. Ownership only, never a start: when our pid is
+   * alive and the new route uses the managed daemon (`local-llama`
+   * active, or a Fusion leg on it), this takes it exactly as the launch
+   * adoption does — for the supervisor and for teardown alike, since
+   * the launch adoption draws no line between a daemon a previous TUI
+   * left and one `models start` launched. A daemon serving another
+   * model is adopted the same way; the next start or restart (the
+   * supervisor's included) launches the configured one. A route moving
+   * away from the daemon changes nothing: it keeps serving the fallback
+   * chain's local link and stays owned.
+   *
+   * @param activeId the provider being made active, when the caller
+   *   knows it before the config write lands.
+   * @returns whether the daemon is now owned by this TUI.
+   */
+  adoptDaemonForRoute(activeId?: string): boolean {
+    if (this.daemonSupervised) return true;
+    const cfg = getConfig();
+    if (cfg.localModels.mode !== "managed") return false;
+    const mid = cfg.localModels.managed.modelId;
+    if (!mid || !isKnownLocalModelId(mid)) return false;
+    const resolved = resolveLlmConfig(cfg);
+    const active = activeId ?? resolved.activeTextProvider;
+    const rm = resolveRunMode(resolved, { managedModelId: mid });
+    const usesDaemon =
+      active === "local-llama" ||
+      (rm.effective === "fusion" &&
+        (rm.orchestratorProviderId === "local-llama" ||
+          rm.workerProviderId === "local-llama"));
+    if (!usesDaemon) return false;
+    if (readRunningPid(cfg.paths.localModelsDataDir) === null) return false;
+    this.daemonSupervised = true;
+    this.supervisor.noteStarted();
+    void this.refresh().catch(() => {
+      /* the next poll repaints the pane */
+    });
+    return true;
+  }
+
+  /**
+   * Run the backend auto-update once the daemon is serving, off the
+   * start path. Deliberately not awaited: the result only matters for
+   * the *next* start, so nothing the user is waiting on depends on it.
+   * `maybeAutoUpdateBackend` already defers when any daemon is live
+   * (`hasOtherLiveSessions` / `readRunningPid`), so the model we just
+   * started is not pulled out from under the user mid-turn.
+   */
+  private scheduleBackendAutoUpdate(dataDir: string): void {
+    this.operations.defer(() => this.applyBackendAutoUpdate(dataDir, {
+      keepDaemonRunning: true,
+    }));
+  }
+
+  /**
+   * One-click bootstrap for managed mode: download the llama.cpp backend
+   * (if missing) and then the target model (defaults to the currently
+   * configured managed.modelId, or the recommended catalog default).
+   * Emits status lines so the user sees progress in the feed even when
+   * the Models tab is not open.
+   */
+  async ensureAutoInstalled(opts?: { modelId?: LocalModelId }): Promise<void> {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const configured = cfg.localModels.managed.modelId;
+    const targetId: LocalModelId =
+      opts?.modelId ??
+      (configured && isKnownLocalModelId(configured)
+        ? configured
+        : DEFAULT_LLAMACPP_MODEL_ID);
+    if (!isBackendDownloaded(dataDir, getConfig().localModels.managed.engine)) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: getConfig().localModels.managed.engine === "atomic-core"
+          ? "local-llm: installing the Atomic Chat engine…"
+          : "local-llm: downloading llama.cpp backend…",
+      });
+      await this.pullBackend();
+    }
+    const def = getLocalModelDef(targetId);
+    if (!isModelDownloaded(dataDir, def)) {
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: downloading model ${def.name} (${def.sizeLabel})…`,
+      });
+      await this.pullModel(targetId, "with-mmproj", { askNotify: false });
+    }
+    persistUserLocalModelsConfig({
+      mode: "managed",
+      managed: { modelId: targetId },
+    });
+    resetConfigCache();
+    await this.refresh();
+    this.bus.emit({
+      type: "runtime_info",
+      line: `local-llm: ready — ${def.name} installed`,
+    });
+  }
+
+  /** One-line status for slash `/models status` (async, emits to bus). */
+  emitStatusLine(): void {
+    void (async () => {
+      const cfg = getConfig();
+      const d = await getDaemonStatus(
+        dataDirOf(cfg),
+        cfg.localModels.managed.port,
+      );
+      this.bus.emit({
+        type: "runtime_info",
+        line: `local-llm: mode=${cfg.localModels.mode} url=${cfg.localModels.url} daemon=${d.running} healthy=${d.healthy}`,
+      });
+    })();
+  }
+
+  private readLogsTail(): void {
+    const cfg = getConfig();
+    const dataDir = cfg.paths.localModelsDataDir;
+    const path = resolveLogFilePath(dataDir);
+    try {
+      const chat = readLogTail(path);
+      // Memory-v2 phase 1B. Stitch the embedding log tail onto the same
+      // viewport when it exists. Keeps a single "LLM Logs" tab — two
+      // tabs would split operator attention while the embedding daemon
+      // is the rare-but-load-bearing piece they actually want to debug.
+      const embedTail = this.readEmbeddingLogTailSilent(dataDir);
+      const text = embedTail
+        ? `${chat.text}\n\n── llama-embed.log ──\n${embedTail.text}`
+        : chat.text;
+      this.bus.emit({
+        type: "local_llm_logs_loaded",
+        text,
+        path,
+        size: chat.size + (embedTail?.size ?? 0),
+        truncated: chat.truncated || (embedTail?.truncated ?? false),
+        at: Date.now(),
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const friendly = msg.includes("ENOENT")
+        ? "(log file not yet created — start the daemon first)"
+        : msg;
+      this.bus.emit({ type: "local_llm_logs_error", message: friendly, path });
+    }
+  }
+
+  /**
+   * Best-effort tail of `llama-embed.log`. Returns `null` when the
+   * file does not exist yet (embedding daemon has never been started
+   * in this `dataDir`) so the chat-only path stays unaffected.
+   */
+  private readEmbeddingLogTailSilent(
+    dataDir: string,
+  ): { text: string; size: number; truncated: boolean } | null {
+    const path = resolveEmbeddingLogFilePath(dataDir);
+    try {
+      return readLogTail(path);
+    } catch {
+      return null;
+    }
+  }
+
+  private beginActiveRefresh(): void {
+    if (this.activeTimer) return;
+    this.activeTimer = setInterval(() => {
+      void this.refresh();
+    }, SNAPSHOT_POLL_MS_ACTIVE);
+  }
+
+  private endActiveRefresh(): void {
+    if (this.activeTimer) clearInterval(this.activeTimer);
+    this.activeTimer = null;
+  }
+}
+
+function dataDirOf(cfg: ReturnType<typeof getConfig>): string {
+  return cfg.paths.localModelsDataDir;
+}
+
+/**
+ * Host physical RAM in whole decimal GB (rounded down). Consumers use
+ * this to decide which models are realistic candidates on this
+ * machine — nothing fancy, just `os.totalmem() / 1e9`.
+ */
+function detectHostRamGb(): number {
+  return Math.max(1, Math.floor(totalmem() / 1_000_000_000));
+}
+
+/**
+ * Map a model definition + on-disk state to an `MmprojStatus`. Text-only
+ * models always return `"n/a"` — keeping the three states distinct in
+ * the UI (vs. boolean `mmprojDownloaded`) is what lets the panel render
+ * a different glyph for "not applicable" vs "missing".
+ */
+function resolveMmprojStatus(
+  dataDir: string,
+  def: LocalModelDef,
+): MmprojStatus {
+  if (!def.supportsVision) return "n/a";
+  return isMmprojDownloaded(dataDir, def) ? "downloaded" : "missing";
+}
+
+/** Per-pull switches threaded from the caller down to the watch. */
+export interface PullOptions {
+  /** `false` skips the "tell me when it lands?" prompt (onboarding has its own flow). */
+  askNotify?: boolean;
+}
+
+/** `"Qwen 3.5 4B (gguf)"` → `"Qwen 3.5 4B"`: the phase is worker detail. */
+function cleanLabel(label: string): string {
+  return label.replace(/\s*\((gguf|mmproj)\)\s*$/i, "");
+}
+
+/** `Qwen 3.5 4B`, or `Qwen 3.5 4B and Nomic Embed` when two pulls are in flight. */
+function describeWatched(labels: readonly string[]): string {
+  const names = labels.map(cleanLabel);
+  if (names.length === 0) return "";
+  if (names.length === 1) return names[0]!;
+  return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+
+function channelName(channel: DownloadNotifyChannel): string {
+  return channel === "telegram"
+    ? "Telegram"
+    : channel === "discord"
+      ? "Discord"
+      : "E-mail";
+}
+
+/** The hub row a channel's credentials live on. */
+function integrationIdFor(channel: DownloadNotifyChannel): string {
+  return channel === "email" ? "atomic-mail" : channel;
+}
+
+/** How often a watched worker's record is re-read. */
+const DOWNLOAD_POLL_MS = 300;
+/** How long a stale `running` record is tolerated before it is declared dead. */
+const STALE_GRACE_MS = 60_000;
+
+function formatJobBytes(bytes: number): string {
+  const gb = bytes / (1024 * 1024 * 1024);
+  return gb >= 1
+    ? `${gb.toFixed(1)} GB`
+    : `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+
+function describeCancelledPull(job: DownloadJob): string {
+  return `download cancelled at ${job.percent}% — ${formatJobBytes(job.transferredBytes)} kept on disk; Enter resumes it`;
+}
+
+function describeProjectorFailure(def: LocalModelDef, error: string): string {
+  return `${def.name}: projector not downloaded (${error}) — the model works text-only; Enter on the row retries the projector`;
+}
+
+function describeAdoptedJob(job: DownloadJob, name: string): string {
+  switch (job.status) {
+    case "running":
+      return `local-llm: ${name} is downloading in the background (${job.percent}%) — picking it up`;
+    case "interrupted":
+      return `local-llm: ${name} download was interrupted at ${job.percent}% — resuming`;
+    case "failed":
+      return `local-llm: ${name} download gave up at ${job.percent}% (${job.error ?? "no reason recorded"}) — resuming`;
+    default:
+      return job.mmprojError
+        ? `local-llm: ${name} finished downloading while the app was closed (without its projector)`
+        : `local-llm: ${name} finished downloading while the app was closed`;
+  }
+}
+
+function isAbortError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  if (e.name === "AbortError") return true;
+  const cause = (e as Error & { cause?: unknown }).cause;
+  return cause instanceof Error && cause.name === "AbortError";
+}

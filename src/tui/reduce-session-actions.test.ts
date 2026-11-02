@@ -1,0 +1,347 @@
+import { describe, expect, it } from "vitest";
+import { reduceTuiState } from "./agent-event-reducer.js";
+import { apply, fakeSession } from "./test-fixtures.js";
+import {
+  createInitialTuiState,
+  type ChatMessage,
+  type SessionPickerEntry,
+} from "./tui-state.js";
+
+function entry(
+  overrides: Partial<SessionPickerEntry> = {},
+): SessionPickerEntry {
+  return {
+    sessionId: "s1",
+    workingDir: "/tmp",
+    turnCount: 0,
+    stepCount: 0,
+    updatedAt: Date.now(),
+    preview: "(empty)",
+    pinned: false,
+    ...overrides,
+  };
+}
+
+describe("session picker reducer", () => {
+  it("opens the picker with the given sessions list and resets cursor", () => {
+    const initial = createInitialTuiState(fakeSession());
+    const next = reduceTuiState(initial, {
+      type: "session_picker_opened",
+      sessions: [entry({ sessionId: "a" }), entry({ sessionId: "b" })],
+    });
+    expect(next.sessionPickerOpen).toBe(true);
+    expect(next.sessionPickerList.map((s) => s.sessionId)).toEqual(["a", "b"]);
+    expect(next.sessionPickerCursor).toBe(0);
+  });
+
+  it("clamps cursor movement to the list bounds", () => {
+    const initial = createInitialTuiState(fakeSession());
+    const open = reduceTuiState(initial, {
+      type: "session_picker_opened",
+      sessions: [entry({ sessionId: "a" }), entry({ sessionId: "b" })],
+    });
+    const down = reduceTuiState(open, {
+      type: "session_picker_cursor_moved",
+      delta: 1,
+    });
+    expect(down.sessionPickerCursor).toBe(1);
+    const pastBottom = reduceTuiState(down, {
+      type: "session_picker_cursor_moved",
+      delta: 1,
+    });
+    expect(pastBottom.sessionPickerCursor).toBe(1);
+    const pastTop = reduceTuiState(pastBottom, {
+      type: "session_picker_cursor_moved",
+      delta: -99,
+    });
+    expect(pastTop.sessionPickerCursor).toBe(0);
+  });
+
+  it("an open picker follows the rail's list and keeps its cursor", () => {
+    // The rail reads the store one page at a time, and the picker's ↓
+    // is one of the two ways to ask for the next page. The answer
+    // arrives as `recent_sessions_updated`, so an open picker has to
+    // take it — with the cursor where the operator left it, or the walk
+    // that fetched the rows would be undone by the rows arriving.
+    const initial = createInitialTuiState(fakeSession());
+    const primed = apply(initial, [
+      {
+        type: "session_picker_opened",
+        sessions: [entry({ sessionId: "a" }), entry({ sessionId: "b" })],
+      },
+      { type: "session_picker_cursor_moved", delta: 1 },
+    ]);
+    expect(primed.sessionPickerCursor).toBe(1);
+    const grown = reduceTuiState(primed, {
+      type: "recent_sessions_updated",
+      morePages: false,
+      sessions: [
+        entry({ sessionId: "a" }),
+        entry({ sessionId: "b" }),
+        entry({ sessionId: "c" }),
+      ],
+    });
+    expect(grown.sessionPickerList.map((e) => e.sessionId)).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+    expect(grown.sessionPickerCursor).toBe(1);
+  });
+
+  it("leaves the picker list alone while the picker is closed", () => {
+    const initial = createInitialTuiState(fakeSession());
+    const next = reduceTuiState(initial, {
+      type: "recent_sessions_updated",
+      morePages: false,
+      sessions: [entry({ sessionId: "a" })],
+    });
+    expect(next.sessionPickerOpen).toBe(false);
+    expect(next.sessionPickerList).toEqual([]);
+  });
+
+  it("session_switched replaces transcript + cwd and closes the picker", () => {
+    const initial = createInitialTuiState(fakeSession());
+    const primed = apply(initial, [
+      { type: "agent_event", event: { type: "user_message", text: "old" } },
+      {
+        type: "session_picker_opened",
+        sessions: [entry({ sessionId: "a" })],
+      },
+    ]);
+    const newMsgs: ChatMessage[] = [
+      { id: "m1", role: "user", text: "hello", timestamp: 1 },
+      { id: "m2", role: "assistant", text: "hi", timestamp: 2, toolSteps: 0 },
+    ];
+    const switched = reduceTuiState(primed, {
+      type: "session_switched",
+      sessionId: "new",
+      workingDir: "/new-cwd",
+      messages: newMsgs,
+    });
+    expect(switched.session.sessionId).toBe("new");
+    expect(switched.session.workingDir).toBe("/new-cwd");
+    expect(switched.messages).toHaveLength(2);
+    expect(switched.sessionPickerOpen).toBe(false);
+    expect(switched.runHistory).toEqual([]);
+    expect(switched.feed).toEqual([]);
+    // No `running` flag: the target thread is idle.
+    expect(switched.status).toBe("idle");
+  });
+
+  it("session_switched with running=true resumes the running posture", () => {
+    // Switching back into a thread whose turn was backgrounded (or one
+    // busy with a scheduler/Telegram/HTTP turn): the composer must
+    // offer steer/queue, not pretend the thread is idle.
+    const initial = createInitialTuiState(fakeSession());
+    const switched = reduceTuiState(initial, {
+      type: "session_switched",
+      sessionId: "busy",
+      workingDir: "/w",
+      messages: [],
+      running: true,
+    });
+    expect(switched.status).toBe("running");
+    expect(switched.runStartedAt).not.toBeNull();
+  });
+
+  it("a background session's approval never arms the modal — it lands as a pointer notice", () => {
+    // Every approval key answers whatever `pendingApproval` holds, so a
+    // request from an off-screen thread must never occupy the slot: a
+    // reflexive Ctrl+C would deny a tool call the operator cannot see
+    // and abort the visible turn in the same press.
+    const base = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: "s-visible" },
+    ]);
+    const next = reduceTuiState(base, {
+      type: "approval_requested",
+      request: request("a-bg", "s-elsewhere"),
+    });
+    expect(next.pendingApproval).toBeNull();
+    expect(next.status).toBe(base.status);
+    const notice = next.messages.at(-1);
+    expect(notice?.role).toBe("system");
+    expect(notice?.text).toContain("s-elsewhere");
+    expect(notice?.text).toContain("switch to it to answer");
+  });
+
+  it("session_switched clears the slot; the re-raised request arms it for the new owner", () => {
+    const base = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: "s-visible" },
+    ]);
+    // The LEFT thread's own request is dropped with its transcript —
+    // the orchestrator denies it at the gate on switch-away, so the
+    // modal would ask a question nobody can answer any more.
+    const leavingOwn = apply(base, [
+      { type: "approval_requested", request: request("a-own", "s-visible") },
+      {
+        type: "session_switched",
+        sessionId: "s-next",
+        workingDir: "/w",
+        messages: [],
+      },
+    ]);
+    expect(leavingOwn.pendingApproval).toBeNull();
+    // Switching INTO the owner: the orchestrator re-emits the parked
+    // request right after the switch (`pendingRequestForSession`), and
+    // only then — with its owner on screen — it arms the modal.
+    const intoOwner = apply(base, [
+      { type: "approval_requested", request: request("a-bg", "s-elsewhere") },
+      {
+        type: "session_switched",
+        sessionId: "s-elsewhere",
+        workingDir: "/w",
+        messages: [],
+        running: true,
+      },
+      { type: "approval_requested", request: request("a-bg", "s-elsewhere") },
+    ]);
+    expect(intoOwner.pendingApproval?.approvalId).toBe("a-bg");
+    expect(intoOwner.status).toBe("awaiting_approval");
+  });
+});
+
+function request(id: string, sessionId: string) {
+  return {
+    approvalId: id,
+    sessionId,
+    tool: "os.shell.run",
+    category: "shell" as const,
+    reason: "r",
+  };
+}
+
+describe("agent_event session filter", () => {
+  const userEvent = { type: "user_message", text: "hi" } as const;
+
+  it.each([
+    // [tag on the event, visible session, applied?]
+    ["s-visible", "s-visible", true],
+    ["s-background", "s-visible", false],
+    [undefined, "s-visible", true],
+  ])("event tagged %s with %s visible applied=%s", (tag, visible, applied) => {
+    const base = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: visible },
+    ]);
+    const next = reduceTuiState(base, {
+      type: "agent_event",
+      event: userEvent,
+      ...(tag === undefined ? {} : { sessionId: tag }),
+    });
+    if (applied) {
+      expect(next.messages.some((m) => m.text === "hi")).toBe(true);
+    } else {
+      expect(next).toBe(base);
+    }
+  });
+});
+
+/**
+ * ATO-37: switching threads while the agent is answering. The composer
+ * and the abort chord are one surface shared by every thread, and what
+ * they held belonged to the thread being left.
+ */
+describe("session_switched and the composer", () => {
+  const switchTo = (sessionId: string, running = false) =>
+    ({
+      type: "session_switched",
+      sessionId,
+      workingDir: "/w",
+      messages: [],
+      ...(running ? { running: true } : {}),
+    }) as const;
+  const typed = (value: string) => ({ type: "input_changed", value }) as const;
+
+  it("parks the draft with its thread and hands it back on return", () => {
+    const base = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: "s-a" },
+      typed("half-written steer for a"),
+    ]);
+    // The steer meant for A's running turn must not go out in B as a
+    // brand-new turn on a reflexive Enter.
+    const inB = reduceTuiState(base, switchTo("s-b"));
+    expect(inB.inputValue).toBe("");
+    const backInA = reduceTuiState(
+      reduceTuiState(inB, typed("note for b")),
+      switchTo("s-a", true),
+    );
+    expect(backInA.inputValue).toBe("half-written steer for a");
+    const backInB = reduceTuiState(backInA, switchTo("s-b"));
+    expect(backInB.inputValue).toBe("note for b");
+  });
+
+  it("parks the operator's draft, not the history entry being recalled", () => {
+    const recalling = {
+      ...apply(createInitialTuiState(fakeSession()), [
+        { type: "session_created", sessionId: "s-a" },
+      ]),
+      inputValue: "an old prompt from history",
+      inputHistoryCursor: 0,
+      inputHistoryDraft: "what I was typing",
+    };
+    const away = reduceTuiState(recalling, switchTo("s-b"));
+    expect(away.inputHistoryCursor).toBeNull();
+    expect(away.inputHistoryDraft).toBeNull();
+    expect(reduceTuiState(away, switchTo("s-a")).inputValue).toBe(
+      "what I was typing",
+    );
+  });
+
+  it("leaves the buffer alone when the thread on screen is re-emitted", () => {
+    // The end-of-turn repaint after a lossy re-attach is a
+    // `session_switched` onto the same id; the operator may be typing.
+    const base = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: "s-a" },
+      typed("still typing"),
+    ]);
+    expect(reduceTuiState(base, switchTo("s-a")).inputValue).toBe(
+      "still typing",
+    );
+  });
+
+  it("carries a draft typed before any thread existed instead of losing it", () => {
+    const base = reduceTuiState(
+      createInitialTuiState(fakeSession()),
+      typed("first words"),
+    );
+    expect(reduceTuiState(base, switchTo("s-b")).inputValue).toBe(
+      "first words",
+    );
+  });
+
+  it("does not carry an armed abort into the thread switched to", () => {
+    // Esc in A arms; the `1` that confirms it must not be the first
+    // character typed into a re-attached B and stop B's turn.
+    const armed = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: "s-a" },
+      { type: "abort_armed" },
+    ]);
+    expect(armed.abortArmed).toBe(true);
+    expect(reduceTuiState(armed, switchTo("s-b", true)).abortArmed).toBe(false);
+  });
+
+  it("does not carry a stop in flight into the thread switched to", () => {
+    // A's cancel lands off screen (filtered by session), so nothing
+    // would ever clear the flag — and B's next real failure would read
+    // as "stopped by user".
+    const stopping = apply(createInitialTuiState(fakeSession()), [
+      { type: "session_created", sessionId: "s-a" },
+      { type: "abort_requested" },
+    ]);
+    expect(stopping.aborting).toBe(true);
+    const inB = reduceTuiState(stopping, switchTo("s-b", true));
+    expect(inB.aborting).toBe(false);
+    const failed = reduceTuiState(inB, {
+      type: "agent_event",
+      sessionId: "s-b",
+      event: {
+        type: "loop_failed",
+        error: new Error("provider returned 500"),
+        category: "transport",
+      },
+    });
+    expect(
+      failed.messages.some((m) => m.text === "Agent stopped by user."),
+    ).toBe(false);
+  });
+});

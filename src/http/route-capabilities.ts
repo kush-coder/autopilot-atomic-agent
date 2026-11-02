@@ -1,0 +1,105 @@
+import { sendJson, sendError, type HttpHandler } from "./request-context.js";
+import { openaiError } from "./openai-errors.js";
+import { APPROVAL_DECISIONS } from "./route-approval.js";
+
+/**
+ * `GET /api/capabilities` — summary of the host environment and
+ * runtime wiring. Consumers (admin UIs, status dashboards) use this to
+ * decide which feature toggles to render without probing the agent
+ * loop directly.
+ */
+export function createCapabilitiesHandler(): HttpHandler {
+  return async (req, res, ctx) => {
+    const { runtime } = ctx;
+    const sessionId = new URL(req.url ?? "/", "http://localhost").searchParams.get("sessionId");
+    if (sessionId && !runtime.sessionStore.load(sessionId)) { sendError(res, 404, openaiError("session not found")); return; }
+    const workspace = sessionId ? runtime.getSessionWorkspace(sessionId) : null;
+    // The registry holds every tool bootstrap wired, including the ones
+    // the config gates hide: `github.*` stays registered without a token,
+    // `fusion.delegate` outside fusion (`filter-disabled-tools.ts`). What
+    // the agent is offered is `runtime.toolDescriptors`, the live, gated
+    // catalog the loop and `/tools` read, so only those are listed.
+    // Listing the registry put tools in the desktop's built-in list that
+    // the agent could never be asked to use.
+    const offered = new Set(runtime.toolDescriptors.map((d) => d.name));
+    sendJson(res, 200, {
+      runtime: "atomic-agent",
+      capabilities: workspace ? { ...runtime.capabilities, workingDir: workspace.workingDir } : runtime.capabilities,
+      paths: {
+        stateDir: runtime.config.paths.stateDir,
+        globalSkillsDir: runtime.config.paths.globalSkillsDir,
+        projectSkillsDirName: runtime.config.paths.projectSkillsDirName,
+        sessionsDbFile: runtime.config.paths.sessionsDbFile,
+        grammarsDir: runtime.config.paths.grammarsDir,
+        userConfigFile: runtime.config.paths.userConfigFile,
+      },
+      llama: {
+        url: runtime.config.localModels.url,
+        healthPath: runtime.config.localModels.healthPath,
+        completionPath: runtime.config.localModels.completionPath,
+      },
+      browser: {
+        channel: runtime.config.browser.channel,
+        headless: runtime.config.browser.headless,
+        cdpUrl: runtime.config.browser.cdpUrl,
+      },
+      agent: {
+        tokenBudget: runtime.config.agent.tokenBudget,
+        maxSteps: runtime.config.agent.maxSteps,
+        // No `toolTimeoutMs`: the key still parses, but no tool reads
+        // it, so advertising it told dashboards a limit that never ran.
+        // Source of truth. Live gate state, not the boot-time config
+        // snapshot: reflects `--no-approval` boots and later
+        // `setApprovalLevel` calls (the composer coding-mode control), so admin UIs
+        // render the truth. Level-aware clients read this and ignore
+        // `approvalRequired`.
+        approvalLevel: runtime.getApprovalLevel(),
+        // DEPRECATED — approximate back-compat for clients written
+        // against the binary approve-everything toggle this route shipped
+        // with. `true` while any category can still prompt (level < 5),
+        // derived from `approvalLevel` so the two cannot drift. Kept only
+        // for wire compatibility; read `approvalLevel` instead.
+        //
+        // It is coarse at every mid-ladder level, not just one: a binary
+        // client reads `approvalRequired: true` and may render "approvals
+        // are on" while whole categories are already silent — file writes
+        // at level 2 (workspace) / 3 (home), plus shell / script /
+        // proc-kill at level 4 (operator). The boolean cannot express
+        // "on for some categories, off for others"; only `approvalLevel`
+        // carries that, which is why this field is deprecated.
+        approvalRequired: runtime.getApprovalLevel() < 5,
+        // What `POST /api/approval/resolve` accepts. A client draws the
+        // "allow in this chat" answer only when `allow-in-chat` is listed:
+        // an older agent answers it with a 400.
+        approvalDecisions: [...APPROVAL_DECISIONS],
+      },
+      tools: runtime.toolRegistry
+        .list()
+        .filter((t) => offered.has(t.name))
+        .map((t) => ({
+          name: t.name,
+          description: t.description,
+          readonly: t.readonly,
+        })),
+      skills: (workspace ? workspace.skills.entries.filter(e => !e.disabledReasons.length).map(e => ({ ...e.record.manifest, source: e.record.source })) : runtime.skillCatalog).map((s) => ({
+        name: s.name,
+        description: s.description,
+        source: s.source,
+      })),
+      // How many installed skills `skills.catalogTokenBudget` left out
+      // of `skills` above. Without it the array is indistinguishable
+      // from a complete one and a dashboard renders "12 skills" for an
+      // install of 40 (issue #466 — the prompt learned to say this, the
+      // API had no way to). Machine-facing, so it is a number and not
+      // the `… [truncated]` prose the prompt and the CLI use; the
+      // client decides how to say it.
+      //
+      // Always present, including as `0`. A field that appeared only on
+      // truncation would make absence ambiguous between "nothing was
+      // dropped" and "server too old to know", which is exactly the
+      // guess this field exists to remove. The `skills` array itself is
+      // untouched at zero.
+      skillsOmitted: workspace ? 0 : runtime.skillCatalogDropped,
+    });
+  };
+}

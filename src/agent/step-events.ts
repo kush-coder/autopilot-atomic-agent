@@ -1,0 +1,294 @@
+import type { ToolCallPayload } from "../llm/grammar/tool-call-grammar.js";
+import type { CompletionResult } from "../llm/llama-server-client.js";
+import type { LlmFailureCategory, TruncationCause } from "../llm/reliability/index.js";
+import type { BuiltPrompt } from "../prompt/build-prompt.js";
+import type { CompressedToolResult } from "../compressor/result-compressor.js";
+
+/**
+ * Why an approval barrier stopped its batch: the gated call was not
+ * approved (whoever or whatever answered no), or it ran and failed.
+ */
+export type ApprovalBarrierStopCause = "not_approved" | "failed";
+
+export interface PromptCapturedTokens {
+  total: number;
+  stablePrefix: number;
+  tail: number;
+}
+
+/**
+ * Observability events emitted by `executeStep` in canonical order:
+ *
+ *   1. `prompt_built` (then `prompt_captured` for trace sinks)
+ *   2. `llm_completed` (then `llm_raw_completion` with `attempt: 1`)
+ *   3. Optional `reasoning` / `reasoning_delta` / `assistant_delta`
+ *   4. Optional `parse_retry` (followed by another `llm_completed` +
+ *      `llm_raw_completion` with `attempt: 2`)
+ *   5. `tool_call_parsed` — once per call. For a batched step (N > 1),
+ *      N events fire in batch-index order before any execution starts.
+ *      `batchIndex`/`batchSize` are present on every event; single
+ *      calls report `batchIndex: 0, batchSize: 1`.
+ *   6. `tool_call_executed` — once per call. Order matches the order
+ *      results land (within a serialised group: batch-index order;
+ *      across groups: undefined). The matching `batchIndex` is carried
+ *      so consumers can correlate parsed↔executed pairs.
+ *   7. Optional `assistant_reply` for the `reply` terminal
+ *
+ * `step_error` short-circuits the sequence and carries the failure.
+ */
+export type StepEvent =
+  | { type: "prompt_built"; prompt: BuiltPrompt; slotId: number }
+  /**
+   * Trace-oriented sibling of `prompt_built`: carries the salted hash of
+   * the stable prefix (so per-step records stay small) together with the
+   * full variable tail, token breakdown, and cache-reuse status needed to
+   * replay the prompt later.
+   */
+  | {
+      type: "prompt_captured";
+      stepIndex: number;
+      stablePrefixHash: string;
+      tail: string;
+      tokens: PromptCapturedTokens;
+      slotId: number;
+      cacheReused: boolean;
+    }
+  | { type: "llm_completed"; completion: CompletionResult }
+  /**
+   * Full completion payload (content, reasoning, timing) paired with the
+   * attempt index (1 for the first call, 2 for the parse-retry) so the
+   * trace recorder can distinguish the original inference from the
+   * retry-driven one.
+   */
+  | {
+      type: "llm_raw_completion";
+      stepIndex: number;
+      attempt: 1 | 2;
+      completion: CompletionResult;
+      /**
+       * How much of the completion was reasoning — the text before the
+       * close sentinel (or the server's `reasoning_content`), in the
+       * budget's units of four characters per token (F49). A step that
+       * hit the bound shows about the configured
+       * `localModels.reasoningBudgetTokens` (an estimate from the text,
+       * not a hard floor).
+       * Set by the step executor; absent from hand-built events.
+       */
+      reasoningTokens?: number;
+    }
+  /**
+   * Non-fatal: reasoning model emitted `<think>...</think>` blocks before
+   * the tool-call JSON. Surfaced so UIs can display the model's thought
+   * process without polluting the feed. Always arrives *before*
+   * `tool_call_parsed` and *before* any `step_error` from the parser.
+   */
+  | { type: "reasoning"; stepIndex: number; text: string }
+  /**
+   * Streaming reasoning delta produced live while the model is still
+   * generating the `<think>...</think>` prelude. Only emitted when the
+   * runtime has a streaming LLM callback wired in — the final `reasoning`
+   * event still arrives once the JSON body is parsed. Consumers may either
+   * render both (the final event is authoritative) or ignore one.
+   */
+  | { type: "reasoning_delta"; stepIndex: number; text: string }
+  /**
+   * The step's streamed completion produced its first output, of any
+   * kind — reasoning, reply text or tool-call JSON (ATO-1027). Before it
+   * the provider was still reading the prompt; a host that shows how
+   * long the wait has lasted stops that count here. Once per streamed
+   * completion; never on the unary path; only for a session whose host
+   * asked (`claimTurnProgress`).
+   */
+  | { type: "first_token"; stepIndex: number }
+  /**
+   * How far a local llama-server got through the step's prompt before
+   * the first token (ATO-1027): `processed` of `total` prompt tokens
+   * (the `cached` ones included), `elapsedMs` of evaluation so far.
+   * Emitted per evaluated batch, streamed initial completions only, for
+   * a session whose host asked (`claimTurnProgress`), and only by a
+   * server that reports progress (`return_progress`).
+   */
+  | {
+      type: "prompt_progress";
+      stepIndex: number;
+      processed: number;
+      total: number;
+      cached: number;
+      elapsedMs: number;
+    }
+  /**
+   * Streaming assistant text delta, emitted only for `reply.args.text`.
+   * Other tools never produce this event so non-reply arguments (shell
+   * commands, URLs, file paths, ...) are not confused with user-facing
+   * text.
+   */
+  | { type: "assistant_delta"; text: string }
+  | {
+      type: "tool_call_parsed";
+      call: ToolCallPayload;
+      /**
+       * Position of this call inside the parsed batch (0-based). For a
+       * single-call step always `0`; for a batched step every parsed
+       * event in the same step shares the same `batchSize` and
+       * different `batchIndex` values in `[0, batchSize)`.
+       */
+      batchIndex: number;
+      batchSize: number;
+    }
+  | {
+      type: "tool_call_executed";
+      result: CompressedToolResult;
+      /** Mirrors the corresponding `tool_call_parsed.batchIndex`. */
+      batchIndex: number;
+      batchSize: number;
+      /**
+       * Wall-clock time of the registry invocation (ms), an approval wait
+       * included — what the batch executor measured. Absent for results
+       * nothing ran for (a suppressed terminal, a progress note).
+       */
+      durationMs?: number;
+    }
+  /**
+   * Rare-tool execution failed; the runtime injected the full schema into
+   * `session.loadedTools` so the next step can retry with valid args.
+   */
+  | {
+      type: "rare_tool_autoloaded";
+      tool: string;
+      source: "auto";
+      stepIndex: number;
+    }
+  | {
+      type: "assistant_reply";
+      text: string;
+      /**
+       * Absolute paths of files the reply delivers alongside the text
+       * (`reply.attachments`, validated and resolved by the tool).
+       * Absent when the reply carries none. Channels post them after
+       * the text; the TUI lists them under the bubble.
+       */
+      attachments?: readonly string[];
+      /**
+       * An interim message, not the end of the turn: the model batched
+       * this `reply` with work tools, the work ran and the step loop
+       * goes on (`progress-note-reply.ts`). Consumers that treat
+       * `assistant_reply` as the turn's answer should expect another.
+       */
+      progressNote?: true;
+    }
+  /**
+   * Emitted once when the first `parseToolCall` threw and the executor
+   * re-runs the LLM call to recover. Includes the failure reason so
+   * postmortems can tell grammar truncation from malformed JSON.
+   */
+  | { type: "parse_retry"; stepIndex: number; attempt: number; reason: string }
+  /**
+   * The first completion of the step was an answer cut at its length
+   * limit, and the step asked the model once to write the rest
+   * (ATO-1031, `step-answer-continuation.ts`). `outcome`: `completed`
+   * (the joined answer is the step's reply), `cut_again` (the rest was
+   * cut too; the reply carries what arrived and says so) or `abandoned`
+   * (the continuation failed; the step ends with the original
+   * truncation). Counts only — never the text.
+   */
+  | {
+      type: "answer_continued";
+      stepIndex: number;
+      cause: TruncationCause;
+      partialChars: number;
+      outcome: "completed" | "cut_again" | "abandoned";
+    }
+  /**
+   * Emitted in place of `parse_retry` when a multi-call batch failed
+   * validation purely because it contained approval-gated tools. The
+   * runtime auto-splits the batch: the first approval-gated call is
+   * executed as a length-1 batch, all other calls are dropped, and a
+   * `### notice` is injected into the next step's prompt so the model
+   * can retry the dropped calls one-by-one. No LLM round-trip happens
+   * for the trim — this avoids the bewildered-repair pathology where
+   * qwen models pivot to an irrelevant length-1 tool (e.g.
+   * `skill.view`).
+   */
+  | {
+      type: "batch_trimmed";
+      stepIndex: number;
+      /** Original batch size emitted by the model. Always >= 2. */
+      originalSize: number;
+      /** Tool name of the call we kept (executed as length-1 batch). */
+      kept: string;
+      /** Tool names of dropped calls in original batch-index order. */
+      dropped: string[];
+      /**
+       * Tool names dropped because the turn's policy (plan mode, the
+       * fusion orchestrator gate) would have refused them — not to be
+       * retried. Omitted when none. Disjoint from `dropped`.
+       */
+      refused?: string[];
+      /** Canonical trim cause. New reasons may be added over time. */
+      reason: "approval-gated-batched";
+    }
+  /**
+   * A model-emitted batch larger than `agent.maxParallelToolCalls` was
+   * mechanically split into bounded waves because every call was
+   * preflight-validated as registered, argument-schema-valid, and
+   * classified `pure_read`. No LLM repair round-trip happened — the
+   * batch executes deterministically in waves of at most `cap`. An
+   * oversized batch containing any non-`pure_read` call bypasses this
+   * (and approval trimming) and routes to `parse_retry` instead.
+   */
+  | {
+      type: "batch_wave_split";
+      stepIndex: number;
+      /** Original batch size the model emitted. Always > cap. */
+      originalSize: number;
+      /** Wave size cap (== agent.maxParallelToolCalls). */
+      cap: number;
+      /** Number of waves: ceil(originalSize / cap). */
+      waveCount: number;
+      /** Start index of each wave in the original call array. */
+      boundaries: number[];
+    }
+  /**
+   * A multi-call batch holding approval-gated calls that could prompt ran
+   * behind approval barriers instead of being trimmed to its first gated
+   * call (issue #109): the batchable calls ahead of each gated call ran
+   * through the class-aware planner and settled, then the gated call ran
+   * alone, and the calls after it ran only once it was approved and came
+   * back `ok`. Emitted after the batch ran. Every call keeps the payload
+   * the model emitted; none is re-generated.
+   */
+  | {
+      type: "batch_approval_barriers";
+      stepIndex: number;
+      /** Calls the model emitted. Always >= 2. */
+      originalSize: number;
+      /** Runs of batchable calls that completed. */
+      waves: number;
+      /** Approval-gated calls that ran, each alone. */
+      barriers: number;
+      /** Calls that ran, with the payload the model emitted. */
+      retained: number;
+      /**
+       * Calls that never ran: a barrier before them did not succeed, or
+       * the turn was cancelled.
+       */
+      invalidated: number;
+      /**
+       * The gated call that stopped the batch and why — the user did not
+       * approve it, or it ran and failed. Omitted when nothing stopped it.
+       */
+      stoppedBy?: {
+        tool: string;
+        batchIndex: number;
+        cause: ApprovalBarrierStopCause;
+      };
+      /** The turn was cancelled while the batch ran. */
+      cancelled: boolean;
+    }
+  /**
+   * Terminal error for this step. The `category` follows the canonical
+   * LLM failure taxonomy (see `src/llm/reliability/`) and is always set
+   * even when the underlying error shape is a legacy `Error` — the step
+   * executor classifies unknown errors before emitting.
+   */
+  | { type: "step_error"; error: Error; category: LlmFailureCategory };

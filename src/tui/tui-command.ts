@@ -1,0 +1,1182 @@
+import { spawnSync } from "node:child_process";
+import { isSea } from "node:sea";
+import { render } from "ink";
+import React from "react";
+import { resolveBootApprovalLevel } from "../approval/approval-level.js";
+import {
+  formatDotenvReadWarning,
+  getConfig,
+  setConfigNoticeSink,
+  type WhileBusySubmitMode,
+} from "../config/index.js";
+import { checkLlamaServer } from "../llm/llama-server-health.js";
+import {
+  describeLlamaHealthFailure,
+  managedPortsOf,
+} from "../llm/describe-llama-health-failure.js";
+import { createAgentRuntime, type AgentRuntime } from "../runtime/bootstrap.js";
+import { getAppVersion } from "../version.js";
+import type { TuiAction } from "./tui-action.js";
+import type { LogRecord, LogSink } from "../tracing/structured-logger.js";
+import type { MetricSample, MetricSink } from "../tracing/metrics-collector.js";
+import { isKnownLocalModelId } from "../local-llm/index.js";
+import { registerSession } from "../local-llm/server/session-registry.js";
+import { enterAltScreen } from "./alt-screen.js";
+import { buildInkRenderOptions } from "./ink-render-options.js";
+import { enableSynchronizedOutput } from "./synchronized-output.js";
+import { legacyConhostStartupHint } from "./legacy-conhost.js";
+import { ChatOrchestrator } from "./chat-orchestrator.js";
+import {
+  parseTuiArgs,
+  nonInteractiveStdinError,
+  TUI_HELP,
+} from "./tui-args.js";
+import {
+  persistUserLocalLlmUrl,
+  pointsAtManagedDaemon,
+} from "./persist-user-local-models-config.js";
+import {
+  persistUserTuiMouse,
+  persistUserTuiTheme,
+  persistUserWhileBusySubmit,
+} from "./persist-user-tui-config.js";
+import { createMouseStdin } from "./mouse/mouse-stdin.js";
+import { makeMouseSource } from "./mouse/mouse-source.js";
+import {
+  enableMouseTracking,
+  type MouseTrackingController,
+} from "./mouse/mouse-tracking.js";
+import { createSelectionPassthrough } from "./mouse/selection-passthrough.js";
+import { isLocalBackendConfigured } from "./local-backend-readiness.js";
+import { makeEscalatingSignalHandler } from "./signal-escalation.js";
+import { restoreTerminalNow } from "./terminal-restore.js";
+import { needsOnboarding } from "./onboarding/needs-onboarding.js";
+import { createOnboardingState } from "./onboarding/onboarding-state.js";
+import {
+  ONBOARDING_RERUN_RESET,
+  reopenOnboarding,
+} from "./onboarding/rerun-onboarding.js";
+import { persistOnboardingState } from "./onboarding/persist-onboarding-state.js";
+import {
+  currentTerminalLaunchInput,
+  openAgentTerminalWindow,
+} from "./open-terminal-window.js";
+import { openUrlInBrowser } from "./open-url.js";
+import { detectKittyKeyboard } from "./detect-kitty-keyboard.js";
+import { setShiftEnterNewline } from "./shift-enter-support.js";
+import { makeTuiEventBus, TuiApp } from "./tui-app.js";
+import { createHerdrReporter } from "./herdr-reporter.js";
+import {
+  detectTerminalBackground,
+  resolveStartupTheme,
+} from "./theme/detect-terminal-background.js";
+import { resolveThemeName, setActiveTheme, THEMES } from "./theme/theme.js";
+import type { InitialTuiLayoutOptions, TuiSessionInfo } from "./tui-state.js";
+import {
+  loadUninstallPreview,
+  performUninstall,
+} from "./uninstall/uninstall-orchestrator.js";
+
+/**
+ * CLI entry for `atomic-agent tui`. Boots the full runtime once and stays
+ * alive across multiple goals: every Enter in the goal input spawns a
+ * fresh `SessionState`, runs the loop, and returns the UI to `idle`. The
+ * browser, `llama-server` slot pool and skill registry are kept warm
+ * between runs — that is the whole point of the chat-like mode.
+ */
+export async function tuiCommand(args: string[]): Promise<number> {
+  const parsed = parseTuiArgs(args);
+  if ("help" in parsed) {
+    process.stdout.write(TUI_HELP);
+    return 0;
+  }
+  if ("error" in parsed) {
+    process.stderr.write(`${parsed.error}\n`);
+    return 2;
+  }
+  // A TUI needs a terminal — refuse a piped stdin with one sentence
+  // instead of letting Ink's raw-mode requirement crash with a stack
+  // trace. See `nonInteractiveStdinError` for the reasoning.
+  const stdinError = nonInteractiveStdinError();
+  if (stdinError) {
+    process.stderr.write(`${stdinError}\n`);
+    return 1;
+  }
+  // Config diagnostics ("created default config at …", "migrated config
+  // v41 → v43 …") are collected instead of printed from here on. They are
+  // written by the first `getConfig()`, which happens two lines below —
+  // long before the alternate screen exists — so on stderr they land
+  // above the interface and stay there for the whole session. Replayed
+  // into the transcript once the app is mounted, and restored to stderr
+  // when the TUI exits.
+  const configNotices: string[] = [];
+  setConfigNoticeSink((line) => configNotices.push(line));
+  // Theme selection BEFORE any Ink render or stdin listener (the first-run
+  // flow and the main render). An explicit
+  // `tui.theme` (a registered name) wins; otherwise `"auto"` (or an unknown
+  // name) falls back to OSC 11 terminal-background autodetection. Running the
+  // probe here means its reply is never swallowed by another stdin consumer,
+  // and both the optional wizard and the main TUI are themed. Autodetect
+  // falls back to dark on any failure (non-TTY, no reply, timeout).
+  const configuredTheme = getConfig().tui.theme;
+  // `resolveThemeName` also rehomes the eleven names the registry used to
+  // carry, so a config pinned to `dracula` lands on the nearest surviving
+  // palette instead of silently falling through to autodetect.
+  const resolvedTheme = resolveThemeName(configuredTheme);
+  if (resolvedTheme) {
+    setActiveTheme(THEMES[resolvedTheme]);
+  } else {
+    setActiveTheme(resolveStartupTheme(await detectTerminalBackground()));
+  }
+  // Ask the terminal whether it speaks the kitty keyboard protocol
+  // BEFORE Ink starts reading stdin — see `detectKittyKeyboard`. It
+  // decides two things: whether Shift+Enter can mean "newline" at all,
+  // and therefore what the hint strip is allowed to promise.
+  const kittyKeyboard = await detectKittyKeyboard();
+  setShiftEnterNewline(kittyKeyboard);
+
+  // The first-run flow is a screen inside the app now, not a program
+  // that runs before it. That is what lets it sit on the alternate
+  // screen (no stray stderr above the UI), react to a resize, and hand a
+  // still-running model download over to the agent — none of which the
+  // pre-render gate could do, because neither the alt screen nor the
+  // runtime existed at the point it ran.
+  const skipOnboarding =
+    parsed.skipLlamaSetup ||
+    process.env.ATOMIC_AGENT_TUI_SKIP_LLAMA_SETUP === "1";
+  // `--onboarding` is `/onboarding` from the shell: the flow opens
+  // whatever `decideOnboarding` would have said. It beats the
+  // SKIP_LLAMA_SETUP env var on purpose — a flag typed on this launch is
+  // more specific than an ambient variable a harness or profile exports;
+  // only the two *flags* together are refused (`parseTuiArgs`), since
+  // that pair is a contradiction on one command line. `rerun` is read
+  // before the stamp reset, which itself waits until just before the
+  // first render, so a launch that dies while the runtime boots clears
+  // nothing.
+  const onboarding = parsed.onboarding
+    ? createOnboardingState(getConfig().localModels.url, {
+        rerun: !needsOnboarding(),
+      })
+    : !skipOnboarding && needsOnboarding()
+      ? createOnboardingState(getConfig().localModels.url)
+      : null;
+  // TUI owns its own llama-server health UX (footer indicator +
+  // LlmHealthPoller). Blocking `createAgentRuntime` on a startup probe
+  // / `/props` fetch just freezes the terminal before the first frame
+  // renders — especially painful in managed mode when the daemon is
+  // still booting. Defer both: the runtime wires the real client +
+  // `ModelProfileManager` and the manager hot-swaps to the correct
+  // profile on the first turn refresh.
+  const deferRuntimeHealthProbe = true;
+  const config = getConfig();
+  // Seed what Enter does while a turn is running from the persisted
+  // preference, so a Ctrl+T flip survives a restart.
+  const initialLayout: InitialTuiLayoutOptions = {
+    onboarding,
+    whileBusyMode: config.tui.whileBusySubmit,
+    // The composer's route controls read these on the home screen, and
+    // the local-models slice only refreshes while the Models tab is
+    // open — unseeded, a managed install mislabels itself `custom`
+    // until the operator visits that tab once.
+    localModels: {
+      configMode: config.localModels.mode,
+      activeModelId:
+        config.localModels.managed.modelId &&
+        isKnownLocalModelId(config.localModels.managed.modelId)
+          ? config.localModels.managed.modelId
+          : null,
+    },
+  };
+  const approvalLevel = resolveBootApprovalLevel(
+    parsed.noApproval,
+    config.agent.approvalLevel,
+  );
+  // `--max-steps` is the operator's ceiling for a whole task. Without it
+  // nothing is passed on, so the runtime applies its own defaults:
+  // `agent.maxSteps` is the leg length and `agent.task.maxSteps` the
+  // ceiling. Filling the config value in here turned the leg into a hard
+  // ceiling and quietly stopped every TUI turn at 25 steps.
+  const maxSteps = parsed.maxSteps ?? undefined;
+  const bus = makeTuiEventBus();
+  // Set when the user presses a key on the post-self-update restart prompt.
+  // Honoured after the Ink app unmounts and the runtime shuts down: we
+  // re-exec the freshly-installed binary in place (see end of this function).
+  let restartRequested = false;
+  // Set when the uninstall ladder's last key is pressed. The removal is
+  // deliberately NOT done here: it runs after the Ink app unmounts and
+  // `orchestrator.shutdown()` has closed the SQLite handles and stopped
+  // llama-server, in the same post-exit slot the self-update restart
+  // uses (see the end of this function).
+  let uninstallRequested = false;
+  // The answer to the ladder's desktop question, when it was asked.
+  let uninstallKeepDesktopData = false;
+
+  const logSink: LogSink = (record: LogRecord) => bus.emitLog(record);
+  const metricSink: MetricSink = (sample: MetricSample) =>
+    bus.emitMetric(sample);
+
+  // Forward declaration: the channel-status sink needs the
+  // orchestrator, but the orchestrator needs the runtime, which the
+  // sink must already exist for. Bind a `let` slot now and resolve it
+  // after construction; the closure stays inert until the runtime
+  // emits its first transition.
+  let orchestratorForChannelStatus: ChatOrchestrator | null = null;
+  const runtime = await createAgentRuntime({
+    workingDir: parsed.workingDir,
+    approvalLevel,
+    traceDefault: true,
+    // The TUI is the one entry point a person actually launches; the
+    // arg-parse / TTY early returns above have already run, so `--help`
+    // and a non-TTY invocation never reach here.
+    interactiveLaunch: true,
+    analyticsSurface: "tui",
+    handlers: {
+      onAgentEvent: (event, sessionId) => bus.emitAgentEvent(event, sessionId),
+      onApprovalRequest: (request) => bus.emitApproval(request),
+      onSkillRegistryChange: (entries, dropped) => {
+        if (orchestratorForChannelStatus) orchestratorForChannelStatus.skills.refresh();
+        else bus.emit({ type: "skill_count_changed", count: entries.length, dropped });
+      },
+      onChannelStatus: (status) => {
+        // Telegram status flows through the panel orchestrator, which
+        // both updates the panel slice and emits a runtime_info line
+        // for the Feed tab. Future channels can fan out from this
+        // single sink without touching the runtime contract.
+        orchestratorForChannelStatus?.telegram.forwardStatus(status);
+        bus.emit({
+          type: "runtime_info",
+          line: status.lastError
+            ? `[${status.channel}] ${status.state}: ${status.lastError}`
+            : `[${status.channel}] ${status.state}`,
+        });
+      },
+      logSinks: [logSink],
+      metricSinks: [metricSink],
+    },
+    ...(deferRuntimeHealthProbe
+      ? { overrides: { deferLlamaHealthCheck: true } }
+      : {}),
+  });
+
+  const sessionInfo: TuiSessionInfo = {
+    sessionId: null,
+    workingDir: parsed.workingDir,
+    llamaUrl: config.localModels.url,
+    browserChannel: config.browser.channel,
+    browserHeadless: config.browser.headless,
+    approvalLevel,
+    // Shown in the session facts: the operator's ceiling when given,
+    // otherwise the leg length the runtime will use.
+    maxSteps: maxSteps ?? config.agent.maxSteps,
+    completionMaxTokens: config.localModels.completionMaxTokens,
+    skillCount: runtime.skillCatalog.length,
+    // The catalog is what the prompt got, not what is installed: a big
+    // enough install is cut at `skills.catalogTokenBudget` and the
+    // count alone then reads as the whole library (issue #466). Seeded
+    // here and kept live by `skill_count_changed`.
+    skillCountDropped: runtime.skillCatalogDropped,
+    // Read after the startup gate, so a local model picked in the wizard
+    // moments ago already counts as configured for this launch.
+    localBackendConfigured: isLocalBackendConfigured(),
+  };
+
+  const orchestrator = new ChatOrchestrator(runtime, bus, {
+    maxSteps,
+    llamaUrl: config.localModels.url,
+  });
+  orchestratorForChannelStatus = orchestrator;
+
+  // First signal quits gracefully; a repeat (a wedged shutdown being
+  // Ctrl-C'd again, a `kill` after a hang) restores the terminal —
+  // mouse reporting off, alt screen left — and exits hard, instead of
+  // Node's default kill that skips `exit` hooks and leaves the shell
+  // printing `[<0;64;21M` on every click. See `signal-escalation.ts`.
+  const onSignal = makeEscalatingSignalHandler({
+    quit: () => orchestrator.quit(),
+    restoreTerminal: restoreTerminalNow,
+    exit: (code) => process.exit(code),
+  });
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  // SIGHUP fires when the terminal window is closed. Without a handler
+  // the default action kills the process before `orchestrator.shutdown()`
+  // runs, orphaning the managed llama-server with the model still in
+  // RAM/VRAM — the exact complaint in #52.
+  process.on("SIGHUP", onSignal);
+
+  // Mark this process as a live TUI session so `stopOnExit` teardown can
+  // tell "last session exits, stop the daemon" from "another window is
+  // still chatting, leave it running".
+  const releaseSession = registerSession(config.paths.localModelsDataDir);
+
+  const altScreen = enterAltScreen({
+    stdout: process.stdout,
+    hideCursor: false,
+  });
+  // Immediately after the alt screen and before the first render: every
+  // frame from here on is bracketed as one synchronized update, so a
+  // terminal that renders as bytes arrive shows whole frames instead of
+  // half of the old one and half of the new.
+  const synchronizedOutput = enableSynchronizedOutput({
+    stdout: process.stdout,
+  });
+
+  // Mouse support. Enabling SGR tracking (1002 + 1006) is what makes
+  // clicking panels, rows, tabs and the prompt work at all — the app
+  // cannot see a click the terminal never reports. The cost is real and
+  // was the reason this was previously left off: while reporting is on,
+  // the terminal stops doing its own drag-to-select. The escape hatch is
+  // `selectionPassthrough` below: a plain drag that starts on dead
+  // content — or a shift-/alt-modified press on a terminal without a
+  // native bypass (Apple Terminal) — suspends reporting for a short
+  // window so the terminal's own selection takes over.
+  // Reporting also stays a toggle — `tui.mouse` in the config,
+  // `--mouse` / `--no-mouse` per run, and `/mouse on|off` live. With
+  // reporting off, behaviour is exactly what it was before:
+  // alternate-scroll (`\x1b[?1007h` from `enterAltScreen`) turns the
+  // wheel into cursor keys, which
+  // `handleAppKey.shouldTreatArrowAsChatScroll` routes into
+  // `chat_scrolled`.
+  //
+  // The decoded events reach React through `mouseSource`; the bytes
+  // themselves are stripped from the stream Ink reads, because Ink's key
+  // parser would otherwise type them into the chat buffer.
+  const mouseEnabled = parsed.mouse ?? config.tui.mouse;
+  const mouseSource = makeMouseSource();
+  let mouseTracking: MouseTrackingController | null = mouseEnabled
+    ? enableMouseTracking({ stdout: process.stdout })
+    : null;
+  // Text-selection passthrough: a shift- or alt-modified press means
+  // the operator is reaching for the terminal's own drag-to-select, not
+  // a click — see `selection-passthrough.ts` for why that report only
+  // ever arrives on a terminal without a native bypass. The same window
+  // also opens on a plain drag over dead content, via
+  // `onSelectionDragIntent` below. The `tracking` getter
+  // reads the live `mouseTracking` binding because `/mouse on|off`
+  // replaces the controller underneath the window; a captured one would
+  // resume a controller nobody is using any more.
+  const selectionPassthrough = createSelectionPassthrough({
+    tracking: () => mouseTracking,
+    notify: (text) => bus.emit({ type: "system_message", text }),
+  });
+  // `mouseTracking` is the single source of truth for "is the mouse on",
+  // and it is read here on every report rather than captured, so
+  // `setMouseEnabled` reassigning it takes effect immediately. Normally
+  // a terminal that was told to stop reporting sends nothing anyway, but
+  // this keeps `/mouse off` honest for the cases where it still does:
+  // a multiplexer that swallowed the disable, or a bracketed paste whose
+  // payload happens to contain an SGR report.
+  const mouseStdin = createMouseStdin(
+    process.stdin,
+    (event) => {
+      if (!mouseTracking) return;
+      // The passthrough sees every event before the app does: a consumed
+      // shift-press must never reach the hit test, and while the window
+      // is open a report that was already in flight when reporting
+      // stopped is swallowed too — the operator is selecting, not
+      // clicking.
+      if (selectionPassthrough.observe(event)) return;
+      if (mouseTracking.isSuspended()) return;
+      mouseSource.emit(event);
+    },
+    {
+      mouseActive: () => mouseTracking !== null,
+      // The leak breaker: the terminal answered our tracking request
+      // with reports the decoder could not consume (seen over ssh with
+      // encoding-confused hops), and coordinates were about to be typed
+      // into the composer. Stop asking for reports — for this session
+      // only, so the persisted preference still serves terminals where
+      // the mouse works.
+      onMouseTextLeak: () => {
+        mouseTracking?.disable();
+        mouseTracking = null;
+        bus.emit({
+          type: "system_message",
+          variant: "warn",
+          text: "this terminal is sending garbled mouse reports — mouse support disabled for this session (/mouse on to retry, or launch with --no-mouse)",
+        });
+      },
+    },
+  );
+  const setMouseEnabled = (next: boolean | null): void => {
+    if (next === null) {
+      bus.emit({
+        type: "system_message",
+        text: `mouse support is ${mouseTracking ? "on" : "off"} — /mouse on|off to change`,
+      });
+      return;
+    }
+    if (next === Boolean(mouseTracking)) {
+      bus.emit({
+        type: "system_message",
+        text: `mouse support already ${next ? "on" : "off"}`,
+      });
+      return;
+    }
+    if (next) {
+      mouseTracking = enableMouseTracking({ stdout: process.stdout });
+    } else {
+      mouseTracking?.disable();
+      mouseTracking = null;
+    }
+    try {
+      persistUserTuiMouse(next);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      bus.emit({
+        type: "runtime_info",
+        line: `mouse setting not saved: ${msg}`,
+      });
+    }
+    bus.emit({
+      type: "system_message",
+      text: next
+        ? "mouse support on — click panels, rows and the prompt; wheel scrolls"
+        : "mouse support off — the terminal's own text selection is back",
+    });
+  };
+
+  // Created out here rather than inside the app so the goodbye call
+  // survives quit paths that tear the process down without unmounting
+  // the React tree; null outside a herdr pane.
+  const herdrReporter = createHerdrReporter();
+
+  // `--onboarding`'s stamp reset, deferred to here from the decision
+  // above: the runtime is up and the next line mounts the flow.
+  if (parsed.onboarding) persistOnboardingState(ONBOARDING_RERUN_RESET);
+  const ink = render(
+    React.createElement(TuiApp, {
+      session: sessionInfo,
+      bus,
+      ...(initialLayout ? { initialLayout } : {}),
+      ...(herdrReporter ? { herdrReporter } : {}),
+      callbacks: {
+        onAbort: () => orchestrator.abortCurrentTurn(),
+        onQuit: () => orchestrator.quit(),
+        onApprovalDecision: (approvalId, approved, grant) => {
+          runtime.approvals.resolve({
+            approvalId,
+            approved,
+            // No reason on a deny: it would reach the model as the
+            // user's own words (see `ApprovalDecision.reason`).
+            ...(approved ? { reason: "tui-approved" } : {}),
+            ...(grant ? { grant } : {}),
+          });
+        },
+        onApprovalRetarget: (approvalId, path) => {
+          runtime.approvals.resolve({
+            approvalId,
+            approved: true,
+            reason: "tui-approved (retargeted)",
+            pathOverride: path,
+          });
+        },
+        onApprovalReply: (approvalId, message) => {
+          // Order matters: resolve first so the blocked tool call fails
+          // fast with the operator's words, then steer. Steering before
+          // the resolve would push the note at a turn still parked on
+          // `await approvals.request(...)`.
+          runtime.approvals.resolve({
+            approvalId,
+            approved: false,
+            reason: message,
+          });
+          orchestrator.steerMessage(message);
+        },
+        onMessageSubmitted: (text) => orchestrator.sendMessage(text),
+        onQueueClearRequested: () => orchestrator.clearQueue(),
+        onMessageSteered: (text) => orchestrator.steerMessage(text),
+        onWhileBusyModePersistRequested: (mode) =>
+          persistWhileBusyMode(mode, bus),
+        // The mode is a stance for this session, so it moves the live
+        // ladder and the live plan flag and writes neither to
+        // `config.json`. The persisted baseline stays whatever
+        // `agent.approvalLevel` in config.json says — otherwise a
+        // session that passed through `bypass` would leave the machine
+        // trusting everything on the next boot.
+        onCodingModeChanged: (_mode, resolved) => {
+          runtime.setApprovalLevel(resolved.approvalLevel);
+          runtime.setPlanMode(resolved.planMode);
+        },
+        onSessionPickerRequested: () => orchestrator.openSessionPicker(),
+        onSessionSwitchRequested: (id) => orchestrator.switchSession(id),
+        onSessionPinToggled: (id) => orchestrator.togglePinned(id),
+        onSessionMoveRequested: (id, toIndex) =>
+          orchestrator.moveSession(id, toIndex),
+        onSessionsEndReached: () => orchestrator.loadMoreSessions(),
+        onSessionNewRequested: () => orchestrator.newSession(),
+        onCompactionRequested: (verb) => { void orchestrator.compactContext(verb); },
+        onPromptEnhanceRequested: (draft) => { void orchestrator.enhancePrompt(draft); },
+        onPromptEnhanceCancel: () => orchestrator.cancelPromptEnhance(),
+        onSessionDeleteConfirmed: (sessionId) =>
+          orchestrator.deleteSession(sessionId),
+        onUninstallPlanRequested: () =>
+          void loadUninstallPreview(bus, config.paths.stateDir),
+        onOnboardingRerunRequested: () =>
+          reopenOnboarding((action) => bus.emit(action)),
+        onUninstallConfirmed: (choice) => {
+          uninstallRequested = true;
+          uninstallKeepDesktopData = choice.keepDesktopData;
+          orchestrator.quit();
+        },
+        onNewWindowRequested: () => openNewAgentWindow(parsed.workingDir, bus),
+        onOpenUrlRequested: (url) => openUrlFromChat(url, bus),
+        onMemoryDumpRequested: () => orchestrator.dumpProfile(),
+        onSkillCatalogRequested: () => orchestrator.dumpSkillCatalog(),
+        onPersistLlamaUrl: (nextUrl) =>
+          persistLlamaUrl(nextUrl, bus, orchestrator, runtime),
+        onThemePersistRequested: (themeName) =>
+          persistThemeChoice(themeName, bus),
+        onTasksAutoRefreshStart: () => orchestrator.tasks.startAutoRefresh(),
+        onTasksRefreshRequested: () => orchestrator.tasks.refresh(),
+        onTaskDetailRequested: (taskId) =>
+          orchestrator.tasks.openDetail(taskId),
+        onSidebarTaskActivated: (taskId) => {
+          // Sidebar Enter on a task: jump to the Tasks debug tab and
+          // surface the detail view. Two dispatches because the keymap
+          // layer cannot reach the bus directly — `tab_changed` flips
+          // the active tab, then `openDetail` seeds the firings ring +
+          // emits `tasks_detail_opened`.
+          bus.emit({ type: "ui_mode_set", mode: "debug" });
+          bus.emit({ type: "tab_changed", tab: "tasks" });
+          orchestrator.tasks.openDetail(taskId);
+        },
+        onTaskNewRequested: () => {
+          // Sidebar `+ new` on the Tasks header: land on the Tasks debug
+          // tab with the create form already open — the destination the
+          // in-panel `n` key reaches, minus the walk. The form-open
+          // action is the same one `n` dispatches, emitted on the bus
+          // for the reason the sibling above spells out.
+          bus.emit({ type: "ui_mode_set", mode: "debug" });
+          bus.emit({ type: "tab_changed", tab: "tasks" });
+          bus.emit({ type: "tasks_create_form_opened" });
+        },
+        onTaskOpenSessionRequested: (taskId) =>
+          orchestrator.tasks.openSession(taskId),
+        onTaskCancelConfirmed: (taskId) =>
+          orchestrator.tasks.cancelTask(taskId),
+        onTaskRunNowRequested: (taskId) => orchestrator.tasks.runNow(taskId),
+        onTaskCreateSubmitted: (input) => orchestrator.tasks.createTask(input),
+        onSkillsAutoRefreshStart: () => orchestrator.skills.startAutoRefresh(),
+        prepareSkillInvocation: (name, input) => orchestrator.skills.prepareInvocation(name, input),
+        onSkillsRefreshRequested: () => orchestrator.skills.refresh(),
+        onSkillDetailRequested: (name) =>
+          void orchestrator.skills.openDetail(name),
+        onSkillToggleRequested: (name) =>
+          void orchestrator.skills.toggleSkill(name),
+        onWorkspaceSkillToggleRequested: (name) => orchestrator.skills.toggleWorkspaceSkill(name),
+        onProjectSkillsToggleRequested: () => orchestrator.skills.toggleProjectSkills(),
+        onSkillRemoveRequested: (name) =>
+          void orchestrator.skills.requestRemove(name),
+        onSkillRemoveConfirmed: (name) =>
+          void orchestrator.skills.confirmRemove(name),
+        onSkillEnableRequested: (name) =>
+          void orchestrator.skills.setSkillDisabled(name, false),
+        onSkillDisableRequested: (name) =>
+          void orchestrator.skills.setSkillDisabled(name, true),
+        onSkillHubOpen: () => void orchestrator.skills.openHub(),
+        onSkillHubRefresh: () => void orchestrator.skills.refreshHub(),
+        onSkillHubSearch: (query) => void orchestrator.skills.searchHub(query),
+        onSkillHubCardOpen: (row) => void orchestrator.skills.openHubCard(row),
+        onSkillHubInstall: (identifier, source) =>
+          void orchestrator.skills.installFromHub(identifier, source),
+        onSkillInstallConfirmed: (identifier) =>
+          void orchestrator.skills.confirmInstall(identifier),
+        onSkillInstallCancelled: (identifier) =>
+          void orchestrator.skills.cancelInstall(identifier),
+        onMemoryAutoRefreshStart: () => orchestrator.memory.startAutoRefresh(),
+        onMemoryRefreshRequested: (opts) => orchestrator.memory.refresh(opts),
+        onMemoryDetailRequested: (row) => orchestrator.memory.openDetail(row),
+        onMemoryOpenNoteRequested: (noteId) =>
+          orchestrator.memory.openNoteById(noteId),
+        onMemoryExpandNeighborsRequested: (noteId) =>
+          orchestrator.memory.expandNoteNeighbors(noteId),
+        onMcpAutoRefreshStart: () => orchestrator.mcp.startAutoRefresh(),
+        onMcpRefreshRequested: () => orchestrator.mcp.refresh(),
+        onProvidersTabRefresh: () => {
+          orchestrator.providers.refresh();
+          // The catalog fetchers cache at module scope, so a fresh TUI
+          // process starts on the short static lists. Kick the live
+          // refresh here (TUI start + providers/LLM tab activation);
+          // the warm-cache guard inside makes repeats free. Dispatching
+          // a reducer action cannot do this: the keymap/reducer layer
+          // never reaches the bus the orchestrator listens on, which is
+          // exactly how the live lists went missing from the pickers.
+          orchestrator.providers.prefetchCloudCatalogs();
+          // Same for the inline Cloud-pane model list: the /v1/models
+          // fetch for openai-compatible providers starts here so the
+          // section is populated (or visibly loading) by the time the
+          // pane renders.
+          void orchestrator.providers.ensureInlineModels(null);
+          // Mirror the effective fallback chain for the Fallback pane
+          // (config-driven; no network). Re-reads live config so a hot
+          // provider swap re-primes the head on tab re-entry.
+          orchestrator.fallback.refresh();
+        },
+        onProvidersSetActiveText: (id) =>
+          void orchestrator.providers.setActiveText(id),
+        // Run mode: the one write that moves `llm.runMode` and
+        // `llm.activeTextProvider` together lives on this orchestrator.
+        onRunModeChangeRequested: (mode, opts) =>
+          void orchestrator.runMode.setMode(mode, opts),
+        onFusionWorkersChangeRequested: (workers) =>
+          orchestrator.runMode.setWorkers(workers),
+        onFusionLegsSwapRequested: () => void orchestrator.runMode.swapLegs(),
+        onProvidersSelectChatModel: (providerId, modelId) =>
+          void orchestrator.providers.selectChatModel(providerId, modelId),
+        onProvidersChatModelPickerRequested: (providerId) =>
+          void orchestrator.providers.openChatModelPicker(providerId),
+        onProvidersInlineModelsEnsureRequested: (providerId) =>
+          void orchestrator.providers.ensureInlineModels(providerId),
+        onProvidersContractProbeRequested: (providerId) =>
+          void orchestrator.providers.runContractProbe(providerId),
+        onProvidersSetActiveEmbedding: (id) =>
+          void orchestrator.providers.setActiveEmbedding(id),
+        onProvidersSelectEmbeddingModel: (providerId, modelId) =>
+          void orchestrator.providers.selectEmbeddingModel(providerId, modelId),
+        // Fallback pane edits: callbacks, not dispatched actions — only
+        // this layer reaches the orchestrator that writes llm.fallback.*.
+        onFallbackMoveRequested: (providerId, delta) =>
+          orchestrator.fallback.move(providerId, delta),
+        onFallbackAddRequested: (providerId) =>
+          orchestrator.fallback.add(providerId),
+        onFallbackRemoveRequested: (providerId) =>
+          orchestrator.fallback.remove(providerId),
+        onFallbackAppendLocalToggleRequested: () =>
+          orchestrator.fallback.toggleAppendLocal(),
+        onOnboardingStep: (step, outcome) => {
+          runtime.reportOnboardingStep(step, outcome);
+        },
+        onOnboardingFinished: () => {
+          // The flow wrote config while the runtime was already up, so
+          // the registry still holds the old provider set. The cloud
+          // branch reloads itself inside `completeWizard`; this covers
+          // the local and custom-endpoint branches, whose llama-server
+          // URL has just changed underneath the active provider.
+          void runtime.reloadLlmProviders();
+        },
+        onProvidersWizardSubmit: (wizard) =>
+          void orchestrator.providers.completeWizard(wizard),
+        onProvidersWizardSubmitCancel: () =>
+          orchestrator.providers.cancelWizardVerification(),
+        onProvidersRemove: (id) =>
+          void orchestrator.providers.removeProviderById(id),
+        onImportPreview: (form) => orchestrator.import.preview(form),
+        onImportExecute: (form) => orchestrator.import.execute(form),
+        onOnboardingImportRequested: (plan) =>
+          void orchestrator.import.runOnboarding(plan),
+        onMcpDetailRequested: (serverName) =>
+          orchestrator.mcp.openDetail(serverName),
+        onMcpAddServerSubmit: (json) =>
+          orchestrator.mcp.addServerFromJson(json),
+        onMcpRemoveServer: (name) => orchestrator.mcp.removeServer(name),
+        onMcpRestartServer: (name) => orchestrator.mcp.restartServer(name),
+        onMcpToggleServerEnabled: (name) =>
+          orchestrator.mcp.toggleServerEnabled(name),
+        onDebugBundleExportRequested: (state) =>
+          orchestrator.exportDebugBundle(state),
+        onIssueReportRequested: () => orchestrator.issueReport.open(),
+        onIssueReportPickRequested: (level, state) =>
+          void orchestrator.issueReport.pick(level, state),
+        onIssueReportSendRequested: () => void orchestrator.issueReport.send(),
+        onIssueReportCloseRequested: () => orchestrator.issueReport.close(),
+        onLocalModelsAutoRefreshStart: () =>
+          orchestrator.localModels.startAutoRefresh(),
+        onLocalModelsPullRequested: (id, mode) =>
+          void orchestrator.localModels.pullModel(id, mode),
+        onLocalModelsPullCancelRequested: (kind) =>
+          void orchestrator.localModels.cancelPull(kind),
+        onComposerEngineRequested: (engine, leg) => { void orchestrator.chooseComposerEngine(engine, leg); },
+        onComposerFusionModelRequested: (leg, model) => { void orchestrator.chooseComposerFusionModel(leg, model); },
+        onLocalModelsEngineRequested: (engine) => { void orchestrator.localModels.chooseEngine(engine); },
+        onLocalModelsSetActiveRequested: (id) =>
+          void orchestrator.localModels.setActive(id),
+        onLocalModelsUseManagedRequested: () =>
+          void orchestrator.localModels.useManagedMode(),
+        onLocalModelsBackendPullRequested: () =>
+          void orchestrator.localModels.pullBackend(),
+        onLocalModelsCoreRetryRequested: () =>
+          void orchestrator.localModels.retryCoreEngine(),
+        onLocalModelsRefreshRequested: () =>
+          void orchestrator.localModels.refresh(),
+        onLocalModelsHfResolveRequested: (reference) =>
+          void orchestrator.localModels.resolveHuggingFaceReference(reference),
+        onLocalModelsHfLookupCancelRequested: () =>
+          orchestrator.localModels.cancelHuggingFaceLookup(),
+        onLocalModelsHfAddRequested: (repo, cursor) =>
+          void orchestrator.localModels.addHuggingFaceChoice(repo, cursor),
+        onLocalModelsDeviceCycleRequested: () =>
+          void orchestrator.localModels.cycleManagedDevice(),
+        onLocalModelsAutoUpdateToggleRequested: () =>
+          void orchestrator.localModels.toggleBackendAutoUpdate(),
+        onLocalModelsRemoveConfirmed: (id) =>
+          void orchestrator.localModels.removeLocalModel(id),
+        onLocalModelsStatusRequested: () =>
+          orchestrator.localModels.emitStatusLine(),
+        onLocalModelsDaemonStartRequested: () =>
+          void orchestrator.localModels.startDaemon(),
+        onLocalModelsDaemonStopRequested: () =>
+          void orchestrator.localModels.stopDaemon(),
+        onLocalModelsChatStopForCloudRequested: () =>
+          void orchestrator.localModels.stopChatForCloudSelection(),
+        onLocalModelsDaemonRestartRequested: () =>
+          void orchestrator.localModels.restartDaemon(),
+        onLocalModelsEmbeddingPullRequested: (id) =>
+          void orchestrator.localModels.pullEmbeddingModel(id),
+        onLocalModelsEmbeddingSetActiveRequested: (id) =>
+          void orchestrator.localModels.setActiveEmbedding(id),
+        onLocalModelsEmbeddingToggleEnabledRequested: () =>
+          void orchestrator.localModels.toggleEmbeddingEnabled(),
+        onLocalModelsEmbeddingDisableRequested: () =>
+          void orchestrator.localModels.disableEmbedding(),
+        onLocalModelsEmbeddingStartRequested: () =>
+          void orchestrator.localModels.startEmbeddingPairing(),
+        onLocalModelsEmbeddingRemoveConfirmed: (id) =>
+          void orchestrator.localModels.removeEmbeddingModel(id),
+        onLocalModelsEmbeddingOnboardingResolved: (accept) =>
+          void orchestrator.localModels.resolveEmbeddingOnboarding(accept),
+        onLocalModelsNotifyChoice: (choice) =>
+          orchestrator.localModels.chooseDownloadNotify(choice),
+        onLocalModelsNotifyDismissed: () =>
+          orchestrator.localModels.dismissDownloadNotify(),
+        onLocalModelsNotifyPromptRequested: () =>
+          orchestrator.localModels.openDownloadNotifyPrompt(),
+        onLocalLlmLogsAutoRefreshStart: () =>
+          orchestrator.localModels.startLogsAutoRefresh(),
+        onLocalLlmLogsAutoRefreshStop: () =>
+          orchestrator.localModels.stopLogsAutoRefresh(),
+        onTelegramRefreshRequested: () =>
+          orchestrator.telegram.refreshSettings(),
+        onTelegramToggleEnabledRequested: () => {
+          // The toggle reads from the live runtime config rather than
+          // a (possibly stale) UI mirror so multiple rapid hotkey
+          // presses cannot land on a contradictory enabled bit.
+          const cfg = runtime.config.telegram;
+          return orchestrator.telegram.setEnabled(!cfg.enabled);
+        },
+        onTelegramSetEnabledRequested: (enabled) =>
+          orchestrator.telegram.setEnabled(enabled),
+        onTelegramRestartRequested: () => orchestrator.telegram.restart(),
+        onTelegramTokenSubmitted: (buffer) =>
+          orchestrator.telegram.submitToken(buffer),
+        onTelegramClearTokenRequested: () => orchestrator.telegram.clearToken(),
+        onTelegramStartPairingRequested: () =>
+          orchestrator.telegram.startPairing(),
+        onTelegramCancelPairingRequested: () =>
+          orchestrator.telegram.cancelPairing(),
+        onTelegramDismissPairingResultRequested: () =>
+          orchestrator.telegram.dismissPairingResult(),
+        onTelegramClearOwnerRequested: () =>
+          orchestrator.telegram.clearOwnerUserId(),
+        onTelegramAdvanceConnectRequested: () =>
+          orchestrator.telegram.advanceConnect(),
+        onTelegramAdvancedToggleRequested: () =>
+          orchestrator.telegram.toggleAdvanced(),
+        onAnalyticsToggleRequested: () =>
+          orchestrator.privacy.toggleAnalytics(),
+        // Only the `/analytics enable|disable` slash verbs call this.
+        onAnalyticsSetEnabledRequested: (enabled) =>
+          orchestrator.privacy.setAnalyticsEnabled(enabled, "slash"),
+        onPrivacyRefreshRequested: () => orchestrator.privacy.refresh(),
+        onIntegrationsRefreshRequested: () =>
+          orchestrator.integrations.refresh(),
+        onIntegrationFieldSaveRequested: (integrationId, fieldKey, value) =>
+          orchestrator.integrations.saveField(integrationId, fieldKey, value),
+        onIntegrationFieldClearRequested: (integrationId, fieldKey) =>
+          orchestrator.integrations.clearField(integrationId, fieldKey),
+        onIntegrationFieldToggleRequested: (integrationId, fieldKey) =>
+          orchestrator.integrations.toggleField(integrationId, fieldKey),
+        onIntegrationActionRequested: (integrationId, actionId) =>
+          orchestrator.integrations.runAction(integrationId, actionId),
+        onSwarmRefreshRequested: () => orchestrator.swarm.refresh(),
+        onSwarmAddRequested: (input) => orchestrator.swarm.add(input),
+        onSwarmFieldSaveRequested: (unitId, field, value) =>
+          orchestrator.swarm.saveField(unitId, field, value),
+        onSwarmToggleRequested: (unitId) => orchestrator.swarm.toggle(unitId),
+        onSwarmRemoveRequested: (unitId) => orchestrator.swarm.remove(unitId),
+        onSwarmPairRequested: (unitId) => orchestrator.swarm.pair(unitId),
+        onSwarmRestartRequested: (unitId) => orchestrator.swarm.restart(unitId),
+        onUpdateConfirmed: () =>
+          parsed.fakeUpdateVersion
+            ? // The testing ground must never reach install.sh: the
+              // point of `--fake-update` is to look at the surfaces, and
+              // "accept" on a dev build would install the real latest
+              // release over whatever is being worked on. Instead, walk
+              // the same events the real installer emits so the whole
+              // lifecycle — "do not close" strip, feed lines, restart
+              // prompt — is on show. The restart re-execs this same dev
+              // command, which is a no-op by construction.
+              simulateFakeUpdate(bus, parsed.fakeUpdateVersion)
+            : orchestrator.runUpdate(),
+        onUpdateRestart: () => {
+          restartRequested = true;
+        },
+        onProjectTrustAnswered: (answer) => void orchestrator.projectTrust.answer(answer),
+        onMouseSupportRequested: setMouseEnabled,
+        // A drag that started on dead content (no target claimed the
+        // press) — the terminal-agnostic selection trigger. Same
+        // window, same timer, same auto-resume as the modifier path;
+        // only the notice differs, because THIS gesture is already
+        // lost to reporting and the operator has to drag again.
+        onSelectionDragIntent: () => selectionPassthrough.beginWindow("drag"),
+        onSelectionPauseRequested: () =>
+          selectionPassthrough.beginWindow("chip"),
+      },
+      // Unconditional on purpose. `mouseEnabled` is a startup-time
+      // value, but `/mouse on` flips reporting *later* and cannot
+      // re-parent an already-mounted tree — gating the prop on it meant
+      // a session started with `tui.mouse: false` kept `mouse ===
+      // undefined` forever, so `TuiApp`'s subscribe effect returned
+      // early and the clicks the terminal had just started reporting
+      // went nowhere while the UI claimed mouse support was on.
+      // Subscribing costs nothing while the mouse is off: the forwarder
+      // above is what decides whether anything is ever emitted.
+      mouse: mouseSource,
+    }),
+    buildInkRenderOptions({
+      stdin: mouseStdin.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      kittyKeyboard,
+    }),
+  );
+
+  orchestrator.start();
+
+  bus.emit({
+    type: "runtime_info",
+    line: `runtime ready — local-llm ${config.localModels.url}, browser ${config.browser.channel}`,
+  });
+  for (const line of configNotices) bus.emit({ type: "runtime_info", line });
+  configNotices.length = 0;
+
+  // Project skills and AGENTS.md/CLAUDE.md files of the opened folder load
+  // only after the operator trusted them (ATO-298); ask once if any are new.
+  orchestrator.projectTrust.check();
+
+  // A `.env` that exists but could not be read means stored API keys were
+  // silently dropped for this run (#59). The loader already wrote to
+  // stderr, but that line scrolls away before the alt screen takes over
+  // and is easy to miss, so repeat it as a warning chat message. Names +
+  // errno only, never file content.
+  if (config.dotenv.error) {
+    bus.emit({
+      type: "system_message",
+      variant: "warn",
+      text: formatDotenvReadWarning(config.dotenv.path, config.dotenv.error),
+    });
+  }
+
+  // The frozen Win10 conhost scrolls under full-height frames — the
+  // layout already reserves its bottom row (see `legacy-conhost.ts`);
+  // this is a plain tip that Windows Terminal renders the UI better,
+  // not an error. Once per session, in the transcript,
+  // because anything printed before the alt screen is never seen.
+  const conhostHint = legacyConhostStartupHint();
+  if (conhostHint) {
+    bus.emit({ type: "system_message", text: conhostHint });
+  }
+
+  // If the user is in managed mode and the backend + model are ready
+  // on disk, start the daemon immediately so there is no extra
+  // "run this command in another terminal" step. No-op in external
+  // mode or when the prerequisites are missing.
+  // Downloads outlive the process: a worker a previous session started,
+  // one that died mid-way, or one that finished while nobody watched is
+  // picked up before the auto-start decides whether anything is missing.
+  orchestrator.localModels.adoptBackgroundDownloads();
+  void orchestrator.localModels.autoStartIfReady();
+  // This TUI owns the managed model, so it is what restarts it with a
+  // smaller context window after it runs out of memory (ATO-334).
+  runtime.setLocalModelRestarter?.((contextWindow) =>
+    orchestrator.localModels.restartWithContextSize(contextWindow));
+
+  // Fire-and-forget startup version check. Surfaces an in-app update
+  // offer when a newer release is published; silently no-ops when
+  // disabled, offline, rate-limited, or running a dev build.
+  // `--fake-update` bypasses the check (a dev build fails
+  // `canSelfUpdate` anyway) and emits the offer directly, so the modal
+  // and the status-bar banner can be exercised on demand.
+  if (parsed.fakeUpdateVersion) {
+    bus.emit({
+      type: "update_available",
+      current: getAppVersion(),
+      latest: parsed.fakeUpdateVersion,
+    });
+  } else {
+    void orchestrator.checkForUpdate();
+  }
+
+  try {
+    await ink.waitUntilExit();
+  } finally {
+    // Tell herdr the pane label is free again before anything else in
+    // the teardown can throw; idempotent with the unmount-time call.
+    herdrReporter?.release();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    process.off("SIGHUP", onSignal);
+    try {
+      // Diagnostics go back to stderr for whatever runs after the TUI.
+      setConfigNoticeSink(null);
+      // The passthrough first: its pending resume must not fire into a
+      // controller that `disable()` below has already retired.
+      selectionPassthrough.dispose();
+      mouseTracking?.disable();
+      mouseStdin.dispose();
+      altScreen.restore();
+      // After the alt screen, so the restore's own writes are still
+      // bracketed, and before `ink.clear()` for the same reason.
+      synchronizedOutput.restore();
+      ink.clear();
+    } catch {
+      // After SIGHUP the tty is gone and these writes raise EIO; the
+      // daemon teardown below must still run.
+    }
+    await orchestrator.shutdown();
+    releaseSession();
+  }
+
+  // Uninstall handoff. Ahead of the restart branch because the two are
+  // mutually exclusive and this one has to win: re-exec'ing a binary we
+  // just deleted would be the last thing the operator saw.
+  if (uninstallRequested) {
+    return performUninstall({
+      stateDir: config.paths.stateDir,
+      keepDesktopData: uninstallKeepDesktopData,
+    });
+  }
+
+  // Self-update restart handoff. The runtime is fully shut down and the
+  // terminal restored, so re-exec the (atomically-replaced) binary in place.
+  // `process.execPath` keeps the same path after the installer's `mv`, but now
+  // resolves to the new inode. `spawnSync` with inherited stdio hands the TTY
+  // to the child and blocks until it exits, then we propagate its exit code —
+  // a seamless restart without a detached-process race for the terminal.
+  if (restartRequested) {
+    process.stdout.write("restarting atomic-agent…\n");
+    // SEA prepends an extra argv slot, so the real user args start at index 2
+    // (see userArgsFromArgv in cli/index.ts). Re-using process.argv.slice(1)
+    // here re-injects the invoke-path slot and the relaunched SEA process reads
+    // it as the command name ("unknown command: atomic-agent"). Plain node keeps
+    // the script path at index 1, so slice(1) stays correct there.
+    const relaunchArgs = isSea()
+      ? process.argv.slice(2)
+      : process.argv.slice(1);
+    const result = spawnSync(process.execPath, relaunchArgs, {
+      stdio: "inherit",
+    });
+    if (typeof result.status === "number") return result.status;
+    return orchestrator.exitCode;
+  }
+  return orchestrator.exitCode;
+}
+
+/**
+ * `--fake-update` accept path: emit the exact event sequence
+ * `runUpdate` emits, on a human-watchable timeline, without ever
+ * touching the installer. Ends in `update_finished ok`, so the "press
+ * any key to restart" prompt is exercised too — the restart re-execs
+ * the same `tui --fake-update` command, landing back at the offer.
+ */
+function simulateFakeUpdate(
+  bus: ReturnType<typeof makeTuiEventBus>,
+  version: string,
+): void {
+  bus.emit({ type: "update_started" });
+  const script: readonly [number, TuiAction][] = [
+    [
+      400,
+      {
+        type: "runtime_info",
+        line: `[update] (fake) downloading atomic-agent v${version}…`,
+      },
+    ],
+    [
+      1500,
+      { type: "runtime_info", line: "[update] (fake) verifying checksum…" },
+    ],
+    [
+      2200,
+      {
+        type: "runtime_info",
+        line: "[update] (fake) installing — nothing on this machine is being replaced",
+      },
+    ],
+    [3000, { type: "update_finished", ok: true, version }],
+  ];
+  for (const [delay, action] of script) {
+    // Unref'd so a Ctrl+C mid-"install" never has the process lingering
+    // on demo timers.
+    setTimeout(() => bus.emit(action), delay).unref();
+  }
+}
+
+/**
+ * Ctrl+N / `/window`: launch a second agent in a new OS terminal window.
+ * Fire-and-forget — the result is reported into the chat log either way,
+ * because a silently ignored keystroke is the worst possible outcome
+ * here (the operator cannot tell "not implemented" from "nothing
+ * happened").
+ */
+function openNewAgentWindow(
+  workingDir: string,
+  bus: ReturnType<typeof makeTuiEventBus>,
+): void {
+  void (async () => {
+    const result = await openAgentTerminalWindow(
+      currentTerminalLaunchInput(workingDir, isSea()),
+    );
+    if (result.ok) {
+      bus.emit({
+        type: "system_message",
+        text: `opened a new atomic-agent window (${result.label})`,
+      });
+      return;
+    }
+    bus.emit({
+      type: "system_message",
+      variant: "warn",
+      text: `could not open a new terminal window: ${result.reason}`,
+    });
+  })();
+}
+
+/**
+ * `[open <host>]` chip: hand `url` to the OS default browser. Success
+ * stays silent — the browser fronting itself *is* the feedback, and a
+ * chat-log line per opened link would be noise — but a failure is
+ * reported, because a chip that silently does nothing reads as a dead
+ * button (the same reasoning as `openNewAgentWindow` above).
+ */
+function openUrlFromChat(
+  url: string,
+  bus: ReturnType<typeof makeTuiEventBus>,
+): void {
+  void (async () => {
+    const result = await openUrlInBrowser(url);
+    if (result.ok) return;
+    bus.emit({
+      type: "system_message",
+      variant: "warn",
+      text: `could not open ${url}: ${result.reason}`,
+    });
+  })();
+}
+
+function persistThemeChoice(
+  themeName: string,
+  bus: ReturnType<typeof makeTuiEventBus>,
+): void {
+  try {
+    persistUserTuiTheme(themeName);
+    bus.emit({ type: "runtime_info", line: `theme saved: ${themeName}` });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    bus.emit({ type: "runtime_info", line: `theme not saved: ${msg}` });
+  }
+}
+
+function persistWhileBusyMode(
+  mode: WhileBusySubmitMode,
+  bus: ReturnType<typeof makeTuiEventBus>,
+): void {
+  try {
+    persistUserWhileBusySubmit(mode);
+    bus.emit({
+      type: "runtime_info",
+      line:
+        mode === "steer"
+          ? "Enter now steers the running turn"
+          : "Enter now queues behind the running turn",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    bus.emit({ type: "runtime_info", line: `mode not saved: ${msg}` });
+  }
+}
+
+function persistLlamaUrl(
+  nextUrl: string,
+  bus: ReturnType<typeof makeTuiEventBus>,
+  orchestrator: ChatOrchestrator,
+  runtime: AgentRuntime,
+): void {
+  // Every verdict goes to BOTH channels: `runtime_info` keeps the feed
+  // history, `providers_status` is the LLM panel's own status line — the
+  // only line the operator can actually see while saving from the
+  // External pane. Feed-only reporting is how a refused save looked like
+  // "nothing happened" (stub-verified: the 404/steer verdicts never
+  // rendered anywhere on the panel).
+  const report = (line: string): void => {
+    bus.emit({ type: "runtime_info", line });
+    bus.emit({ type: "providers_status", line, source: "external" });
+  };
+  void (async () => {
+    try {
+      // Immediate feedback: the probe can take up to 8s against a dead
+      // host, and a silent gap reads as a freeze (#65).
+      report(`probing ${nextUrl}…`);
+      const health = await checkLlamaServer({
+        url: nextUrl,
+        retries: 0,
+        backoffMs: 0,
+        timeoutMs: 8000,
+        // Catch a --api-key server here, where the operator can act,
+        // instead of on the first completion (llama.cpp exempts /health
+        // from the key, so the plain probe passes).
+        verifyAuth: true,
+      });
+      if (!health.reachable) {
+        report(
+          describeLlamaHealthFailure(
+            health,
+            nextUrl,
+            managedPortsOf(getConfig().localModels),
+          ),
+        );
+        // An openai-compat verdict has a real path forward — the same
+        // server saved as a cloud provider — so beyond naming it, open
+        // the steer prompt: `y` there deep-links into the provider
+        // wizard prefilled with this URL (Ollama URLs land on the
+        // Ollama preset) instead of leaving a dead-end refusal.
+        if (health.kind === "openai-compat") {
+          bus.emit({ type: "llm_external_compat_steer_opened", url: nextUrl });
+        }
+        return;
+      }
+      persistUserLocalLlmUrl(nextUrl);
+      // Rebuild the registered provider: its base URL was frozen at boot
+      // (health/vision requests would keep hitting the old address until
+      // a restart). The config write above already reset the cache.
+      await runtime.reloadLlmProvider("local-llama");
+      bus.emit({ type: "llama_url_changed", url: nextUrl });
+      orchestrator.updateLlamaUrl(nextUrl);
+      // The URL only takes effect if the chat route points at
+      // llama-server; a cloud provider would otherwise stay active and
+      // the saved URL would look inert. Done after the probe so a dead
+      // address never steals a working route, and skipped when the route
+      // is already local so editing a URL stays quiet. `refresh()`
+      // re-reads `localModels.mode` so the LLM tab stops claiming managed.
+      if (getConfig().llm?.activeTextProvider !== "local-llama") {
+        await orchestrator.providers.setActiveText("local-llama");
+      }
+      // An external server replaces the managed chat daemon, which would
+      // otherwise keep its VRAM for a route nothing uses. Unless the new
+      // URL *is* the managed daemon — stopping it would kill the server
+      // we just pointed at. Both branches refresh the LLM tab so it stops
+      // reporting managed mode.
+      if (
+        pointsAtManagedDaemon(nextUrl, getConfig().localModels.managed.port)
+      ) {
+        await orchestrator.localModels.refresh();
+      } else {
+        await orchestrator.localModels.stopChatDaemonOnly();
+      }
+      report(`local-llm URL saved (${health.latencyMs}ms)`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      report(`local-llm URL not saved: ${msg}`);
+    }
+  })();
+}

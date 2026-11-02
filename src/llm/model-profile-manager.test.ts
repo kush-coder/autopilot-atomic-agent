@@ -1,0 +1,473 @@
+import { describe, expect, it, vi } from "vitest";
+import { ModelProfileManager } from "./model-profile-manager.js";
+import {
+  GEMMA4_THINK_PROFILE,
+  PLAIN_INSTRUCT_PROFILE,
+  QWEN_THINK_PROFILE,
+} from "./model-profile.js";
+import { buildGrammar } from "./grammar/build-grammar.js";
+import {
+  GEMMA4_PROPS,
+  QWEN3_PROPS,
+  LLAMA3_PROPS,
+} from "./model-profile.fixtures.js";
+import type { LlamaServerClient } from "./llama-server-client.js";
+
+function makeLlamaStub(responses: Record<string, unknown>[]): {
+  client: Pick<LlamaServerClient, "fetchProps">;
+  calls: number;
+} {
+  let calls = 0;
+  const queue = [...responses];
+  const client = {
+    async fetchProps() {
+      calls += 1;
+      const next = queue.shift() ?? queue[queue.length - 1];
+      if (!next) throw new Error("no fake props configured");
+      return next;
+    },
+  } as Pick<LlamaServerClient, "fetchProps">;
+  return {
+    client,
+    get calls() {
+      return calls;
+    },
+  } as { client: Pick<LlamaServerClient, "fetchProps">; calls: number };
+}
+
+describe("ModelProfileManager reasoning budget (F49)", () => {
+  it("threads reasoningBudgetTokens into the grammar a hot-swap rebuilds", async () => {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      reasoningBudgetTokens: 2,
+    });
+    await mgr.refresh();
+    expect(mgr.getProfile().id).toBe("qwen-think");
+    expect(mgr.getGrammar()).toContain("think-body ::= think-char{0,8}");
+  });
+
+  it("falls back to the default budget when none is given", async () => {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+    });
+    await mgr.refresh();
+    // The default is 0 since config v78: no bound on the prelude.
+    expect(mgr.getGrammar()).toContain("think-body ::= think-fragment*");
+    expect(mgr.getGrammar()).not.toMatch(/think-char\{0,\d+\}/);
+  });
+});
+
+describe("ModelProfileManager slot discovery", () => {
+  // Managed mode defers the boot health check, so bootstrap builds the
+  // SlotManager on a one-slot default. This refresh hook is the only path
+  // that ever widens it to the daemon's real `--parallel` count.
+  it("reports /props.total_slots on a successful refresh", async () => {
+    const stub = makeLlamaStub([{ ...QWEN3_PROPS, total_slots: 2 }]);
+    const seen: number[] = [];
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      onTotalSlots: (n) => seen.push(n),
+    });
+    await mgr.refresh();
+    expect(seen).toEqual([2]);
+  });
+
+  it("stays silent when the server omits total_slots", async () => {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const seen: number[] = [];
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      onTotalSlots: (n) => seen.push(n),
+    });
+    await mgr.refresh();
+    expect(seen).toEqual([]);
+  });
+
+  it("reports slots even when the probe body fails profile detection", async () => {
+    // Slot discovery must not be hostage to the grammar rebuild path — an
+    // oversized pool thrashes the KV cache on every turn regardless of
+    // whether the profile changed.
+    const stub = makeLlamaStub([{ total_slots: 4 }]);
+    const seen: number[] = [];
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      onTotalSlots: (n) => seen.push(n),
+    });
+    await mgr.refresh();
+    expect(seen).toEqual([4]);
+  });
+});
+
+describe("ModelProfileManager", () => {
+  it("reports the initial profile/grammar until a mismatch is observed", async () => {
+    const grammar = await buildGrammar(GEMMA4_THINK_PROFILE);
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: GEMMA4_THINK_PROFILE,
+      initialGrammar: grammar,
+      initialModelId: "gemma-4-it",
+    });
+
+    expect(manager.getProfile().id).toBe("gemma4-think");
+    expect(manager.getGrammar()).toBe(grammar);
+    expect(manager.isStale()).toBe(false);
+
+    manager.observeCompletionModelId("gemma-4-it");
+    expect(manager.isStale()).toBe(false);
+    expect(stub.calls).toBe(0);
+
+    const result = await manager.refreshIfStale();
+    expect(result.profileChanged).toBe(false);
+    expect(stub.calls).toBe(0);
+  });
+
+  it("flags itself stale when a completion returns a different modelId", async () => {
+    const grammar = await buildGrammar(GEMMA4_THINK_PROFILE);
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: GEMMA4_THINK_PROFILE,
+      initialGrammar: grammar,
+      initialModelId: "gemma-4-it",
+    });
+
+    manager.observeCompletionModelId("qwen3-30b-a3b-instruct-2507");
+    expect(manager.isStale()).toBe(true);
+  });
+
+  it("refreshIfStale re-probes /props and swaps grammar when profile id changes", async () => {
+    const grammar = await buildGrammar(GEMMA4_THINK_PROFILE);
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: GEMMA4_THINK_PROFILE,
+      initialGrammar: grammar,
+      initialModelId: "gemma-4-it",
+    });
+
+    manager.observeCompletionModelId("qwen3-30b-a3b-instruct-2507");
+    const result = await manager.refreshIfStale();
+
+    expect(stub.calls).toBe(1);
+    expect(result.profileChanged).toBe(true);
+    expect(result.profileId).toBe("qwen-think");
+    expect(manager.getProfile().id).toBe("qwen-think");
+    expect(manager.getProfile().reasoningStyle).toBe(
+      QWEN_THINK_PROFILE.reasoningStyle,
+    );
+    expect(manager.getGrammar()).toContain("think-prelude");
+    expect(manager.getModelId()).toBe("qwen3-30b-a3b-instruct-2507");
+    expect(manager.isStale()).toBe(false);
+  });
+
+  it("does not rebuild the grammar when the profile id stays the same", async () => {
+    const grammar = await buildGrammar(QWEN_THINK_PROFILE);
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: QWEN_THINK_PROFILE,
+      initialGrammar: grammar,
+      initialModelId: "qwen3-30b-a3b-instruct-2507",
+    });
+
+    manager.observeCompletionModelId("qwen3-30b-a3b-instruct-2507-alt");
+    const result = await manager.refreshIfStale();
+    expect(result.profileChanged).toBe(false);
+    expect(manager.getGrammar()).toBe(grammar);
+  });
+
+  it("carries vision and the context window over on a refresh that keeps the profile id", async () => {
+    // A restarted daemon serves the same model (same profile id), now
+    // with the mmproj projector and another --ctx-size.
+    const textOnly = { ...QWEN3_PROPS, n_ctx: 8192 };
+    const withProjector = {
+      ...QWEN3_PROPS,
+      n_ctx: 32768,
+      modalities: { vision: true },
+    };
+    const stub = makeLlamaStub([textOnly, withProjector]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+    });
+    await manager.refresh();
+    expect(manager.getProfile().id).toBe("qwen-think");
+    expect(manager.getProfile().vision.supported).toBe(false);
+    const grammar = manager.getGrammar();
+
+    const result = await manager.refresh();
+    expect(result.profileChanged).toBe(false);
+    expect(manager.getProfile().vision).toEqual({
+      supported: true,
+      source: "modalities.vision",
+    });
+    expect(manager.getProfile().contextWindow).toBe(32768);
+    expect(manager.getGrammar()).toBe(grammar);
+  });
+
+  it("falls back to keeping the prior profile when /props probe throws", async () => {
+    const grammar = await buildGrammar(GEMMA4_THINK_PROFILE);
+    const warn = vi.fn();
+    const stub = {
+      async fetchProps() {
+        throw new Error("boom");
+      },
+    } as unknown as LlamaServerClient;
+    const manager = new ModelProfileManager({
+      llama: stub,
+      initialProfile: GEMMA4_THINK_PROFILE,
+      initialGrammar: grammar,
+      initialModelId: "gemma-4-it",
+      logger: { info: vi.fn(), warn, error: vi.fn(), debug: vi.fn() } as never,
+    });
+
+    manager.observeCompletionModelId("qwen3-30b-a3b-instruct-2507");
+    const result = await manager.refreshIfStale();
+    expect(result.profileChanged).toBe(false);
+    expect(result.profileId).toBe("gemma4-think");
+    expect(manager.isStale()).toBe(false);
+    expect(warn).toHaveBeenCalledWith(
+      "model profile refresh failed; keeping prior profile",
+      expect.objectContaining({ error: "boom", profile: "gemma4-think" }),
+    );
+  });
+
+  it("bootstrap-from-plain: first non-empty modelId is adopted without marking stale", async () => {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: 'root ::= "ok"',
+      initialModelId: null,
+    });
+
+    manager.observeCompletionModelId("qwen3-30b-a3b-instruct-2507");
+    expect(manager.isStale()).toBe(false);
+    expect(manager.getModelId()).toBe("qwen3-30b-a3b-instruct-2507");
+    expect(stub.calls).toBe(0);
+  });
+
+  it("refresh() can collapse to plain-instruct when /props no longer looks reasoning-capable", async () => {
+    const grammar = await buildGrammar(QWEN_THINK_PROFILE);
+    const stub = makeLlamaStub([LLAMA3_PROPS]);
+    const manager = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: QWEN_THINK_PROFILE,
+      initialGrammar: grammar,
+      initialModelId: "qwen3-30b-a3b-instruct-2507",
+    });
+
+    manager.observeCompletionModelId("llama-3.1-8b-instruct");
+    const result = await manager.refreshIfStale();
+    expect(result.profileChanged).toBe(true);
+    expect(result.profileId).toBe("plain-instruct");
+    expect(manager.getProfile()).toStrictEqual(PLAIN_INSTRUCT_PROFILE);
+    expect(manager.getGrammar()).not.toContain("think-prelude");
+  });
+});
+
+describe("ModelProfileManager throughput (F16)", () => {
+  async function manager(readThroughput?: () => number | null) {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    return new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      ...(readThroughput ? { readThroughput } : {}),
+    });
+  }
+
+  it("knows no speed until something measured it", async () => {
+    const mgr = await manager();
+    expect(mgr.getTokensPerSecond()).toBeNull();
+  });
+
+  it("keeps an observed reading and ignores nonsense", async () => {
+    const mgr = await manager();
+    mgr.observeThroughput(6.4);
+    expect(mgr.getTokensPerSecond()).toBe(6.4);
+    for (const bad of [0, -3, Number.NaN, null]) mgr.observeThroughput(bad);
+    expect(mgr.getTokensPerSecond()).toBe(6.4);
+  });
+
+  it("reads the daemon's record lazily when it holds nothing", async () => {
+    // `models start` in another process wrote the record; the runtime
+    // that connects later reads it the first time the prompt asks.
+    let recorded: number | null = null;
+    const mgr = await manager(() => recorded);
+    expect(mgr.getTokensPerSecond()).toBeNull();
+    recorded = 3.2;
+    expect(mgr.getTokensPerSecond()).toBe(3.2);
+    // Held from then on, not re-read per step.
+    recorded = null;
+    expect(mgr.getTokensPerSecond()).toBe(3.2);
+  });
+
+  it("re-reads the record on a /props refresh so a restarted daemon's speed replaces the old", async () => {
+    let recorded: number | null = 3.2;
+    const mgr = await manager(() => recorded);
+    expect(mgr.getTokensPerSecond()).toBe(3.2);
+    recorded = 9.9;
+    await mgr.refresh();
+    expect(mgr.getTokensPerSecond()).toBe(9.9);
+  });
+
+  it("drops a speed that no record backs once the profile changed", async () => {
+    // A different model behind the same URL: the old figure describes a
+    // model that is gone.
+    let recorded: number | null = 3.2;
+    const stub = makeLlamaStub([GEMMA4_PROPS]);
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      readThroughput: () => recorded,
+    });
+    expect(mgr.getTokensPerSecond()).toBe(3.2);
+    recorded = null;
+    const result = await mgr.refresh();
+    expect(result.profileChanged).toBe(true);
+    expect(mgr.getTokensPerSecond()).toBeNull();
+  });
+});
+
+
+describe("ModelProfileManager prefix reuse (F12)", () => {
+  async function managerWith(opts: {
+    props: Record<string, unknown>;
+    verdict: { prefixReuse: "partial" | "none"; reasons: string[] } | null;
+    swaFullActive?: () => boolean;
+  }) {
+    const stub = makeLlamaStub([opts.props]);
+    const asked: string[] = [];
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+      readPrefixReuse: async (path) => {
+        asked.push(path);
+        return opts.verdict;
+      },
+      ...(opts.swaFullActive ? { swaFullActive: opts.swaFullActive } : {}),
+    });
+    return { mgr, asked };
+  }
+
+  it("stamps prefixReuse none from the header of /props.model_path", async () => {
+    const { mgr, asked } = await managerWith({
+      props: { ...GEMMA4_PROPS, model_path: "/models/gemma-4-31b.gguf" },
+      verdict: { prefixReuse: "none", reasons: ["50 of 60 layers use a sliding window of 1024"] },
+    });
+    await mgr.refresh();
+    expect(asked).toEqual(["/models/gemma-4-31b.gguf"]);
+    expect(mgr.getProfile().id).toBe("gemma4-think");
+    expect(mgr.getProfile().prefixReuse).toBe("none");
+  });
+
+  it("leaves the default when /props names no model path or the header is unreadable", async () => {
+    const { mgr, asked } = await managerWith({ props: QWEN3_PROPS, verdict: { prefixReuse: "none", reasons: [] } });
+    await mgr.refresh();
+    expect(asked).toEqual([]);
+    expect(mgr.getProfile().prefixReuse).toBeUndefined();
+    const { mgr: unreadable } = await managerWith({
+      props: { ...QWEN3_PROPS, model_path: "/models/x.gguf" },
+      verdict: null,
+    });
+    await unreadable.refresh();
+    expect(unreadable.getProfile().prefixReuse).toBeUndefined();
+  });
+
+  it("turns a sliding-window model's reuse back to partial when the daemon runs --swa-full, never a hybrid's", async () => {
+    const { mgr } = await managerWith({
+      props: { ...GEMMA4_PROPS, model_path: "/models/gemma.gguf" },
+      verdict: { prefixReuse: "none", reasons: ["50 of 60 layers use a sliding window of 1024"] },
+      swaFullActive: () => true,
+    });
+    await mgr.refresh();
+    expect(mgr.getProfile().prefixReuse).toBe("partial");
+    const { mgr: hybrid } = await managerWith({
+      props: { ...QWEN3_PROPS, model_path: "/models/qwen35.gguf" },
+      verdict: { prefixReuse: "none", reasons: ["hybrid/recurrent architecture (qwen35)"] },
+      swaFullActive: () => true,
+    });
+    await hybrid.refresh();
+    expect(hybrid.getProfile().prefixReuse).toBe("none");
+  });
+
+  it("updates prefixReuse on a refresh that keeps the profile id", async () => {
+    // The initial profile is plain-instruct and /props says plain too:
+    // no grammar rebuild, but the header's verdict must still land.
+    const { mgr } = await managerWith({
+      props: { ...LLAMA3_PROPS, model_path: "/models/hybrid.gguf" },
+      verdict: { prefixReuse: "none", reasons: ["hybrid/recurrent architecture (nemotron_h)"] },
+    });
+    const result = await mgr.refresh();
+    expect(result.profileChanged).toBe(false);
+    expect(mgr.getProfile().id).toBe("plain-instruct");
+    expect(mgr.getProfile().prefixReuse).toBe("none");
+  });
+});
+
+describe("ModelProfileManager MCP tool names (ATO-1029)", () => {
+  // The agent loop reads this manager's grammar before the catalog's, so
+  // it must carry the live MCP names, and keep them across a hot-swap.
+  const RULE = 'mcp-server-tool ::= "\\"mcp.docs.search\\""';
+
+  it("patches the held grammar and keeps the rule across a rebuild", async () => {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+    });
+    expect(mgr.getGrammar()).not.toMatch(/^tool-name ::= .*mcp-server-tool/m);
+    mgr.setMcpToolNameRule(RULE);
+    expect(mgr.getGrammar()).toContain(RULE);
+    expect(mgr.getGrammar()).toMatch(/^tool-name ::= .*\| mcp-server-tool \|/m);
+    await mgr.refresh();
+    expect(mgr.getProfile().id).toBe("qwen-think");
+    expect(mgr.getGrammar()).toContain(RULE);
+    expect(mgr.getGrammar()).toMatch(/^tool-name ::= .*\| mcp-server-tool \|/m);
+    mgr.setMcpToolNameRule(null);
+    expect(mgr.getGrammar()).not.toMatch(/^tool-name ::= .*mcp-server-tool/m);
+  });
+
+  it("keeps the native MCP tools out across a rebuild when MCP is off", async () => {
+    const stub = makeLlamaStub([QWEN3_PROPS]);
+    const mgr = new ModelProfileManager({
+      llama: stub.client as LlamaServerClient,
+      initialProfile: PLAIN_INSTRUCT_PROFILE,
+      initialGrammar: await buildGrammar(PLAIN_INSTRUCT_PROFILE),
+      initialModelId: null,
+    });
+    mgr.setMcpToolNameRule(null, false);
+    expect(mgr.getGrammar()).not.toMatch(/^tool-name ::= .*mcp-native-tool/m);
+    await mgr.refresh();
+    expect(mgr.getProfile().id).toBe("qwen-think");
+    expect(mgr.getGrammar()).not.toMatch(/^tool-name ::= .*mcp-native-tool/m);
+  });
+});

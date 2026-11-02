@@ -1,0 +1,58 @@
+export { buildPrompt } from "./build-prompt.js";
+export type { BuildPromptInput, BuiltPrompt } from "./build-prompt.js";
+export {
+  buildStablePrefix,
+  DEFAULT_SYSTEM_PERSONA,
+  NATIVE_TOOLS_SYSTEM_PERSONA,
+  SYSTEM_PERSONA_INPUTS_LINE,
+  formatToolForLoadedTail,
+} from "./stable-prefix.js";
+export type {
+  StablePrefixInput,
+  ToolDescriptor,
+  ToolTier,
+  CapabilitiesSummary,
+  SkillCatalogEntry,
+} from "./stable-prefix.js";
+export {
+  estimateTokens,
+  defaultBudget,
+  checkBudget,
+  truncateToTokens,
+  computeEffectiveConversationCap,
+  minUsableContextWindow,
+  effectiveReplyReserve,
+  REPLY_RESERVE_MAX_WINDOW_SHARE,
+  AGENT_FIXED_PROMPT_TOKENS,
+  CONVERSATION_CAP_SAFETY_MARGIN,
+  CONVERSATION_CAP_FLOOR,
+  SESSION_SECTIONS_CAP_AUTO,
+  SESSION_SECTIONS_BUDGET_SHARE,
+} from "./token-budget.js";
+export {
+  buildFusionGuidance,
+  isFusionActive,
+  FUSION_GUIDANCE,
+} from "./fusion-guidance.js";
+export {
+  resolveFusionMachineFacts,
+  NO_FUSION_MACHINE_FACTS,
+} from "./fusion-machine-facts.js";
+export type { FusionMachineFacts } from "./fusion-machine-facts.js";
+export { renderTaskPolicy } from "./render-task-policy.js";
+export type {
+  RenderedTaskPolicy,
+  TaskPolicyKind,
+} from "./render-task-policy.js";
+export type {
+  TokenBudgetLimits,
+  BudgetCheckResult,
+  EffectiveConversationCapInput,
+} from "./token-budget.js";
+export {
+  DEFAULT_TOOL_DESCRIPTORS,
+  getToolDescriptorByName,
+  isRareToolName,
+} from "./tool-descriptors.js";
+export { buildCapabilities } from "./capabilities.js";
+export type { BuildCapabilitiesInput } from "./capabilities.js";

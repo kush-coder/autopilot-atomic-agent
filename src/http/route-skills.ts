@@ -1,0 +1,241 @@
+import { join } from "node:path";
+import { SessionNotFoundError } from "../runtime/session-not-found-error.js";
+
+import {
+  installLocalSkill,
+  scanApprovalFromIds,
+  scanIdOf,
+  SkillHubInstallError,
+  SkillInstallError,
+  SkillNotFoundError,
+  uninstallSkill,
+} from "../skills/index.js";
+
+import { openaiError } from "./openai-errors.js";
+import {
+  readJsonBody,
+  sendError,
+  sendJson,
+  type HttpHandler,
+} from "./request-context.js";
+
+interface InstallBody {
+  sourcePath?: string;
+  force?: boolean;
+  source?: "global" | "project";
+  /**
+   * The `scanId` of the caution scan the user confirmed. Only that exact
+   * scan is approved; `true` or a stale id is not a confirmation.
+   */
+  confirm?: unknown;
+  /** The `scanId` of the dangerous scan the user accepted (implies confirm). */
+  acknowledgeRisk?: unknown;
+}
+
+interface UninstallBody {
+  name?: string;
+  source?: "global" | "project";
+}
+
+/**
+ * `GET /api/skills` — list installed skills with their source (global
+ * vs project-local). Mirrors the catalog used by the prompt prefix so
+ * an admin surface shows exactly what the model will see.
+ */
+export function createListSkillsHandler(): HttpHandler {
+  return async (req, res, ctx) => {
+    const { runtime } = ctx;
+    const sessionId = new URL(req.url ?? "/", "http://localhost").searchParams.get("sessionId");
+    if (sessionId) {
+      if (!runtime.sessionStore.load(sessionId)) { sendError(res, 404, openaiError("session not found")); return; }
+      const workspace = runtime.getSessionWorkspace(sessionId);
+      if (workspace) {
+        sendJson(res, 200, { workingDir: workspace.workingDir, projectSkillsEnabled: workspace.skills.projectSkillsEnabled,
+          skills: workspace.skills.entries.map(e => ({ name: e.record.manifest.name, description: e.record.manifest.description,
+            version: e.record.manifest.version, source: e.record.source, rootDir: e.record.rootDir,
+            disabled: e.disabledReasons.length > 0, disabledReasons: e.disabledReasons, sources: e.sources,
+            dangerous: e.record.manifest.dangerous, requiresTools: e.record.manifest.requiresTools, requiresScripts: e.record.manifest.requiresScripts })),
+          errors: workspace.diagnostics });
+        return;
+      }
+    }
+    const records = runtime.skillRegistry.list();
+    sendJson(res, 200, {
+      skills: records.map((r) => ({
+        name: r.manifest.name,
+        description: r.manifest.description,
+        version: r.manifest.version,
+        source: r.source,
+        rootDir: r.rootDir,
+        dangerous: r.manifest.dangerous,
+        requiresTools: r.manifest.requiresTools,
+        requiresScripts: r.manifest.requiresScripts,
+      })),
+      errors: runtime.skillRegistry.errors(),
+    });
+  };
+}
+
+/**
+ * `GET /api/skills/{name}` — return the full manifest plus the raw
+ * SKILL.md body for the named skill. The body is needed by UIs that
+ * want to render the full playbook without asking the agent to call
+ * `skill.view`.
+ */
+export function createGetSkillHandler(): HttpHandler {
+  return async (req, res, ctx) => {
+    const name = ctx.params.name;
+    if (!name) {
+      sendError(res, 400, openaiError("skill name is required"));
+      return;
+    }
+    try {
+      const sessionId = new URL(req.url ?? "/", "http://localhost").searchParams.get("sessionId");
+      const workspace = sessionId ? ctx.runtime.getSessionWorkspace(sessionId) : null;
+      if (workspace) {
+        const entry = workspace.skills.entries.find(e => e.record.manifest.name === name);
+        if (!entry) throw new SkillNotFoundError(name);
+        sendJson(res, 200, { manifest: entry.record.manifest, rootDir: entry.record.rootDir, source: entry.record.source,
+          body: entry.body, disabledReasons: entry.disabledReasons, sources: entry.sources });
+        return;
+      }
+      const record = ctx.runtime.skillRegistry.get(name);
+      const body = await ctx.runtime.skillRegistry.readBody(name);
+      sendJson(res, 200, {
+        manifest: record.manifest,
+        rootDir: record.rootDir,
+        source: record.source,
+        body,
+      });
+    } catch (err) {
+      if (err instanceof SkillNotFoundError || err instanceof SessionNotFoundError) {
+        sendError(res, 404, openaiError(err.message, "invalid_request_error"));
+        return;
+      }
+      throw err;
+    }
+  };
+}
+
+/**
+ * `POST /api/skills/install` — install a skill from a local directory.
+ * We do not support remote sources (see architecture doc §9). The
+ * default target is the user-global skills dir; the request may pick
+ * the project-local dir explicitly.
+ *
+ * The folder goes through the same security scan as hub installs. A
+ * `caution` verdict answers 428 with `error.code: "needs_confirmation"`,
+ * the `scan` (verdict + findings) and its `scanId`; the client re-sends
+ * with `confirm: "<scanId>"` once the user agrees. A `dangerous` verdict
+ * answers 403 `dangerous_blocked`; only `acknowledgeRisk: "<scanId>"`
+ * installs it. The ids bind the "yes" to the findings shown: if the
+ * folder changed, the new scan has a new id and the route asks again.
+ * Nothing is copied before the gate passes.
+ */
+export function createInstallSkillHandler(): HttpHandler {
+  return async (req, res, ctx) => {
+    let body: InstallBody;
+    try {
+      body = await readJsonBody<InstallBody>(req);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      sendError(res, 400, openaiError(`Invalid JSON: ${message}`));
+      return;
+    }
+    if (!body.sourcePath || typeof body.sourcePath !== "string") {
+      sendError(res, 400, openaiError("sourcePath is required"));
+      return;
+    }
+    const targetRoot = resolveSkillsTarget(ctx, body.source ?? "global");
+    try {
+      const result = await installLocalSkill({
+        sourceDir: body.sourcePath,
+        targetRoot,
+        ...(body.force === true ? { force: true } : {}),
+        ...scanApprovalFromIds(body),
+      });
+      await ctx.runtime.refreshSkills();
+      sendJson(res, 200, {
+        installed: true,
+        manifest: result.manifest,
+        installedAt: result.installedAt,
+        scan: result.scan,
+        scanId: result.scanId,
+      });
+    } catch (err) {
+      if (err instanceof SkillHubInstallError && err.scan) {
+        const needsConfirm = err.code === "needs_confirmation";
+        sendJson(res, needsConfirm ? 428 : 403, {
+          ...openaiError(
+            err.message,
+            "invalid_request_error",
+            needsConfirm ? "confirm" : "acknowledgeRisk",
+            err.code,
+          ),
+          installed: false,
+          scan: err.scan,
+          scanId: scanIdOf(err.scan),
+        });
+        return;
+      }
+      if (err instanceof SkillInstallError) {
+        sendError(
+          res,
+          err.code === "already_installed" ? 409 : 400,
+          openaiError(err.message, "invalid_request_error", null, err.code),
+        );
+        return;
+      }
+      throw err;
+    }
+  };
+}
+
+/**
+ * `POST /api/skills/uninstall` — remove an installed skill from the
+ * selected root. Silently succeeds when the skill is not present so
+ * the caller can use this to ensure a clean slate.
+ */
+export function createUninstallSkillHandler(): HttpHandler {
+  return async (req, res, ctx) => {
+    let body: UninstallBody;
+    try {
+      body = await readJsonBody<UninstallBody>(req);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      sendError(res, 400, openaiError(`Invalid JSON: ${message}`));
+      return;
+    }
+    if (!body.name || typeof body.name !== "string") {
+      sendError(res, 400, openaiError("name is required"));
+      return;
+    }
+    const targetRoot = resolveSkillsTarget(ctx, body.source ?? "global");
+    const outcome = await uninstallSkill(targetRoot, body.name);
+    await ctx.runtime.refreshSkills();
+    sendJson(res, 200, {
+      removed: outcome.removed,
+      path: outcome.path,
+    });
+  };
+}
+
+function resolveSkillsTarget(
+  ctx: {
+    runtime: {
+      config: {
+        paths: { globalSkillsDir: string; projectSkillsDirName: string };
+      };
+      capabilities: { workingDir: string };
+    };
+  },
+  source: "global" | "project",
+): string {
+  if (source === "project") {
+    return join(
+      ctx.runtime.capabilities.workingDir,
+      ctx.runtime.config.paths.projectSkillsDirName,
+    );
+  }
+  return ctx.runtime.config.paths.globalSkillsDir;
+}

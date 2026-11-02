@@ -1,0 +1,253 @@
+import { render } from "ink-testing-library";
+import { describe, expect, it } from "vitest";
+
+import { ApprovalModal } from "./approval-modal.js";
+import type { ApprovalRequest } from "../approval/approval-gate.js";
+
+function request(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
+  return {
+    approvalId: "a1",
+    sessionId: "s1",
+    tool: "os.shell.run",
+    category: "shell",
+    reason: "dangerous command",
+    ...overrides,
+  };
+}
+
+/**
+ * The modal takes the target-field props from the app shell; every test
+ * that is not about the field renders it closed.
+ */
+function frameOf(
+  req: ApprovalRequest,
+  pathDraft: string | null = null,
+  previewPage: number | null = null,
+): string {
+  return (
+    render(
+      <ApprovalModal
+        request={req}
+        pathDraft={pathDraft}
+        onPathOpen={() => {}}
+        onPathChange={() => {}}
+        onPathSubmit={() => {}}
+        onPathCancel={() => {}}
+        previewPage={previewPage}
+        onPreviewPage={() => {}}
+      />,
+    ).lastFrame() ?? ""
+  );
+}
+
+describe("ApprovalModal", () => {
+  it("renders the request and the decision buttons", () => {
+    const frame = frameOf(request());
+    expect(frame).toContain("approval required");
+    expect(frame).toContain("os.shell.run");
+    expect(frame).toContain("approve");
+    expect(frame).toContain("deny");
+    expect(frame).toContain("esc abort run");
+  });
+
+  it("prints each button's chord on the button", () => {
+    // The chord is the keyboard path to the same control the mouse
+    // clicks, so it belongs on the face rather than in a legend three
+    // lines down that has to be kept in sync by hand.
+    const frame = frameOf(request({ category: "shell", commandShape: "git" }));
+    expect(frame).toContain("ctrl+y");
+    expect(frame).toContain("ctrl+d");
+    expect(frame).toContain("ctrl+f");
+    expect(frame).toContain("ctrl+b");
+  });
+
+  it("never offers a bare letter as a decision", () => {
+    // The regression this whole change exists to prevent: a bracketed
+    // letter promises that typing it decides the call, and the composer
+    // underneath is live.
+    const frame = frameOf(request({ category: "shell", commandShape: "git" }));
+    for (const marker of ["[y]", "[n]", "[s]", "[a]", "[e]"]) {
+      expect(frame).not.toContain(marker);
+    }
+  });
+
+  it("shows the ladder category label so the operator sees why it fired", () => {
+    // R5: the prompt carries its `ApprovalCategory`; the modal renders a
+    // human label (`file write · home`) so a home write reads differently
+    // from a trust-config write.
+    const frame = frameOf(request({ category: "fs_write_home" }));
+    expect(frame).toContain("file write · home");
+  });
+
+  it("points at the composer coding-mode control so the off switch is discoverable", () => {
+    // The footer hint is the discoverability answer to issue #79:
+    // approving covers one call, the standing stance lives in the
+    // composer's coding-mode control.
+    const frame = frameOf(request());
+    expect(frame).toContain("approve covers this call once");
+    expect(frame).toContain("coding-mode control");
+  });
+
+  it("offers both session grants for a shell request with a shape", () => {
+    const frame = frameOf(request({ category: "shell", commandShape: "git" }));
+    expect(frame).toContain("this session");
+    expect(frame).toContain("git");
+  });
+
+  it("offers the category grant but no shape grant for a non-shell request", () => {
+    const frame = frameOf(request({ category: "fs_write_home" }));
+    expect(frame).toContain("this session");
+    expect(frame).toContain("ctrl+f");
+    // Nothing to grant a shape for, so the shared slot stays empty.
+    expect(frame).not.toContain("ctrl+b");
+  });
+
+  it("offers NO grants and warns for a trust_config request", () => {
+    // trust_config is never grantable: approve / deny / esc, plus an
+    // explicit note.
+    const frame = frameOf(request({ category: "trust_config" }));
+    expect(frame).not.toContain("this session");
+    expect(frame).not.toContain("ctrl+f");
+    expect(frame).toContain("approve");
+    expect(frame).toContain("deny");
+    expect(frame).toContain("never granted for the session");
+  });
+
+  it("names the category in the never-granted note (issue #552)", () => {
+    // `email` and `fusion_fanout` are never grantable either; the note
+    // used to call every one of them a trust-config write.
+    for (const [category, label] of [
+      ["email", "e-mail send"],
+      ["fusion_fanout", "fusion · fan-out"],
+    ] as const) {
+      const frame = frameOf(request({ category })).replace(/\s+/g, " ");
+      expect(frame).toContain(`${label} is never granted for the session`);
+      expect(frame).not.toContain("trust-config");
+    }
+  });
+
+  it("offers the retarget button only when the request carries a path", () => {
+    // The shell request has no target to move; the write does.
+    expect(frameOf(request())).not.toContain("edit target path");
+    const write = frameOf(
+      request({
+        tool: "os.fs.write",
+        category: "fs_write_workspace",
+        redirectablePath: "/work/site/index.html",
+      }),
+    );
+    expect(write).toContain("edit target path");
+    // Same slot, same chord as the shape grant — the two can never both
+    // be offered, which `approval-key-arbitration.test.ts` pins.
+    expect(write).toContain("ctrl+b");
+  });
+
+  it("swaps the decision buttons for the target field while it is open", () => {
+    // While the field owns the keyboard the buttons would be a lie —
+    // those chords are inert until the field closes.
+    const frame = frameOf(
+      request({
+        tool: "os.fs.write",
+        category: "fs_write_workspace",
+        redirectablePath: "/work/site/index.html",
+      }),
+      "~/Documents/apple-site/index.html",
+    );
+    expect(frame).toContain("target");
+    expect(frame).toContain("~/Documents/apple-site/index.html");
+    expect(frame).toContain("confirm target path");
+    expect(frame).not.toContain("ctrl+y");
+    expect(frame).not.toContain("ctrl+d");
+  });
+
+  it("says the composer is live rather than that the keys stand down", () => {
+    // The old hint had to explain that typing disarmed the verdicts.
+    // Nothing disarms now, so the hint says the one thing still worth
+    // knowing: you may answer in words instead. Ink wraps the footer at
+    // the terminal width, so strip the box chrome and collapse
+    // whitespace before matching.
+    const frame = frameOf(request())
+      .replace(/[\u2550-\u256c]/g, " ")
+      .replace(/\s+/g, " ");
+    expect(frame).toContain("the composer stays live");
+    expect(frame).not.toContain("keys work while the input is empty");
+  });
+
+  it("withholds the shape grant for a shell request with no command shape", () => {
+    // Opaque interpreters (bash -c …) reach the prompt with no
+    // commandShape, so the shape grant must not be offered — only the
+    // category grant and the two decisions.
+    const frame = frameOf(request());
+    expect(frame).toContain("ctrl+f");
+    expect(frame).not.toContain("ctrl+b");
+  });
+
+  // ATO-434: a multi-line command was cut at 240 characters with a bare
+  // `…`, so the lines after the cut never reached the person approving.
+  it("shows every line of a multi-line command", () => {
+    const frame = frameOf(
+      request({ preview: "echo hi\nmkdir -p out\nrm -rf out/cache" }),
+    );
+    expect(frame).toContain("echo hi");
+    expect(frame).toContain("mkdir -p out");
+    expect(frame).toContain("rm -rf out/cache");
+    expect(frame).not.toContain("more line");
+  });
+
+  it("says how many lines it hides when a script is too long to show", () => {
+    const script = Array.from({ length: 30 }, (_, i) => `echo line-${i + 1}`).join("\n");
+    const frame = frameOf(request({ preview: script }));
+    expect(frame).toContain("echo line-20");
+    expect(frame).not.toContain("echo line-21");
+    expect(frame).toContain("+10 more lines");
+  });
+
+  // ATO-876: the lines past the excerpt could not be read at all before
+  // the decision, so an `rm -rf` on line 25 stayed behind the note.
+  describe("full command view", () => {
+    const script = Array.from({ length: 30 }, (_, i) => `echo line-${i + 1}`);
+    script[29] = "rm -rf ~/projects";
+    const long = request({ preview: script.join("\n") });
+
+    it("offers the full command under a cut preview", () => {
+      const frame = frameOf(long);
+      expect(frame).toContain("+10 more lines");
+      expect(frame).toContain("view full command");
+      expect(frame).toContain("ctrl+z");
+    });
+
+    it("does not offer it when the whole preview is shown", () => {
+      const frame = frameOf(request({ preview: "echo hi\nrm -rf out" }));
+      expect(frame).not.toContain("view full command");
+      expect(frame).not.toContain("ctrl+z");
+    });
+
+    it("shows the first page of the whole command", () => {
+      const frame = frameOf(long, null, 0);
+      expect(frame).toContain("full command (30 lines), page 1 of 2");
+      expect(frame).toContain("echo line-20");
+      expect(frame).not.toContain("echo line-21");
+      expect(frame).toContain("next page");
+    });
+
+    it("reaches the last line on the last page", () => {
+      const frame = frameOf(long, null, 1);
+      expect(frame).toContain("page 2 of 2");
+      expect(frame).toContain("echo line-21");
+      expect(frame).toContain("rm -rf ~/projects");
+      expect(frame).not.toContain("more lines");
+      expect(frame).toContain("back to the short preview");
+    });
+
+    it("ignores a page for a preview that is not cut", () => {
+      const frame = frameOf(request({ preview: "echo hi\nrm -rf out" }), null, 0);
+      expect(frame).not.toContain("full command");
+      expect(frame).toContain("rm -rf out");
+    });
+  });
+
+  it("keeps a one-line preview next to its label", () => {
+    const frame = frameOf(request({ preview: "git push origin main" }));
+    expect(frame).toContain("preview: git push origin main");
+  });
+});

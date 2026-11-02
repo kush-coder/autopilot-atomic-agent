@@ -1,0 +1,937 @@
+import {
+  ModelCannotSeeError,
+  VisionUnsupportedError,
+  type LlmProvider,
+  type ProviderCapabilities,
+  type ProviderHealthResult,
+  type VisionRequest,
+  type VisionResult,
+} from "../llm-provider.js";
+import type {
+  CompletionRequest,
+  CompletionResult,
+  StreamChunk,
+  StreamFinalResult,
+} from "../completion-types.js";
+import type { ToolCallAdapter } from "../adapters/tool-call-adapter.js";
+import type { StreamConsumer } from "../adapters/stream-consumer.js";
+import type { ReasoningFormat } from "../llm-provider.js";
+import {
+  openAiToolCallAdapter,
+  withStrictNullArgumentDrop,
+} from "./openai-tool-call-adapter.js";
+import {
+  createOpenAiStreamConsumer,
+  OpenAiSseError,
+} from "./openai-stream-consumer.js";
+import {
+  buildOpenAiChatBody,
+  resolveMessageShape,
+  type OpenAiBodyOptions,
+} from "./openai-build-body.js";
+import { isNativeShapeRejection } from "./openai-native-messages.js";
+import { OPENAI_DEFAULT_REQUEST_TIMEOUT_MS } from "../../transport-deadlines.js";
+import {
+  buildOpenAiHeaders,
+  createOpenAiAttemptBudget,
+  openAiGetJson,
+  openAiPostJson,
+  openAiRetryBackoff,
+  openAiStartStream,
+  OpenAiHttpError,
+  OPENAI_MAX_ATTEMPTS,
+  type OpenAiAttemptBudget,
+  type OpenAiHttpDeps,
+} from "./openai-http.js";
+import { isNetworkError } from "../../reliability/network-error.js";
+import { normaliseOpenAiChatResponse } from "./openai-normalise-response.js";
+import { normalizeOpenAiBaseUrl } from "./normalize-openai-base-url.js";
+import { openAiChatPathPrefix } from "./openai-chat-path.js";
+import { describeImageViaOpenAi } from "./openai-describe-image.js";
+import { isAnthropicHost, isAnthropicModel } from "./prompt-cache-control.js";
+import { isLocalServerUrl } from "./local-server-url.js";
+import {
+  adaptQwenCompletionResult,
+  adaptQwenTaggedToolResponse,
+  type TaggedToolAdaptOptions,
+} from "./qwen-tagged-tool-response-adapter.js";
+import type { CreditLimitLogger } from "./plan-credit-limit-retry.js";
+import { sendWithStructuredOutputFallback } from "./structured-output-fallback.js";
+import {
+  isImageRejection,
+  markModelCannotSee,
+  modelCannotSee,
+} from "../model-vision-rejections.js";
+
+export interface OpenAiProviderOptions {
+  id: string;
+  baseUrl: string;
+  apiKey: string;
+  defaultChatModel?: string;
+  headers?: Record<string, string>;
+  /**
+   * Header that carries the API key when the service does not accept
+   * `Authorization: Bearer`. See `openai-auth-headers.ts`.
+   */
+  apiKeyHeader?: string;
+  /**
+   * Whether the model this link serves can read images, as resolved per
+   * model by the factory (`model-vision.ts`), with `visionSource` saying
+   * where that came from. Absent means nothing describes the model:
+   * vision is offered as `assumed`, and the first image the service
+   * rejects turns it off for this model (`describeImage`).
+   */
+  supportsVision?: boolean;
+  visionSource?: ProviderCapabilities["visionSource"];
+  supportsParallelTools?: boolean;
+  supportsPromptCache?: boolean;
+  reasoningFormat?: ReasoningFormat;
+  requestTimeoutMs?: number;
+  fetchImpl?: typeof fetch;
+  toolCallAdapter?: ToolCallAdapter;
+  streamConsumer?: StreamConsumer;
+  apiPathPrefix?: string;
+  /**
+   * Tagged text tool calls (`<tool_call>…</tool_call>`, Qwen's XML-ish
+   * form or the Hermes JSON form) are decoded for every kind when the
+   * whole reply is such blocks. `"qwen"` additionally reads a call out of
+   * `reasoning_content` when `content` holds none (#105).
+   */
+  taggedToolCompatibility?: "qwen";
+  /**
+   * The registered kind this client serves (`openrouter`,
+   * `openai-compatible`, …), for body fields whose spelling is the
+   * vendor's. See `OpenAiBodyOptions.providerKind`.
+   */
+  providerKind?: string;
+  /**
+   * Wire parameters of the default chat model from `userModels[].params`,
+   * merged over every chat body after `extraBody`.
+   */
+  modelParams?: Record<string, unknown>;
+  /**
+   * How the structured prompt is laid out on the wire: `native` (the
+   * default) as `system` + history messages + final `user`; `flat` as the
+   * one `user` message of text every request used to be. A 400 about
+   * roles / `tool_call_id` / `messages` flips a session to `flat` and
+   * retries once. See `openai-native-messages.ts`.
+   */
+  messageShape?: "native" | "flat";
+  /**
+   * The entry's prompt-caching policy. `off` sends no cache markers;
+   * `explicit-markers` always sends Anthropic breakpoints; `auto` (and
+   * absent) sends them when the model or the host is Anthropic's. See
+   * `prompt-cache-control.ts`.
+   */
+  promptCache?: "auto" | "off" | "explicit-markers";
+  /**
+   * Vendor-specific fields merged into every chat completion body.
+   * See `RESERVED_BODY_KEYS` in `openai-build-body.ts` for the keys
+   * this passthrough cannot override.
+   */
+  extraBody?: Record<string, unknown>;
+  /** Output ceiling for this provider; absent means the model's maximum. */
+  maxOutputTokens?: number;
+  /**
+   * Emit OpenAI strict function tools (`tools[].function.strict`).
+   * Opt-in per provider entry: it rewrites every tool schema into the
+   * subset strict mode accepts (`openai-strict-tools.ts`), which a
+   * service that does not implement strict mode will reject outright.
+   * Absent leaves the request body exactly as it was.
+   */
+  strictTools?: boolean;
+  /**
+   * OpenRouter provider routing, sent as the body's `provider` object on
+   * every chat completion this client makes — turns, sub-calls, vision.
+   * Only the `openrouter` factory wires it; `extraBody.provider` wins.
+   */
+  providerPreferences?: Record<string, unknown>;
+  /**
+   * Sink for the credit-limit retry warning (`plan-credit-limit-retry.ts`).
+   * Wired from the provider factory context so the notice lands wherever
+   * the rest of the runtime logs; without it the client falls back to a
+   * stderr line rather than recovering silently.
+   */
+  logger?: CreditLimitLogger;
+}
+
+export class OpenAiProvider implements LlmProvider {
+  readonly id: string;
+  readonly name: string;
+  readonly toolCallAdapter: ToolCallAdapter;
+  readonly streamConsumer: StreamConsumer;
+  readonly capabilities: ProviderCapabilities;
+  readonly chatModelId: string | undefined;
+
+  private readonly http: OpenAiHttpDeps;
+  private readonly defaultChatModel: string | undefined;
+  private readonly apiPathPrefix: string;
+  /**
+   * Prefix of the chat route. The same as `apiPathPrefix` everywhere but
+   * on a root that serves chat outside `/v1` (`openai-chat-path.ts`).
+   */
+  private readonly chatPathPrefix: string;
+  private readonly taggedToolCompatibility: "qwen" | undefined;
+  private readonly extraBody: Record<string, unknown> | undefined;
+  private readonly maxOutputTokens: number | undefined;
+  private readonly strictTools: boolean;
+  private readonly providerPreferences: Record<string, unknown> | undefined;
+  private readonly bodyOptions: OpenAiBodyOptions;
+  private readonly reasoningFormat: ReasoningFormat;
+  private readonly messageShape: "native" | "flat";
+  /**
+   * Sessions whose requests go out flat after the service rejected the
+   * native layout (`"*"` for requests without a session id). Per
+   * session rather than per provider so one shim-backed session cannot
+   * downgrade another's caching; per instance because a provider is
+   * rebuilt on every config write, which is the cheapest re-probe.
+   */
+  private readonly flatSessions = new Set<string>();
+
+  constructor(options: OpenAiProviderOptions) {
+    this.id = options.id;
+    this.name = options.id;
+    const baseToolCallAdapter =
+      options.toolCallAdapter ?? openAiToolCallAdapter;
+    // Strict mode makes the model send `"x": null` where it used to
+    // omit `x` — see `withStrictNullArgumentDrop`. Wrapped here, on the
+    // one provider that opted in, so the parse side stays untouched for
+    // everybody else.
+    this.toolCallAdapter = options.strictTools
+      ? withStrictNullArgumentDrop(baseToolCallAdapter)
+      : baseToolCallAdapter;
+    // `auto` reads whichever reasoning field the service writes; a
+    // configured format (`userModels[].reasoningFormat`) pins one.
+    this.reasoningFormat = options.reasoningFormat ?? "auto";
+    this.streamConsumer =
+      options.streamConsumer ??
+      createOpenAiStreamConsumer(this.reasoningFormat);
+    this.capabilities = {
+      ...openAiVisionCapabilities(options),
+      toolTransport: "native_tools",
+      contextWindow: 128_000,
+      supportsParallelTools: options.supportsParallelTools ?? true,
+      supportsSlotAffinity: false,
+      supportsPromptCache: options.supportsPromptCache ?? true,
+      reasoningFormat: this.reasoningFormat,
+    };
+    this.defaultChatModel = options.defaultChatModel;
+    this.chatModelId = options.defaultChatModel;
+    this.apiPathPrefix = normalizeApiPathPrefix(options.apiPathPrefix ?? "/v1");
+    // An explicit prefix (Gemini's `/v1beta/openai`) is the whole answer
+    // for both routes; the `/v1` default is a guess the root can correct.
+    this.chatPathPrefix =
+      options.apiPathPrefix === undefined
+        ? openAiChatPathPrefix(options.baseUrl)
+        : this.apiPathPrefix;
+    this.taggedToolCompatibility = options.taggedToolCompatibility;
+    this.extraBody = options.extraBody;
+    this.maxOutputTokens = options.maxOutputTokens;
+    this.strictTools = options.strictTools ?? false;
+    this.providerPreferences = options.providerPreferences;
+    this.messageShape = options.messageShape ?? "native";
+    this.bodyOptions = {
+      nameEscape: (name) => this.toolCallAdapter.nameEscape(name),
+      ...(options.providerKind ? { providerKind: options.providerKind } : {}),
+      ...(isTemplateKwargsKind(options.providerKind) && isLocalServerUrl(options.baseUrl)
+        ? { templateKwargs: true }
+        : {}),
+      ...(options.modelParams ? { modelParams: options.modelParams } : {}),
+      ...(resolveAnthropicCacheControl(options)
+        ? { anthropicCacheControl: true }
+        : {}),
+    };
+    this.http = {
+      baseUrl: normalizeOpenAiBaseUrl(options.baseUrl),
+      apiKey: options.apiKey,
+      extraHeaders: options.headers ?? {},
+      ...(options.apiKeyHeader ? { apiKeyHeader: options.apiKeyHeader } : {}),
+      requestTimeoutMs:
+        options.requestTimeoutMs ?? OPENAI_DEFAULT_REQUEST_TIMEOUT_MS,
+      fetchImpl: options.fetchImpl ?? fetch,
+      label: options.id,
+      ...(options.logger ? { logger: options.logger } : {}),
+    };
+  }
+
+  async complete(request: CompletionRequest): Promise<CompletionResult> {
+    const model = this.defaultChatModel;
+    if (!model) {
+      throw new Error(
+        `openai-compatible provider "${this.name}" has no defaultChatModel configured`,
+      );
+    }
+    // The body the response actually came from; see `OnOpenAiRequestBody`.
+    let sentBody: Record<string, unknown> | undefined;
+    const send = (shape: "native" | "flat") =>
+      // Unary only: sub-calls carry `response_format`, streamed turns never do.
+      sendWithStructuredOutputFallback(
+        {
+          providerId: this.id,
+          model: model,
+          logger: this.http.logger,
+        },
+        request,
+        (req) => this.buildBody(req, false, shape),
+        (body) =>
+          openAiPostJson(
+            this.http,
+            `${this.chatPathPrefix}/chat/completions`,
+            body,
+            request,
+            (sent) => {
+              sentBody = sent;
+            },
+          ),
+      );
+    const shape = this.shapeFor(request);
+    let json: Record<string, unknown>;
+    try {
+      json = await send(shape);
+    } catch (err) {
+      if (!this.shouldFallBackToFlat(request, shape, err)) throw err;
+      this.markFlat(request, err);
+      json = await send("flat");
+    }
+    const adapted = adaptQwenTaggedToolResponse(
+      json,
+      request,
+      this.taggedToolOptions(),
+    );
+    return withSentMaxTokens(
+      normaliseOpenAiChatResponse(
+        adapted,
+        model,
+        this.reasoningFormat,
+      ),
+      sentBody,
+    );
+  }
+
+  /**
+   * A reply that is nothing but `<tool_call>` blocks is a tool call on
+   * every kind (Hermes fine-tunes and Qwen-derived models write one over
+   * any OpenAI-compatible server); only the Qwen kind also looks inside
+   * the reasoning channel. See `TaggedToolAdaptOptions`.
+   */
+  private taggedToolOptions(): TaggedToolAdaptOptions {
+    return { fromReasoning: this.taggedToolCompatibility === "qwen" };
+  }
+
+  private buildBody(
+    request: CompletionRequest,
+    stream: boolean,
+    shape: "native" | "flat",
+  ): Record<string, unknown> {
+    return buildOpenAiChatBody(
+      request,
+      this.defaultChatModel!,
+      stream,
+      this.extraBody,
+      this.maxOutputTokens,
+      this.strictTools,
+      this.providerPreferences,
+      { ...this.bodyOptions, messageShape: shape },
+    );
+  }
+
+  /** The layout this request goes out in, given what the session learned. */
+  private shapeFor(request: CompletionRequest): "native" | "flat" {
+    if (this.messageShape === "flat") return "flat";
+    return this.flatSessions.has(sessionKey(request)) ? "flat" : "native";
+  }
+
+  /**
+   * Whether a failed send is the service refusing the native layout —
+   * which only a request that actually went out native can be — rather
+   * than anything else, and whether a flat resend is still wanted.
+   */
+  private shouldFallBackToFlat(
+    request: CompletionRequest,
+    shape: "native" | "flat",
+    err: unknown,
+  ): boolean {
+    if (request.signal?.aborted) return false;
+    if (resolveMessageShape(request, { messageShape: shape }) !== "native") {
+      return false;
+    }
+    return isNativeShapeRejection(err);
+  }
+
+  private markFlat(request: CompletionRequest, err: unknown): void {
+    this.flatSessions.add(sessionKey(request));
+    this.http.logger?.warn(
+      `llm: "${this.id}" rejected native chat messages (roles / tool_call_id); sending the flat prompt for the rest of this session`,
+      {
+        provider: this.id,
+        model: this.defaultChatModel,
+        sessionId: request.sessionId ?? null,
+        status: 400,
+        detail: err instanceof Error ? err.message.slice(0, 240) : String(err),
+      },
+    );
+  }
+
+  async *completeStream(
+    request: CompletionRequest,
+  ): AsyncGenerator<StreamChunk, CompletionResult, void> {
+    const model = this.defaultChatModel;
+    if (!model) {
+      throw new Error(
+        `openai-compatible provider "${this.name}" has no defaultChatModel configured`,
+      );
+    }
+    let shape = this.shapeFor(request);
+    let body = this.buildBody(request, true, shape);
+    const path = `${this.chatPathPrefix}/chat/completions`;
+    let accumulated = "";
+    let accumulatedReasoning = "";
+    let streamFinal: StreamFinalResult | void = undefined;
+    // The body the live stream was opened with; see `OnOpenAiRequestBody`.
+    let sentBody: Record<string, unknown> | undefined;
+    // Flipped the instant the first chunk leaves this generator. Before
+    // that the caller has seen nothing, so throwing the half-opened
+    // stream away and starting over is invisible to everyone — the same
+    // argument `openAiStartStream` makes for retrying the open. After
+    // it, the stream is COMMITTED: a restart would replay the completion
+    // from the top and duplicate text the user already read, and because
+    // sampling is non-deterministic no prefix dedupe can repair that.
+    let committed = false;
+    // One completion, one budget. Passed into every open so a reopen
+    // draws from the same pot the opens do — the alternative is two
+    // nested loops of `OPENAI_MAX_ATTEMPTS` and 9 requests per turn.
+    const budget = createOpenAiAttemptBudget();
+    // Distinguishes "the loop finished a stream" from "the loop ran out
+    // of iterations", which is what makes the bound below safe to add.
+    let streamEnded = false;
+
+    // The window this loop exists for: a provider answers 2xx, thinks for
+    // a long time (reasoning models, cold routes), then drops the socket
+    // without ever emitting a delta. `openAiStartStream` has already
+    // returned by then, so its retry is spent, and undici surfaces the
+    // death as a bare `Error: terminated` from the body reader — which
+    // used to fail the whole turn ("Turn failed [transport]: terminated")
+    // even though not one byte of output existed.
+    //
+    // The `attempt <= OPENAI_MAX_ATTEMPTS` bound is a structural
+    // backstop, not the working exit: every iteration spends at least one
+    // unit of `budget` and `canReopenStream` stops at zero, so the
+    // condition should never be what ends this loop. It is written anyway
+    // because this loop issues network requests, and a loop whose only
+    // termination is a helper's return value is one edit away from
+    // hammering a provider forever.
+    attempts: for (
+      let attempt = 1;
+      attempt <= OPENAI_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      try {
+        // Opening the stream (connect + status check) happens inside the
+        // client's bounded retry, strictly before the first chunk exists.
+        const res = await openAiStartStream(
+          this.http,
+          path,
+          body,
+          request,
+          budget,
+          (sent) => {
+            sentBody = sent;
+          },
+        );
+        // A reopen starts from an empty transcript: whatever the dead
+        // attempt accumulated was never yielded and must not be mixed
+        // into the fresh one. With the built-in stream consumer nothing
+        // can accumulate without also committing, so this is dead weight
+        // for it; it is not dead for an injected `streamConsumer`, which
+        // may report content on a `done` chunk this loop does not yield.
+        accumulated = "";
+        accumulatedReasoning = "";
+        streamFinal = undefined;
+        const stream = this.streamConsumer.consume(res.body, request.signal);
+        // Whether this pump reached the consumer's own `done`. A pump that
+        // did not has abandoned a live stream; see the release below.
+        let drained = false;
+        try {
+          while (true) {
+            const next = await stream.next();
+            if (next.done) {
+              streamFinal = next.value;
+              streamEnded = true;
+              drained = true;
+              break attempts;
+            }
+            const chunk = next.value;
+            if (chunk.delta) accumulated += chunk.delta;
+            if (chunk.reasoningDelta)
+              accumulatedReasoning += chunk.reasoningDelta;
+            if (!chunk.done) {
+              // Set before the yield, deliberately: a caller that throws
+              // into this generator (`generator.throw()`, which is how a
+              // consumer reports its own failure into a stream it is
+              // draining) resumes us *inside* the catch below, with the
+              // yield never having returned. Set after the yield, that
+              // error would find `committed === false` and replay a
+              // completion the caller has already shown part of.
+              committed = true;
+              yield chunk;
+            }
+          }
+        } finally {
+          // Release this attempt's transport on every exit that is not the
+          // consumer's own `done`.
+          //
+          // This pump cannot be a `yield*`/`for await` — the loop decides
+          // which chunks reach the caller and when to leave the retry loop
+          // — and a hand-run inner iterator is NOT closed when this
+          // generator is closed: `yield*` forwards a `.return()`, a manual
+          // pump swallows it. So a consumer that walks away at the `yield`
+          // above (a `.return()` down the chain, a `break` out of its
+          // `for await`, an exception thrown back into us) left the
+          // consumer suspended at its own `yield` forever, with the reader
+          // lock still held and a fetch body nobody reads.
+          //
+          // Order matters: closing the consumer runs its own `finally`,
+          // whose `releaseLock()` is what makes the body cancellable at
+          // all, and the cancel is what actually ends the request —
+          // `openAiFetch` detaches the caller's abort listener the moment
+          // the headers land, so after the open nothing but a cancel of
+          // this body can close the socket.
+          //
+          // The cancel is deliberately not awaited, like the reader cancel
+          // in `LlamaServerClient.completeStream`: a cancel travelling
+          // into a socket must never hang a consumer trying to walk away.
+          // Closing the consumer *is* awaited, because the cancel below
+          // needs the lock it gives back — so a consumer whose `finally`
+          // never settles would park this unwind. That is the shape of
+          // `createOpenAiStreamConsumer`'s contract, not an accident: its
+          // `finally` is a bare synchronous `releaseLock()`.
+          // Both rejections are swallowed because we are already unwinding
+          // — a transport that fails to close must not replace the error
+          // the caller is already seeing, nor surface as an unhandled
+          // rejection — and both calls are no-ops where they are not
+          // needed: closing a generator that already finished returns at
+          // once, and a body that has ended or errored takes the cancel
+          // into that same swallow.
+          if (!drained) {
+            await stream.return(undefined).catch(() => undefined);
+            void res.body.cancel().catch(() => undefined);
+          }
+        }
+      } catch (err) {
+        // Cancellation first, and it throws rather than returning a
+        // verdict, because the *shape* of the error decides what the user
+        // gets. `classifyFailure` files every `OpenAiHttpError` as
+        // `transport` before it ever looks for an abort, and a bare
+        // `Error: terminated` from a body that died while the abort was
+        // in flight is `transport` too — either one makes `shouldAdvance`
+        // report an immediate provider-down signal, so the fallback chain
+        // switches links and starts the very completion the user just
+        // stopped. `signal.reason` is abort-shaped by construction.
+        if (request.signal?.aborted)
+          throw cancellationError(request.signal, err);
+        // The service refused the message layout, before any byte of
+        // output existed (a 400 comes from the open): the same request
+        // goes out once more in the flat form, and the session stays
+        // flat. Only ever one such resend — the second attempt is flat
+        // by construction and cannot match again.
+        if (!committed && this.shouldFallBackToFlat(request, shape, err)) {
+          this.markFlat(request, err);
+          shape = "flat";
+          body = this.buildBody(request, true, shape);
+          continue;
+        }
+        // An error event inside the stream (OpenRouter's `504 Upstream
+        // idle timeout` after output) becomes the typed HTTP error the
+        // loop classifies, carrying the generation id for the trace.
+        if (err instanceof OpenAiSseError) throw this.httpErrorFromSse(err, path);
+        if (!canReopenStream(err, committed, budget)) throw err;
+        // Nothing to release here: the dead attempt's transport went
+        // through the block above on the way out, and on this path it is
+        // a no-op either way. The only way to reach this line with a
+        // response in hand is `isNetworkError(err)` on an error raised by
+        // the body reader — i.e. the stream is already errored, `cancel()`
+        // on an errored stream rejects with the stored error, and undici
+        // has already destroyed the socket. The reopen below gets its own
+        // `res`, so the stream this loop is about to use is never the one
+        // that was released.
+        await openAiRetryBackoff(
+          OPENAI_MAX_ATTEMPTS - budget.remaining,
+          request.signal,
+        );
+        // `sleep()` resolves on abort instead of rejecting, so without
+        // this the loop walks out of the backoff straight into the next
+        // open. Today that open throws before it fetches
+        // (`runOpenAiWithRetry` checks the signal first) and the check
+        // above catches it on the way through, which makes this line
+        // redundant *given* that behaviour — no test can tell the two
+        // apart, and the mutation sweep confirms it: dropping either
+        // check alone keeps the suite green, dropping both fails two
+        // tests. It stays because the invariant belongs to this loop:
+        // once the caller has cancelled, this loop issues nothing more,
+        // whatever the HTTP client decides to do about aborted signals.
+        if (request.signal?.aborted)
+          throw cancellationError(request.signal, err);
+      }
+    }
+    if (!streamEnded) {
+      // The backstop fired: `canReopenStream` let the loop run past its
+      // budget. Returning the empty completion assembled below would look
+      // to the user like a model that said nothing, so say what actually
+      // happened instead.
+      throw new Error(
+        "openai stream retry loop ended without a completion — canReopenStream and OPENAI_MAX_ATTEMPTS disagree",
+      );
+    }
+    const final = completionFromStreamFinal(
+      streamFinal,
+      model,
+      accumulated,
+      accumulatedReasoning,
+    );
+    if (accumulated.length > 0 && final.content.length === 0) {
+      final.content = accumulated;
+    }
+    if (
+      accumulatedReasoning.length > 0 &&
+      final.reasoningContent.length === 0
+    ) {
+      final.reasoningContent = accumulatedReasoning;
+    }
+    // Tagged Qwen calls are synthesized only after the stream has been
+    // fully buffered. Apply termination safety after that adaptation seam,
+    // so native and tagged calls are judged from the same final dispatchable
+    // tool-call set. A synthetic `finishReason: "tool_calls"` from the
+    // adapter is not evidence that the provider actually terminated cleanly.
+    const adaptedFinal = adaptQwenCompletionResult(
+      final,
+      request,
+      this.taggedToolOptions(),
+    );
+    return withSentMaxTokens(
+      applyToolCallTerminationSafety(
+        adaptedFinal,
+        // A stream the consumer ended itself has no provider terminal
+        // event by definition, and it kept only calls whose arguments had
+        // fully arrived — so the missing terminal is not a sign of a cut
+        // call, and the completion must not be marked truncated.
+        streamFinal?.terminalObserved === true ||
+          streamFinal?.earlyStop !== undefined,
+      ),
+      sentBody,
+    );
+  }
+
+  /**
+   * An error the provider reported inside the stream, as the typed HTTP
+   * failure the rest of the runtime knows: a 5xx parks the turn like a
+   * 5xx on the open would, and the generation id stays on it.
+   */
+  private httpErrorFromSse(err: OpenAiSseError, path: string): OpenAiHttpError {
+    return new OpenAiHttpError(
+      `openai provider ${err.status ?? "stream"}: ${err.message}`,
+      err.status,
+      `${this.http.baseUrl}${path}`,
+      false,
+      null,
+      this.http.label,
+      undefined,
+      {
+        cause: err,
+        streamError: err.message,
+        ...(err.generationId !== null
+          ? { generationId: err.generationId }
+          : {}),
+      },
+    );
+  }
+
+  async health(): Promise<ProviderHealthResult> {
+    const start = Date.now();
+    try {
+      const res = await this.http.fetchImpl(
+        `${this.http.baseUrl}${this.apiPathPrefix}/models`,
+        {
+          method: "GET",
+          headers: buildOpenAiHeaders(this.http, false),
+        },
+      );
+      return {
+        reachable: res.ok,
+        status: res.status,
+        error: res.ok ? null : `http ${res.status}`,
+        latencyMs: Date.now() - start,
+      };
+    } catch (err) {
+      return {
+        reachable: false,
+        status: null,
+        error: err instanceof Error ? err.message : String(err),
+        latencyMs: Date.now() - start,
+      };
+    }
+  }
+
+  async close(): Promise<void> {
+    // Stateless HTTP client — nothing to tear down.
+  }
+
+  async describeImage(request: VisionRequest): Promise<VisionResult> {
+    if (!this.capabilities.vision) {
+      throw new VisionUnsupportedError(this.name);
+    }
+    const model = this.defaultChatModel;
+    if (!model) {
+      throw new Error(
+        `openai-compatible provider "${this.name}" has no defaultChatModel configured`,
+      );
+    }
+    try {
+      return await describeImageViaOpenAi(
+        this.http,
+        model,
+        request,
+        this.chatPathPrefix,
+        this.providerPreferences,
+      );
+    } catch (error) {
+      // Only a model nobody described learns from a rejection: an
+      // operator's `supportsVision` or a catalogue row is not overruled
+      // by one 400, and its error goes back as the service wrote it.
+      if (
+        this.capabilities.visionSource === "assumed" &&
+        error instanceof OpenAiHttpError &&
+        isImageRejection(error.status, error.message)
+      ) {
+        markModelCannotSee(this.id, model);
+        this.capabilities.vision = false;
+        this.capabilities.visionSource = "rejected-images";
+        throw new ModelCannotSeeError(
+          this.id,
+          model,
+          error.message,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async listModels(): Promise<readonly string[]> {
+    const json = await openAiGetJson(this.http, `${this.apiPathPrefix}/models`);
+    const data = (json.data as Array<{ id?: string }> | undefined) ?? [];
+    return data
+      .map((row) => row.id)
+      .filter((id): id is string => typeof id === "string");
+  }
+}
+
+/**
+ * The vision half of the capabilities. The factory passes the per-model
+ * answer; a bare construction (no `supportsVision`) is `assumed`, and a
+ * model already recorded as rejecting images stays text-only across the
+ * rebuild a config write causes.
+ */
+function openAiVisionCapabilities(
+  options: OpenAiProviderOptions,
+): Pick<ProviderCapabilities, "vision" | "visionSource"> {
+  if (options.supportsVision !== undefined) {
+    return {
+      vision: options.supportsVision,
+      visionSource: options.visionSource ?? "config.provider",
+    };
+  }
+  if (options.defaultChatModel && modelCannotSee(options.id, options.defaultChatModel)) {
+    return { vision: false, visionSource: "rejected-images" };
+  }
+  return { vision: true, visionSource: "assumed" };
+}
+
+/** Kinds that front a self-hosted server, whose template may read `chat_template_kwargs`. */
+function isTemplateKwargsKind(kind: string | undefined): boolean {
+  return kind === "openai-compatible" || kind === "qwen-openai-compatible";
+}
+
+/**
+ * Whether this client places Anthropic cache breakpoints. The policy
+ * word decides when it is explicit; otherwise the model id or the host
+ * has to be Anthropic's, because every other service ignores the marker
+ * at best and rejects the request at worst.
+ */
+function resolveAnthropicCacheControl(options: OpenAiProviderOptions): boolean {
+  switch (options.promptCache) {
+    case "off":
+      return false;
+    case "explicit-markers":
+      return true;
+    default:
+      return (
+        (options.defaultChatModel && isAnthropicModel(options.defaultChatModel)) ||
+        isAnthropicHost(options.baseUrl)
+      );
+  }
+}
+
+/** The key a session's learned layout is remembered under. */
+function sessionKey(request: Pick<CompletionRequest, "sessionId">): string {
+  return request.sessionId ?? "*";
+}
+
+function normalizeApiPathPrefix(prefix: string): string {
+  const trimmed = prefix.trim().replace(/\/+$/, "");
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function completionFromStreamFinal(
+  streamFinal: StreamFinalResult | void,
+  defaultChatModel: string | undefined,
+  accumulated: string,
+  accumulatedReasoning: string,
+): CompletionResult {
+  const usage = streamFinal?.usage ?? {
+    promptTokens: 0,
+    completionTokens: 0,
+    totalTokens: 0,
+  };
+  const finishReason = streamFinal?.finishReason ?? null;
+  return {
+    content: streamFinal?.content ?? accumulated,
+    reasoningContent: streamFinal?.reasoningContent ?? accumulatedReasoning,
+    stop: finishReason !== "length",
+    truncated: finishReason === "length",
+    timing: {
+      promptMs: 0,
+      predictedMs: 0,
+      promptTokens: usage.promptTokens,
+      predictedTokens: usage.completionTokens,
+    },
+    cacheHitTokens: usage.cachedTokens ?? 0,
+    slotId: -1,
+    modelId: streamFinal?.modelId ?? defaultChatModel ?? null,
+    usage,
+    toolCalls: streamFinal?.toolCalls,
+    finishReason,
+    ...(streamFinal?.generationId !== undefined
+      ? { generationId: streamFinal.generationId }
+      : {}),
+    ...(streamFinal?.earlyStop !== undefined
+      ? { earlyStop: streamFinal.earlyStop }
+      : {}),
+  };
+}
+
+/**
+ * Stamp the output cap the request carried on the wire. `max_tokens` is
+ * what `buildOpenAiChatBody` writes; `max_completion_tokens` can only
+ * arrive through `extraBody`, and bounds the reply just the same. Neither
+ * present is recorded as `null` — no cap was sent — which is different
+ * from not knowing.
+ */
+function withSentMaxTokens(
+  result: CompletionResult,
+  sentBody: Record<string, unknown> | undefined,
+): CompletionResult {
+  if (sentBody === undefined) return result;
+  const cap =
+    typeof sentBody.max_tokens === "number"
+      ? sentBody.max_tokens
+      : typeof sentBody.max_completion_tokens === "number"
+        ? sentBody.max_completion_tokens
+        : null;
+  return { ...result, sentMaxTokens: cap };
+}
+
+/**
+ * The error a turn the user cancelled should fail with.
+ *
+ * `classifyFailure` reads cancellation off the error's *shape*, and the
+ * shapes that reach the retry loop when someone presses Esc are not
+ * reliably abort-shaped: a body that dies while the abort is in flight
+ * arrives as `Error: terminated` (→ `transport`), and an abort noticed
+ * inside `runOpenAiWithRetry` arrives as an `OpenAiHttpError` whose
+ * `transport` branch is checked *before* the abort branch. Either one
+ * makes `shouldAdvance` report an immediate provider-down signal, so the
+ * fallback chain switches links and starts the very completion the user
+ * just stopped.
+ *
+ * `signal.reason` is the abort's own error — a `DOMException` named
+ * `AbortError` when the aborter supplied nothing — so it classifies as
+ * `cancelled`. The original error is the fallback for signal doubles
+ * that never populate `reason`.
+ */
+function cancellationError(signal: AbortSignal, fallback: unknown): unknown {
+  const reason: unknown = signal.reason;
+  return reason ?? fallback;
+}
+
+/**
+ * May a failure raised between "2xx headers received" and "first chunk
+ * handed to our caller" be recovered by reopening the stream?
+ *
+ * Cancellation is deliberately NOT one of these guards: the caller checks
+ * the signal before asking, because an aborted turn needs a specific
+ * error *thrown*, not a boolean returned (see `cancellationError`).
+ *
+ * The order of the guards that are here is the contract, not a stylistic
+ * choice:
+ *
+ * 1. **Committed.** Once a chunk has been yielded, nothing below matters.
+ *    This is a strict reading of "output": a chunk carrying only the
+ *    provider's opening `role` delta commits the stream just as a text
+ *    delta does. We cannot know what a downstream consumer did with it,
+ *    and being wrong here means duplicating a user's reply. Reasoning
+ *    deltas are output for the same reason — the TUI renders them live.
+ *
+ *    What this does NOT cover is a completion that streamed nothing but
+ *    tool-call arguments: `createOpenAiStreamConsumer` yields on a
+ *    `function.arguments` delta only once the accumulated arguments
+ *    contain reply text, so a `{"path":"a.txt"` in flight leaves
+ *    `committed` false and such a stream IS reopened. That is safe — no
+ *    text reached the user, and tools are dispatched only after the
+ *    completion returns — and it is what the reporter's case wants, since
+ *    a tool call whose arguments never finished streaming is not a usable
+ *    turn. It is spelled out because "any chunk we yielded" and "any byte
+ *    the provider sent" are not the same line.
+ * 2. **`OpenAiHttpError`.** The failure came from *opening* the stream,
+ *    inside `runOpenAiWithRetry`, which has already applied this client's
+ *    retry policy to it. Reopening here would quietly replace that policy
+ *    with a looser one, because `isNetworkError` says yes to failures
+ *    `isRetryableOpenAiError` deliberately says no to: our own request
+ *    timeout, and any non-retryable status whose body preview happens to
+ *    mention a socket. The shared budget makes this cheap rather than
+ *    catastrophic now — a *retryable* open failure has already drained
+ *    the budget, so guard 4 would stop it anyway — but a non-retryable
+ *    one still has budget left, and re-deciding a call the HTTP client
+ *    already made is how a deterministic failure turns into three
+ *    requests and a delayed, actionable message.
+ * 3. **Shape.** Anything that is not a recognisable transport death — a
+ *    bug in a stream consumer, a parse error — is a real error. Replaying
+ *    it would just hide it behind three identical failures.
+ * 4. **Budget.** One streaming completion gets `OPENAI_MAX_ATTEMPTS`
+ *    requests in total, shared with the opens: the same counter is passed
+ *    into `openAiStartStream`, so opens and reopens add up instead of
+ *    multiplying.
+ */
+function canReopenStream(
+  err: unknown,
+  committed: boolean,
+  budget: OpenAiAttemptBudget,
+): boolean {
+  if (committed) return false;
+  if (err instanceof OpenAiHttpError) return false;
+  if (!isNetworkError(err)) return false;
+  return budget.remaining > 0;
+}
+
+function applyToolCallTerminationSafety(
+  result: CompletionResult,
+  terminalObserved: boolean,
+): CompletionResult {
+  const hasToolCalls = (result.toolCalls?.length ?? 0) > 0;
+  if (!hasToolCalls || terminalObserved || result.truncated) {
+    return result;
+  }
+  return {
+    ...result,
+    stop: false,
+    truncated: true,
+  };
+}

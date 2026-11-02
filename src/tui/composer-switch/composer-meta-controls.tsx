@@ -1,0 +1,366 @@
+import { Box, Text } from "ink";
+import type { ReactElement } from "react";
+
+import { useMouseCommands, useMouseTarget } from "../mouse/mouse-context.js";
+import { isPrimaryPress } from "../mouse/mouse-event.js";
+import { theme } from "../theme/theme.js";
+import { openLocalModelsPane } from "./composer-switch-activate.js";
+import { fusionSurfaceInk, fusionSurfaceMuted } from "../theme/fusion-tint.js";
+import {
+  BackendControl,
+  backendControlWidth,
+} from "./composer-backend-control.js";
+import type { ComposerBackendMeta } from "./composer-backend-selectors.js";
+import type { ComposerSwitchKind } from "./composer-switch-state.js";
+
+/**
+ * What `selectPromptLlmMeta` puts between the two fusion legs.
+ *
+ * It lives here, and `prompt-meta-bar.tsx` imports it, because the two
+ * uses have to agree: that file splits the pair to spend the label
+ * budget on both halves, this one splits it to hang the swap button on
+ * the seam. One of them moving alone would leave a pair that truncates
+ * as a pair but no longer comes apart.
+ */
+export const LEG_SEPARATOR = " ⇄ ";
+
+/** What the model slot says when the local route has no weights on disk. */
+export const DOWNLOAD_MODEL_LABEL = "download model";
+
+export interface ComposerMetaControlsProps {
+  backend: ComposerBackendMeta | null;
+  provider: string | null;
+  model: string | null;
+  /**
+   * Replaces the model slot with `download model` and points it at the
+   * local models pane. Set on the managed-local route when nothing is
+   * on disk — see `selectComposerNeedsModelDownload`.
+   */
+  needsModelDownload?: boolean;
+  /** Paint on the Fusion surface: white ink, orange-warmed separators. */
+  fusion?: boolean;
+  /**
+   * Mouse layer the click targets register on. The composer floats over
+   * the chat log with a `MOUSE_LAYER_PANEL` backstop behind it (see
+   * `composer-overlay.tsx`), and a control left on the base layer would
+   * lose every click to that backstop — the registry offers higher
+   * layers first.
+   */
+  mouseLayer?: number;
+}
+
+/**
+ * The composer toolbar's route statement, as three controls:
+ * `● cloud · anthropic · claude-opus-5`.
+ *
+ * **No status word.** The row used to spell the probe out — `○ local
+ * down · …` next to the backend, and a fourth control carrying
+ * `healthy · 4.4 GB` on the managed-local route. Both are gone: the
+ * words tracked a probe that reported `down` against working daemons
+ * often enough that operators learned to ignore the whole right-hand
+ * end of the row, and the RAM figure cost a `ps` child process every
+ * three seconds to produce. The dot keeps the status it can actually
+ * stand behind, and the Models pane owns the detail.
+ *
+ * **Order.** Where it runs, who serves it, which model — the order the
+ * route is actually decided in. The model used to come first, which put
+ * the most volatile label in the position the eye anchors on and left
+ * the provider reading as a footnote to it.
+ *
+ * **Tone.** All three are `railForeground`: this row states what the
+ * agent *is*, and the old palette said the opposite by drawing the
+ * provider in `railMuted` and the backend word in a literal `gray`. The
+ * dot keeps its status colour and the separators stay muted, so the
+ * three words read as three things rather than one long string. Nothing
+ * here reaches for `accentSoft` — that token is a fill, and as text it
+ * lands around 2:1 on the classic-dark ground (see `theme-palettes.ts`).
+ *
+ * **Width.** Ink does not clip an over-wide row, it wraps it, and a
+ * second line here would push the composer's bottom border down. So the
+ * row fits by shrinking rather than by being cut off: the model gives
+ * first, the provider second, the backend word and the separators never.
+ *
+ * Each word is a button. Clicking one opens its switch; `ctrl+r` opens
+ * the strip from the keyboard and the arrows walk it, because a control
+ * only a mouse can reach is not a control in a terminal app.
+ */
+export function ComposerMetaControls({
+  backend,
+  provider,
+  model,
+  needsModelDownload = false,
+  fusion = false,
+  mouseLayer,
+}: ComposerMetaControlsProps): ReactElement | null {
+  if (!backend && !provider && !model && !needsModelDownload) return null;
+  const enginePair = provider ? splitLegs(provider) : null;
+  const pair = model && !needsModelDownload ? splitLegs(model) : null;
+  return (
+    <>
+      {backend ? (
+        <BackendControl
+          backend={backend}
+          fusion={fusion}
+          mouseLayer={mouseLayer}
+        />
+      ) : null}
+      {provider ? (
+        <Control
+          kind="provider"
+          label={enginePair?.[0] ?? provider}
+          lead={Boolean(backend)}
+          shrink={1}
+          fusion={fusion}
+          mouseLayer={mouseLayer}
+        />
+      ) : null}
+      {needsModelDownload ? (
+        <DownloadModelControl
+          lead={Boolean(backend || provider)}
+          mouseLayer={mouseLayer}
+        />
+      ) : pair ? (
+        <>
+          <Control
+            kind="model"
+            label={pair[0]}
+            lead={Boolean(backend || provider)}
+            shrink={3}
+            fusion={fusion}
+            mouseLayer={mouseLayer}
+          />
+          <SwapLegsControl fusion={fusion} mouseLayer={mouseLayer} />
+          {enginePair ? <Control kind="workerProvider" label={enginePair[1]} shrink={1} fusion={fusion} mouseLayer={mouseLayer} /> : null}
+          <Control
+            kind="workers"
+            lead={Boolean(enginePair)}
+            label={pair[1]}
+            shrink={3}
+            fusion={fusion}
+            mouseLayer={mouseLayer}
+          />
+        </>
+      ) : model ? (
+        <Control
+          kind="model"
+          label={model}
+          lead={Boolean(backend || provider)}
+          shrink={3}
+          fusion={fusion}
+          mouseLayer={mouseLayer}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/** Columns the ` · ` a control draws before itself costs. */
+const LEAD_WIDTH = 3;
+
+/**
+ * Rendered columns of the whole route statement —
+ * `● cloud · anthropic · claude-opus-5` — built from the same branches
+ * {@link ComposerMetaControls} renders, including the fusion pair's two
+ * legs and the rigid swap glyph between them.
+ *
+ * The row planner in `meta-bar-rows.ts` needs this before Yoga runs:
+ * how many rows the bar takes is decided from the widths, and the bar's
+ * rendered height is then clamped to that number. A width computed here
+ * that disagreed with what the component paints would show up as a blank
+ * stripe over the transcript or as a row of it hidden behind the
+ * composer, so the two are deliberately the same code path.
+ *
+ * `model` is the label as the bar will draw it — already through
+ * `formatModel` — not the raw config value.
+ */
+export function composerRouteWidth(input: {
+  backend: ComposerBackendMeta | null;
+  provider: string | null;
+  model: string | null;
+  needsModelDownload?: boolean;
+}): number {
+  const { backend, provider, model } = input;
+  const needsModelDownload = input.needsModelDownload ?? false;
+  if (!backend && !provider && !model && !needsModelDownload) return 0;
+  let width = backend ? backendControlWidth(backend) : 0;
+  const enginePair = provider ? splitLegs(provider) : null;
+  if (provider) width += (backend ? LEAD_WIDTH : 0) + (enginePair?.[0] ?? provider).length;
+  const lead = backend || provider ? LEAD_WIDTH : 0;
+  if (needsModelDownload) return width + lead + DOWNLOAD_MODEL_LABEL.length;
+  if (!model) return width;
+  const pair = splitLegs(model);
+  if (pair) {
+    return (
+      width + lead + pair[0].length + LEG_SEPARATOR.length + pair[1].length
+      + (enginePair ? enginePair[1].length + LEAD_WIDTH : 0)
+    );
+  }
+  return width + lead + model.length;
+}
+
+/**
+ * The model slot when the local route has nothing to run: a call to
+ * action rather than a switch. Clicking it goes where the download
+ * actually happens — the model switch popup would only list the empty
+ * catalog and its own deep link to the same pane.
+ */
+function DownloadModelControl({
+  lead,
+  mouseLayer,
+}: {
+  lead: boolean;
+  mouseLayer?: number;
+}): ReactElement {
+  const mouse = useMouseCommands();
+  const ref = useMouseTarget(
+    (hit) => {
+      if (!mouse || !isPrimaryPress(hit.event)) return false;
+      openLocalModelsPane(mouse.dispatch);
+      return true;
+    },
+    mouseLayer === undefined ? {} : { layer: mouseLayer },
+  );
+  return (
+    <Box ref={ref} flexShrink={3} minWidth={0}>
+      <Text wrap="truncate">
+        {lead ? (
+          <Text color={theme.colors.railMuted}>
+            {" "}
+            {theme.glyphs.dotSeparator}{" "}
+          </Text>
+        ) : null}
+        {/*
+          The rail's own warn, not the route's `railForeground`: this
+          slot is the one thing on the bar the operator has to act on,
+          and in the route's own tone it reads as just another label.
+          `railWarn` rather than `warnStrong` because this text lands on
+          the rail ground, and `warnStrong` is picked to be read on the
+          page — on the rail it was one of the pairs the contrast audit
+          caught.
+        */}
+        <Text color={theme.colors.railWarn} bold>
+          {DOWNLOAD_MODEL_LABEL}
+        </Text>
+      </Text>
+    </Box>
+  );
+}
+
+/**
+ * The glyph between the two fusion legs, as a button: one click trades
+ * the orchestrator for the workers and back.
+ *
+ * It sits where the separator already was, so the row costs nothing it
+ * did not cost before — the pair was always drawn as `A ⇄ B`; the
+ * only change is that the three characters in the middle now answer to
+ * a press. `/runmode swap` is the same move from the keyboard, because
+ * a control only a mouse can reach is not a control in a terminal app.
+ */
+function SwapLegsControl({
+  fusion,
+  mouseLayer,
+}: {
+  fusion: boolean;
+  mouseLayer?: number;
+}): ReactElement {
+  const mouse = useMouseCommands();
+  const ref = useMouseTarget(
+    (hit) => {
+      if (!mouse || !isPrimaryPress(hit.event)) return false;
+      mouse.callbacks.onFusionLegsSwapRequested?.();
+      return true;
+    },
+    mouseLayer === undefined ? {} : { layer: mouseLayer },
+  );
+  return (
+    // Rigid: the arrows are the only thing on the row that says which
+    // half is which, so they must not be what the row gives up when it
+    // runs out of columns.
+    <Box ref={ref} flexShrink={0}>
+      <Text
+        color={fusion ? fusionSurfaceInk() : theme.colors.railForeground}
+        wrap="truncate"
+      >
+        {LEG_SEPARATOR}
+      </Text>
+    </Box>
+  );
+}
+
+/**
+ * Split `A ⇄ B` into its two legs. Anything else — a single model
+ * name, a label that happens to contain the glyph without the spaces —
+ * comes back `null` and is drawn as one control, exactly as before.
+ */
+function splitLegs(label: string): readonly [string, string] | null {
+  const at = label.indexOf(LEG_SEPARATOR);
+  if (at < 0) return null;
+  const left = label.slice(0, at);
+  const right = label.slice(at + LEG_SEPARATOR.length);
+  if (left.length === 0 || right.length === 0) return null;
+  return [left, right];
+}
+
+function Control({
+  kind,
+  label,
+  glyph,
+  lead = false,
+  shrink = 0,
+  fusion = false,
+  mouseLayer,
+}: {
+  kind: ComposerSwitchKind;
+  label: string;
+  glyph?: ReactElement;
+  /**
+   * Draw the dot separator that precedes this control. It belongs to the
+   * control rather than sitting between two of them so that the pair
+   * truncates as one unit: a separator of its own would survive the
+   * label it introduces and leave the row ending in a dangling dot.
+   */
+  lead?: boolean;
+  /**
+   * How eagerly this control gives up columns. The model goes first and
+   * the provider second; the backend word is a handful of characters
+   * that name the whole route, and losing it costs more than either.
+   */
+  shrink?: number;
+  /** Paint on the Fusion surface instead of the rail. */
+  fusion?: boolean;
+  /** See `ComposerMetaControlsProps.mouseLayer`. */
+  mouseLayer?: number;
+}): ReactElement {
+  const mouse = useMouseCommands();
+  // `useMouseTarget` rather than the `MouseTarget` wrapper: the box needs
+  // `minWidth={0}` for Yoga to shrink it at all, and outside a provider
+  // (component tests, the wizard's separate Ink tree) the hook hands back
+  // an inert ref, so one code path covers both worlds.
+  const ref = useMouseTarget(
+    (hit) => {
+      if (!mouse || !isPrimaryPress(hit.event)) return false;
+      mouse.dispatch({ type: "composer_switch_opened", kind });
+      return true;
+    },
+    mouseLayer === undefined ? {} : { layer: mouseLayer },
+  );
+  return (
+    <Box ref={ref} flexShrink={shrink} minWidth={0}>
+      <Text wrap="truncate">
+        {lead ? (
+          <Text color={fusion ? fusionSurfaceMuted() : theme.colors.railMuted}>
+            {" "}
+            {theme.glyphs.dotSeparator}{" "}
+          </Text>
+        ) : null}
+        {glyph ?? null}
+        <Text
+          color={fusion ? fusionSurfaceInk() : theme.colors.railForeground}
+          bold
+        >
+          {label}
+        </Text>
+      </Text>
+    </Box>
+  );
+}

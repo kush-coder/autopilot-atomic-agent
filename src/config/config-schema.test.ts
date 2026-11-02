@@ -1,0 +1,2486 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  ConfigValidationError,
+  USER_CONFIG_DEFAULTS,
+  USER_CONFIG_VERSION,
+  parseUserConfigFile,
+} from "./config-schema.js";
+
+describe("tui.onboarding (config v43, extended in v45)", () => {
+  it("defaults every stamp to null on a file that predates the block", () => {
+    const parsed = parseUserConfigFile({ version: 42, tui: { theme: "nord" } });
+    expect(parsed.tui.onboarding).toEqual({
+      completedAt: null,
+      introSeenAt: null,
+      skippedAt: null,
+      proposedSecondBackendAt: null,
+      localSetupSeenAt: null,
+      importOfferedAt: null,
+    });
+    expect(parsed.tui.theme).toBe("nord");
+  });
+
+  it("still accepts a v44 file — the customModels release — as input", () => {
+    const parsed = parseUserConfigFile({ version: 44, tui: { theme: "nord" } });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.tui.onboarding.localSetupSeenAt).toBeNull();
+  });
+
+  it("reads a v43 file as never having opened the local list", () => {
+    const stamp = "2026-08-21T18:04:05.000Z";
+    const parsed = parseUserConfigFile({
+      version: 43,
+      tui: { onboarding: { completedAt: stamp } },
+    });
+    expect(parsed.tui.onboarding.completedAt).toBe(stamp);
+    expect(parsed.tui.onboarding.localSetupSeenAt).toBeNull();
+  });
+
+  it("round-trips localSetupSeenAt", () => {
+    const stamp = "2026-08-22T07:15:00.000Z";
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { onboarding: { localSetupSeenAt: stamp } },
+    });
+    expect(parsed.tui.onboarding.localSetupSeenAt).toBe(stamp);
+  });
+
+  it("rejects a localSetupSeenAt that is not a date", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { onboarding: { localSetupSeenAt: "earlier" } },
+      }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it("round-trips ISO stamps", () => {
+    const stamp = "2026-08-21T18:04:05.000Z";
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { onboarding: { completedAt: stamp, introSeenAt: stamp } },
+    });
+    expect(parsed.tui.onboarding.completedAt).toBe(stamp);
+    expect(parsed.tui.onboarding.introSeenAt).toBe(stamp);
+    expect(parsed.tui.onboarding.skippedAt).toBeNull();
+  });
+
+  it("rejects a stamp that is not a date", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { onboarding: { completedAt: "soon" } },
+      }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it("rejects a non-object onboarding block", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { onboarding: true },
+      }),
+    ).toThrow(ConfigValidationError);
+  });
+});
+
+describe("parseUserConfigFile", () => {
+  it("returns defaults when all fields are missing", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed).toEqual(USER_CONFIG_DEFAULTS);
+  });
+
+  it("accepts a fully specified config and normalises it", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { url: "http://localhost:18991" },
+      log: { level: "debug" },
+      agent: {
+        tokenBudget: 3000,
+        maxSteps: 10,
+        toolTimeoutMs: 45000,
+        approvalLevel: 5,
+      },
+    });
+    expect(parsed.localModels.url).toBe("http://localhost:18991");
+    expect(parsed.log.level).toBe("debug");
+    expect(parsed.agent.tokenBudget).toBe(3000);
+    expect(parsed.agent.approvalLevel).toBe(5);
+  });
+
+  it("defaults agent.approvalLevel to 1 (ask for everything)", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.agent.approvalLevel).toBe(1);
+  });
+
+  it("migrates legacy agent.approvalRequired: false to level 5", () => {
+    const parsed = parseUserConfigFile({
+      version: 36,
+      agent: { approvalRequired: false },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.agent.approvalLevel).toBe(5);
+    // The legacy key is read once and never written back.
+    expect("approvalRequired" in parsed.agent).toBe(false);
+  });
+
+  it("migrates legacy agent.approvalRequired: true (and string forms) to level 1", () => {
+    expect(
+      parseUserConfigFile({ version: 36, agent: { approvalRequired: true } })
+        .agent.approvalLevel,
+    ).toBe(1);
+    expect(
+      parseUserConfigFile({ version: 36, agent: { approvalRequired: "false" } })
+        .agent.approvalLevel,
+    ).toBe(5);
+  });
+
+  it("prefers agent.approvalLevel over a stale legacy approvalRequired", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      agent: { approvalLevel: 3, approvalRequired: false },
+    });
+    expect(parsed.agent.approvalLevel).toBe(3);
+  });
+
+  it("takes a numeric string, like every other number in this file", () => {
+    // `config set <key> <value>` hands the schema the raw argv string on
+    // purpose — guessing the type at the CLI would be a second source of
+    // truth that drifts the moment a field changes type — and every
+    // other numeric key coerces accordingly. `approvalLevel` was the one
+    // exception, which made the ladder the only key the dotted-key
+    // editor could not write, and it said so with a message that asked
+    // for exactly what it had been given.
+    for (const [input, want] of [
+      ["3", 3],
+      [" 5 ", 5],
+      ["1", 1],
+    ] as const) {
+      expect(
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          agent: { approvalLevel: input },
+        }).agent.approvalLevel,
+        `${JSON.stringify(input)} should be accepted`,
+      ).toBe(want);
+    }
+  });
+
+  it("rejects out-of-range or non-integer agent.approvalLevel", () => {
+    // A string that names a number is fine; a string that does not, a
+    // fractional level, and anything off the 1..5 ladder are not.
+    for (const bad of [0, 6, 2.5, "2.5", "high", "", true]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          agent: { approvalLevel: bad },
+        }),
+      ).toThrow(ConfigValidationError);
+    }
+    // null means "unset": falls back through the migration to level 1.
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { approvalLevel: null },
+      }).agent.approvalLevel,
+    ).toBe(1);
+  });
+
+  it("rejects a non-numeric version", () => {
+    expect(() => parseUserConfigFile({ version: "41" })).toThrow(
+      ConfigValidationError,
+    );
+    expect(() => parseUserConfigFile({ version: Number.NaN })).toThrow(
+      ConfigValidationError,
+    );
+  });
+
+  // A build that is rolled back, or a second install sharing one state
+  // dir, meets a file from the future. Throwing here bricks every command
+  // — `getConfig()` runs before all of them — so a newer file is read
+  // with this build's schema instead.
+  it("reads a config written by a newer build instead of rejecting it", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION + 1,
+      agent: { approvalLevel: 3 },
+    });
+    expect(parsed.agent.approvalLevel).toBe(3);
+  });
+
+  it("keeps a newer version rather than stamping its own", () => {
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION + 7 }).version,
+    ).toBe(USER_CONFIG_VERSION + 7);
+  });
+
+  // Every version-gated rule in the parse is a `<` comparison against the
+  // input version, so a newer file must take its stored values verbatim
+  // rather than having the pre-v41/v22/v25 defaults forced back on.
+  it("does not apply migration overrides to a newer file", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION + 1,
+      localModels: { managed: { autoUpdate: false } },
+      memory: { links: { enabled: false } },
+    });
+    expect(parsed.localModels.managed.autoUpdate).toBe(false);
+    expect(parsed.memory.links.enabled).toBe(false);
+  });
+
+  // The parse rebuilds a fixed literal, so a block added by a newer
+  // schema only survives if it is carried across explicitly.
+  // Deliberately absent from `UserConfigFile` — the keys ride along on the
+  // object without widening the type, so the test has to reach past it.
+  it("carries unknown top-level keys through the parse", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION + 1,
+      somethingFromTheFuture: { nested: [1, 2, 3] },
+    }) as unknown as Record<string, unknown>;
+    expect(parsed.somethingFromTheFuture).toEqual({ nested: [1, 2, 3] });
+  });
+
+  it("retires the legacy telemetry alias instead of carrying it forward", () => {
+    const parsed = parseUserConfigFile({
+      version: 20,
+      telemetry: { trace: { enabled: true } },
+    }) as unknown as Record<string, unknown>;
+    expect(parsed.telemetry).toBeUndefined();
+    expect(parsed.tracing).toBeDefined();
+  });
+
+  it("rejects a version that is not a plausible whole number", () => {
+    for (const version of [42.5, 1e308, 0, -1]) {
+      expect(() => parseUserConfigFile({ version })).toThrow(
+        ConfigValidationError,
+      );
+    }
+  });
+
+  // JSON.parse — unlike an object literal — makes `__proto__` a real own
+  // key, which is the only way this reaches the carry-through spread.
+  it("drops a __proto__ key instead of carrying it through", () => {
+    const raw: unknown = JSON.parse(
+      `{"version": ${USER_CONFIG_VERSION}, "__proto__": {"polluted": true}}`,
+    );
+    expect(Object.hasOwn(raw as object, "__proto__")).toBe(true);
+
+    const parsed = parseUserConfigFile(raw);
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(Object.hasOwn(parsed, "__proto__")).toBe(false);
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it("never lets an unknown key shadow a parsed one", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      agent: { approvalLevel: 2 },
+    });
+    expect(parsed.agent.approvalLevel).toBe(2);
+  });
+
+  it("rejects legacy v1/v2/v3/v4 input — migration is not supported", () => {
+    expect(() => parseUserConfigFile({ version: 1 })).toThrow(
+      ConfigValidationError,
+    );
+    expect(() => parseUserConfigFile({ version: 4 })).toThrow(
+      ConfigValidationError,
+    );
+  });
+
+  it("accepts a v5 file and fills in vision.* defaults transparently", () => {
+    const parsed = parseUserConfigFile({ version: 5 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.vision).toEqual(USER_CONFIG_DEFAULTS.vision);
+  });
+
+  it("applies vision defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.vision).toEqual(USER_CONFIG_DEFAULTS.vision);
+  });
+
+  it("fills web.search defaults when migrating from v26", () => {
+    const parsed = parseUserConfigFile({ version: 26 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.web.search).toEqual(USER_CONFIG_DEFAULTS.web.search);
+  });
+
+  it("accepts user-supplied web search provider overrides", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      web: {
+        search: {
+          provider: "searxng",
+          maxResults: 6,
+          timeoutMs: 12_000,
+          searxng: { instanceUrl: "https://search.example.com" },
+        },
+      },
+    });
+    expect(parsed.web.search.provider).toBe("searxng");
+    expect(parsed.web.search.maxResults).toBe(6);
+    expect(parsed.web.search.timeoutMs).toBe(12_000);
+    expect(parsed.web.search.searxng.instanceUrl).toBe(
+      "https://search.example.com",
+    );
+  });
+
+  it("rejects an unknown web search provider", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        web: { search: { provider: "google" } },
+      }),
+    ).toThrow(/web.search.provider/);
+  });
+
+  it("fills cacheTtlMinutes/fallback defaults when migrating from v27", () => {
+    const parsed = parseUserConfigFile({ version: 27 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.web.search.cacheTtlMinutes).toBe(60);
+    expect(parsed.web.search.provider).toBe("exa");
+    expect(parsed.web.search.fallback).toEqual(["duckduckgo"]);
+  });
+
+  it("fills tui.theme default 'auto' when migrating from v28", () => {
+    const parsed = parseUserConfigFile({ version: 28 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.tui.theme).toBe("auto");
+  });
+
+  it("fills web.fetch defaults when migrating from v37", () => {
+    const parsed = parseUserConfigFile({
+      version: 37,
+      web: { search: { provider: "exa", timeoutMs: 15_000 } },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.web.fetch.timeoutMs).toBe(30_000);
+    expect(parsed.web.fetch.connectTimeoutMs).toBe(10_000);
+    expect(parsed.web.fetch.maxRetries).toBe(2);
+    // The version bump must not drop the settings a v37 file already carried.
+    expect(parsed.web.search.timeoutMs).toBe(15_000);
+  });
+
+  it("accepts every version between the oldest supported and the current one", () => {
+    // A bump that forgets to append the outgoing version to the supported
+    // list locks out everyone whose config is still on it.
+    for (let version = 5; version <= USER_CONFIG_VERSION; version += 1) {
+      expect(() => parseUserConfigFile({ version })).not.toThrow();
+    }
+  });
+
+  it("preserves an explicit tui.theme name", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { theme: "dracula" },
+    });
+    expect(parsed.tui.theme).toBe("dracula");
+  });
+
+  it("normalises a blank tui.theme back to 'auto'", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { theme: "   " },
+    });
+    expect(parsed.tui.theme).toBe("auto");
+  });
+
+  it("enables tui.mouse by default when migrating from v37", () => {
+    const parsed = parseUserConfigFile({ version: 37 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.tui.mouse).toBe(true);
+  });
+
+  it("preserves tui.mouse: false so an operator's opt-out survives", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { theme: "auto", mouse: false },
+    });
+    expect(parsed.tui.mouse).toBe(false);
+  });
+
+  it("accepts the string forms parseBool understands for tui.mouse", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { mouse: "off" },
+    });
+    expect(parsed.tui.mouse).toBe(false);
+  });
+
+  it("rejects a non-boolean tui.mouse", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { mouse: 42 },
+      }),
+    ).toThrow(/tui.mouse/);
+  });
+
+  it("rejects a non-string tui.theme", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { theme: 42 },
+      }),
+    ).toThrow(/tui.theme/);
+  });
+
+  it("keeps an explicit empty fallback (disables the default Exa->DDG degrade)", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      web: { search: { provider: "exa", fallback: [] } },
+    });
+    expect(parsed.web.search.fallback).toEqual([]);
+  });
+
+  it("accepts cacheTtlMinutes and a deduped fallback chain (dropping the primary)", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      web: {
+        search: {
+          provider: "duckduckgo",
+          cacheTtlMinutes: 30,
+          fallback: ["exa", "duckduckgo", "exa", "searxng"],
+        },
+      },
+    });
+    expect(parsed.web.search.cacheTtlMinutes).toBe(30);
+    // primary (duckduckgo) dropped, duplicate exa collapsed
+    expect(parsed.web.search.fallback).toEqual(["exa", "searxng"]);
+  });
+
+  it("allows cacheTtlMinutes = 0 (cache disabled)", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      web: { search: { cacheTtlMinutes: 0 } },
+    });
+    expect(parsed.web.search.cacheTtlMinutes).toBe(0);
+  });
+
+  it("rejects an out-of-range cacheTtlMinutes", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        web: { search: { cacheTtlMinutes: 5000 } },
+      }),
+    ).toThrow(/web.search.cacheTtlMinutes/);
+  });
+
+  it("fills git.remoteSync default false when migrating from v51", () => {
+    // A repository the agent versions must stay on this machine until
+    // the operator opens the door: an older file must never come up
+    // syncing.
+    const parsed = parseUserConfigFile({ version: 51 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.git.remoteSync).toBe(false);
+    expect(USER_CONFIG_DEFAULTS.git.remoteSync).toBe(false);
+  });
+
+  it("honours an explicit git.remoteSync opt-in", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      git: { remoteSync: true },
+    });
+    expect(parsed.git.remoteSync).toBe(true);
+  });
+
+  it("rejects a non-boolean git.remoteSync", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        git: { remoteSync: "yes please" },
+      }),
+    ).toThrow(/git.remoteSync/);
+  });
+
+  it("fills persistCache default true when migrating from v45 (#256)", () => {
+    const parsed = parseUserConfigFile({ version: 45 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.web.search.persistCache).toBe(true);
+  });
+
+  it("honours an explicit persistCache opt-out", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      web: { search: { persistCache: false } },
+    });
+    expect(parsed.web.search.persistCache).toBe(false);
+  });
+
+  it("rejects a non-boolean persistCache", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        web: { search: { persistCache: "yes please" } },
+      }),
+    ).toThrow(/web.search.persistCache/);
+  });
+
+  it("rejects an invalid fallback entry", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        web: { search: { fallback: ["exa", "google"] } },
+      }),
+    ).toThrow(/web.search.fallback/);
+  });
+
+  it("rejects a non-array fallback", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        web: { search: { fallback: "exa" } },
+      }),
+    ).toThrow(/web.search.fallback/);
+  });
+
+  it("accepts user-supplied vision overrides", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      vision: {
+        enabled: false,
+        autoDetect: false,
+        maxImageBytes: 2_097_152,
+        maxImagesPerCall: 1,
+      },
+    });
+    expect(parsed.vision).toEqual({
+      enabled: false,
+      autoDetect: false,
+      maxImageBytes: 2_097_152,
+      maxImagesPerCall: 1,
+    });
+  });
+
+  it("rejects vision.maxImageBytes <= 0", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        vision: { maxImageBytes: 0 },
+      }),
+    ).toThrow(ConfigValidationError);
+  });
+
+  it("applies memory.notes defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.memory.notes).toEqual(USER_CONFIG_DEFAULTS.memory.notes);
+  });
+
+  it("accepts user-supplied memory.notes overrides", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: {
+        notes: {
+          enabled: false,
+          maxEntries: 50,
+          maxContentChars: 1_000,
+          recallDefaultK: 3,
+        },
+      },
+    });
+    expect(parsed.memory.notes).toEqual({
+      enabled: false,
+      maxEntries: 50,
+      maxContentChars: 1_000,
+      recallDefaultK: 3,
+    });
+  });
+
+  it("rejects non-positive memory.notes.maxEntries", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { notes: { maxEntries: 0 } },
+      }),
+    ).toThrow(/memory.notes.maxEntries/);
+  });
+
+  it("defaults memory.profile.maxEntries to 500 and accepts an override", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.memory.profile.maxEntries).toBe(500);
+    const custom = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: { profile: { maxEntries: 40 } },
+    });
+    expect(custom.memory.profile).toEqual({
+      ...USER_CONFIG_DEFAULTS.memory.profile,
+      maxEntries: 40,
+    });
+  });
+
+  it("reads a profile block written before memory.profile.maxEntries existed", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: {
+        profile: { enabled: true, maxTokens: 900, contextualKeywordGate: false },
+      },
+    });
+    expect(parsed.memory.profile).toEqual({
+      enabled: true,
+      maxTokens: 900,
+      contextualKeywordGate: false,
+      maxEntries: 500,
+    });
+  });
+
+  it("rejects a memory.profile.maxEntries that is not a positive integer", () => {
+    for (const bad of [0, -1, 2.5]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          memory: { profile: { maxEntries: bad } },
+        }),
+      ).toThrow(/memory.profile.maxEntries/);
+    }
+  });
+
+  it("rejects invalid log level", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        log: { level: "loud" },
+      }),
+    ).toThrow(/log.level/);
+  });
+
+  it("rejects invalid URL", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { url: "not a url" },
+      }),
+    ).toThrow(/localModels.url/);
+  });
+
+  it("rejects non-positive tokenBudget", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { tokenBudget: 0 },
+      }),
+    ).toThrow(/agent.tokenBudget/);
+  });
+
+  it("applies safety-net caps from defaults when unspecified", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.agent.conversationMaxTokens).toBe(
+      USER_CONFIG_DEFAULTS.agent.conversationMaxTokens,
+    );
+    expect(parsed.agent.worldSnapshotMaxTokens).toBe(
+      USER_CONFIG_DEFAULTS.agent.worldSnapshotMaxTokens,
+    );
+  });
+
+  it("accepts user-supplied conversation and world caps", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      agent: {
+        conversationMaxTokens: 16_000,
+        worldSnapshotMaxTokens: 4_000,
+      },
+    });
+    expect(parsed.agent.conversationMaxTokens).toBe(16_000);
+    expect(parsed.agent.worldSnapshotMaxTokens).toBe(4_000);
+  });
+
+  it("defaults conversationLowWater to 0.65 and bounds it to (0, 1]", () => {
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION }).agent
+        .conversationLowWater,
+    ).toBe(0.65);
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { conversationLowWater: 1 },
+      }).agent.conversationLowWater,
+    ).toBe(1);
+    for (const bad of [0, 1.5, -0.2]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          agent: { conversationLowWater: bad },
+        }),
+      ).toThrow(/agent.conversationLowWater/);
+    }
+  });
+
+  it("defaults agent.readScope to working-dir and accepts only the two scopes (v67)", () => {
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION }).agent.readScope,
+    ).toBe("working-dir");
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { readScope: "unrestricted" },
+      }).agent.readScope,
+    ).toBe("unrestricted");
+    // `null` is "absent" here, as for every other `agent.*` field.
+    for (const bad of ["everywhere", "", 1, true]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          agent: { readScope: bad },
+        }),
+      ).toThrow(/agent.readScope/);
+    }
+  });
+
+  it("upgrades a v66 file to v67 with the confined read scope", () => {
+    // The default-behaviour change: an older file has no field and takes
+    // `working-dir`; what it did carry is kept.
+    const parsed = parseUserConfigFile({
+      version: 66,
+      agent: { toolTimeoutMs: 45_000 },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.agent.readScope).toBe("working-dir");
+    expect(parsed.agent.toolTimeoutMs).toBe(45_000);
+  });
+
+  it("accepts conversationMaxTokens: 0 as the auto sentinel", () => {
+    // `0` is not a request for a zero-token transcript: it is "let the
+    // window decide", the same sentinel `localModels.managed.contextSize`
+    // uses. It has to survive the parser to mean anything.
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      agent: { conversationMaxTokens: 0 },
+    });
+    expect(parsed.agent?.conversationMaxTokens).toBe(0);
+  });
+
+  it("rejects a negative conversationMaxTokens", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { conversationMaxTokens: -1 },
+      }),
+    ).toThrow(/agent.conversationMaxTokens/);
+  });
+
+  it("ships the transcript on auto and two hundred pairs, bounded to [1, 1000]", () => {
+    // The shipped caps: the window decides the token cap (`0` = auto),
+    // and the pair cap is high enough that the token cap binds first on
+    // any real hardware. Pinned as literals so neither can drift silently.
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.agent.conversationMaxTokens).toBe(0);
+    expect(parsed.agent.conversationMaxPairs).toBe(200);
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { conversationMaxPairs: 1000 },
+      }).agent.conversationMaxPairs,
+    ).toBe(1000);
+    for (const bad of [0, 1001, -5]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          agent: { conversationMaxPairs: bad },
+        }),
+      ).toThrow(/agent.conversationMaxPairs/);
+    }
+  });
+
+  it("rejects non-object root", () => {
+    expect(() => parseUserConfigFile([])).toThrow(ConfigValidationError);
+    expect(() => parseUserConfigFile(null)).toThrow(ConfigValidationError);
+    expect(() => parseUserConfigFile("oops")).toThrow(ConfigValidationError);
+  });
+
+  // Config v73. Retention deletes the operator's own transcripts, so the
+  // default has to be "do nothing" and a file written before v73 has to
+  // land on it.
+  it("leaves sessions.retention off by default", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.sessions.retention.enabled).toBe(false);
+    expect(parsed.sessions.retention.maxAgeDays).toBe(90);
+    expect(parsed.sessions.retention.maxRows).toBeNull();
+    expect(parsed.sessions.retention).toEqual(
+      USER_CONFIG_DEFAULTS.sessions.retention,
+    );
+  });
+
+  it("gives a pre-v73 file the sessions.retention defaults", () => {
+    const parsed = parseUserConfigFile({ version: 72 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.sessions.retention).toEqual(
+      USER_CONFIG_DEFAULTS.sessions.retention,
+    );
+  });
+
+  it("accepts explicit sessions.retention values", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      sessions: { retention: { enabled: true, maxAgeDays: 30, maxRows: 500 } },
+    });
+    expect(parsed.sessions.retention).toEqual({
+      enabled: true,
+      maxAgeDays: 30,
+      maxRows: 500,
+    });
+  });
+
+  // `raw ?? default` would put 90 back and keep pruning by age — the one
+  // thing an operator writing `null` there is asking it not to do.
+  it("keeps an explicit null sessions.retention.maxAgeDays", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      sessions: { retention: { enabled: true, maxAgeDays: null } },
+    });
+    expect(parsed.sessions.retention.maxAgeDays).toBeNull();
+  });
+
+  it("rejects non-positive sessions.retention caps", () => {
+    for (const retention of [{ maxAgeDays: 0 }, { maxAgeDays: -1 }]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          sessions: { retention },
+        }),
+      ).toThrow(/sessions.retention.maxAgeDays/);
+    }
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        sessions: { retention: { maxRows: 0 } },
+      }),
+    ).toThrow(/sessions.retention.maxRows/);
+  });
+
+  it("applies tracing.trace defaults when unspecified", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.tracing.trace.enabled).toBeNull();
+    expect(parsed.tracing.trace.maxBytesPerSession).toBe(
+      USER_CONFIG_DEFAULTS.tracing.trace.maxBytesPerSession,
+    );
+  });
+
+  it("accepts explicit tracing.trace.enabled values", () => {
+    const on = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tracing: { trace: { enabled: true } },
+    });
+    expect(on.tracing.trace.enabled).toBe(true);
+    const off = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tracing: { trace: { enabled: false } },
+    });
+    expect(off.tracing.trace.enabled).toBe(false);
+  });
+
+  it("accepts custom tracing.trace.maxBytesPerSession", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tracing: { trace: { maxBytesPerSession: 2_097_152 } },
+    });
+    expect(parsed.tracing.trace.maxBytesPerSession).toBe(2_097_152);
+  });
+
+  it("rejects non-positive tracing.trace.maxBytesPerSession", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tracing: { trace: { maxBytesPerSession: 0 } },
+      }),
+    ).toThrow(/tracing.trace.maxBytesPerSession/);
+  });
+
+  it("reads legacy telemetry.* as an alias of tracing.* (tracing wins on overlap)", () => {
+    const fromLegacy = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      telemetry: { trace: { enabled: false, maxBytesPerSession: 4096 } },
+    });
+    expect(fromLegacy.tracing.trace.enabled).toBe(false);
+    expect(fromLegacy.tracing.trace.maxBytesPerSession).toBe(4096);
+    const tracingWins = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      telemetry: { trace: { enabled: false, maxBytesPerSession: 1 } },
+      tracing: { trace: { enabled: true, maxBytesPerSession: 2_097_152 } },
+    });
+    expect(tracingWins.tracing.trace.enabled).toBe(true);
+    expect(tracingWins.tracing.trace.maxBytesPerSession).toBe(2_097_152);
+  });
+
+  it("applies memory.reflection.autoStoreNotes + maxNotesPerCall defaults", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.memory.reflection.autoStoreNotes).toBe(
+      USER_CONFIG_DEFAULTS.memory.reflection.autoStoreNotes,
+    );
+    expect(parsed.memory.reflection.maxNotesPerCall).toBe(
+      USER_CONFIG_DEFAULTS.memory.reflection.maxNotesPerCall,
+    );
+  });
+
+  it("accepts explicit memory.reflection note overrides", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: {
+        reflection: { autoStoreNotes: false, maxNotesPerCall: 0 },
+      },
+    });
+    expect(parsed.memory.reflection.autoStoreNotes).toBe(false);
+    expect(parsed.memory.reflection.maxNotesPerCall).toBe(0);
+  });
+
+  it("rejects negative memory.reflection.maxNotesPerCall", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { reflection: { maxNotesPerCall: -1 } },
+      }),
+    ).toThrow(/memory.reflection.maxNotesPerCall/);
+  });
+
+  it("fills in localModels defaults when only url is provided", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { url: "http://custom:9000" },
+    });
+    expect(parsed.localModels.mode).toBe("external");
+    expect(parsed.localModels.url).toBe("http://custom:9000");
+    expect(parsed.localModels.managed).toEqual(
+      USER_CONFIG_DEFAULTS.localModels.managed,
+    );
+  });
+
+  it("rejects invalid localModels.mode", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { mode: "bogus" },
+      }),
+    ).toThrow(/localModels.mode/);
+  });
+
+  it("ATO-1239: an unknown localModels.managed.modelId (a newer app's model) reads as no model selected", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { modelId: "glm-4.7-flash-30b" } },
+    });
+    expect(parsed.localModels.managed.modelId).toBeNull();
+  });
+
+  it("defaults localModels.managed.device to 'auto'", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.localModels.managed.device).toBe("auto");
+  });
+
+  it("defaults localModels.managed.backendVariant to 'auto', v45 files included", () => {
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION }).localModels.managed
+        .backendVariant,
+    ).toBe("auto");
+    // A pre-v46 file has no such key — it transparently inherits the
+    // detection behaviour it already had.
+    expect(
+      parseUserConfigFile({ version: 45 }).localModels.managed.backendVariant,
+    ).toBe("auto");
+  });
+
+  it("preserves an explicit localModels.managed.backendVariant", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { backendVariant: "cpu" } },
+    });
+    expect(parsed.localModels.managed.backendVariant).toBe("cpu");
+  });
+
+  it("ATO-1239: an unknown localModels.managed.backendVariant reads as the default; a wrong type is rejected", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { backendVariant: "opencl" } },
+    });
+    expect(parsed.localModels.managed.backendVariant).toBe("auto");
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { backendVariant: 7 } },
+      }),
+    ).toThrow(/localModels.managed.backendVariant/);
+  });
+
+  it("defaults localModels.managed.stopOnExit to true", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.localModels.managed.stopOnExit).toBe(true);
+  });
+
+  it("preserves an explicit localModels.managed.stopOnExit=false", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { stopOnExit: false } },
+    });
+    expect(parsed.localModels.managed.stopOnExit).toBe(false);
+  });
+
+  it("accepts a v33 file and fills in stopOnExit=true transparently", () => {
+    const parsed = parseUserConfigFile({
+      version: 33,
+      localModels: { managed: { autoUpdate: true } },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.localModels.managed.stopOnExit).toBe(true);
+    expect(parsed.localModels.managed.autoUpdate).toBe(true);
+  });
+
+  it("defaults localModels.managed.autoUpdate to true", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.localModels.managed.autoUpdate).toBe(true);
+  });
+
+  it("migrates a pre-v41 autoUpdate:false (unused default) to true", () => {
+    const parsed = parseUserConfigFile({
+      version: 37,
+      localModels: { managed: { autoUpdate: false } },
+    });
+    expect(parsed.localModels.managed.autoUpdate).toBe(true);
+  });
+
+  // The migration gate is the LAST version that stored the dead default.
+  // v40 is the boundary: it must still migrate, v41 must be honoured.
+  // Without this pair the gate can drift off USER_CONFIG_VERSION unnoticed.
+  it("migrates a v40 autoUpdate:false (still the unused default) to true", () => {
+    const parsed = parseUserConfigFile({
+      version: 40,
+      localModels: { managed: { autoUpdate: false } },
+    });
+    expect(parsed.localModels.managed.autoUpdate).toBe(true);
+  });
+
+  it("preserves an explicit localModels.managed.autoUpdate=false on v41+", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { autoUpdate: false } },
+    });
+    expect(parsed.localModels.managed.autoUpdate).toBe(false);
+  });
+
+  it("preserves an explicit localModels.managed.device override", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { device: "Vulkan0" } },
+    });
+    expect(parsed.localModels.managed.device).toBe("Vulkan0");
+  });
+
+  it("migrates a v25 file by filling localModels.managed.device='auto'", () => {
+    const parsed = parseUserConfigFile({ version: 25 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.localModels.managed.device).toBe("auto");
+  });
+
+  it("defaults localModels.managed.tensorSplit to [] (multi-GPU split off)", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.localModels.managed.tensorSplit).toEqual([]);
+  });
+
+  it("migrates a v45 file by filling localModels.managed.tensorSplit=[]", () => {
+    const parsed = parseUserConfigFile({ version: 45 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.localModels.managed.tensorSplit).toEqual([]);
+  });
+
+  it("preserves an explicit localModels.managed.tensorSplit ratio list", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { tensorSplit: [3, 1] } },
+    });
+    expect(parsed.localModels.managed.tensorSplit).toEqual([3, 1]);
+  });
+
+  it("defaults localModels.managed.swaFull to auto and validates the enum", () => {
+    expect(USER_CONFIG_DEFAULTS.localModels.managed.swaFull).toBe("auto");
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION }).localModels.managed
+        .swaFull,
+    ).toBe("auto");
+    for (const value of ["on", "off", "auto"] as const) {
+      expect(
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          localModels: { managed: { swaFull: value } },
+        }).localModels.managed.swaFull,
+      ).toBe(value);
+    }
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { swaFull: "yes" } },
+      }),
+    ).toThrow(/localModels\.managed\.swaFull/);
+  });
+
+  it("defaults localModels.managed.parallel to auto (the machine decides)", () => {
+    // v63: the slot count stopped being an operator setting. `"auto"`
+    // resolves against the context the daemon actually launches with.
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION }).localModels.managed
+        .parallel,
+    ).toBe("auto");
+    expect(USER_CONFIG_DEFAULTS.localModels.managed.parallel).toBe("auto");
+  });
+
+  it("reads a pre-v63 file's unchosen 2 as auto, and any other number as a pin", () => {
+    // Every pre-v63 file carries a `parallel` the schema wrote, not the
+    // operator. Reading the old default as a deliberate choice would
+    // freeze every existing install at two workers forever — the exact
+    // setting this version exists to stop asking about.
+    expect(
+      parseUserConfigFile({
+        version: 62,
+        localModels: { managed: { parallel: 2 } },
+      }).localModels.managed.parallel,
+    ).toBe("auto");
+    expect(
+      parseUserConfigFile({
+        version: 62,
+        localModels: { managed: { parallel: 6 } },
+      }).localModels.managed.parallel,
+    ).toBe(6);
+    // At v63 the operator's own 2 is theirs, and stays.
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { parallel: 2 } },
+      }).localModels.managed.parallel,
+    ).toBe(2);
+  });
+
+  it("migrates a v51 file by filling localModels.managed.parallel=auto", () => {
+    const parsed = parseUserConfigFile({
+      version: 51,
+      localModels: { managed: { port: 19091 } },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.localModels.managed.parallel).toBe("auto");
+  });
+
+  it("keeps an explicit localModels.managed.parallel and bounds it to 1..8", () => {
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { parallel: 4 } },
+      }).localModels.managed.parallel,
+    ).toBe(4);
+    for (const parallel of [0, 9, 2.5]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          localModels: { managed: { parallel } },
+        }),
+      ).toThrow(/localModels\.managed\.parallel/);
+    }
+  });
+
+  it("accepts fractional ratios and zeros that skip a device", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { managed: { tensorSplit: [0.6, 0, 0.4] } },
+    });
+    expect(parsed.localModels.managed.tensorSplit).toEqual([0.6, 0, 0.4]);
+  });
+
+  it("rejects a single-element tensorSplit (not a split)", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { tensorSplit: [1] } },
+      }),
+    ).toThrow(/localModels.managed.tensorSplit/);
+  });
+
+  it("rejects negative, non-numeric, and non-finite tensorSplit ratios", () => {
+    for (const bad of [
+      [1, -1],
+      [1, "1"],
+      [1, Number.NaN],
+      [1, null],
+    ]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          localModels: { managed: { tensorSplit: bad } },
+        }),
+      ).toThrow(/localModels.managed.tensorSplit\[1\]/);
+    }
+  });
+
+  it("rejects an all-zero tensorSplit (offloads nowhere)", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { tensorSplit: [0, 0] } },
+      }),
+    ).toThrow(/localModels.managed.tensorSplit/);
+  });
+
+  it("rejects a non-array tensorSplit", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { managed: { tensorSplit: "3,1" } },
+      }),
+    ).toThrow(/localModels.managed.tensorSplit/);
+  });
+
+  it("applies skills defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.skills).toEqual(USER_CONFIG_DEFAULTS.skills);
+  });
+
+  it("accepts a v7 file and fills in skills.* defaults transparently", () => {
+    const parsed = parseUserConfigFile({ version: 7 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.skills).toEqual(USER_CONFIG_DEFAULTS.skills);
+  });
+
+  it("preserves a non-empty skills.disabled list and dedupes duplicates", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      skills: { disabled: ["apple-notes", "obsidian", "apple-notes"] },
+    });
+    expect(parsed.skills.disabled).toEqual(["apple-notes", "obsidian"]);
+  });
+
+  it("rejects invalid skills.disabled entries", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        skills: { disabled: ["Apple-Notes"] },
+      }),
+    ).toThrow(/skills.disabled\[0\]/);
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        skills: { disabled: [""] },
+      }),
+    ).toThrow(/skills.disabled\[0\]/);
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        skills: { disabled: "obsidian" },
+      }),
+    ).toThrow(/skills.disabled/);
+  });
+
+  it("fills skills.taps defaults on a v29 file (transparent v29 -> v30)", () => {
+    const parsed = parseUserConfigFile({
+      version: 29,
+      skills: { disabled: [] },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.skills.taps).toEqual(USER_CONFIG_DEFAULTS.skills.taps);
+  });
+
+  it("preserves a custom skills.taps list and dedupes duplicates", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      skills: {
+        disabled: [],
+        taps: ["my-org/skills", "my-org/skills", "openai/skills"],
+      },
+    });
+    expect(parsed.skills.taps).toEqual(["my-org/skills", "openai/skills"]);
+  });
+
+  it("rejects invalid skills.taps entries", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        skills: { disabled: [], taps: ["not-a-repo"] },
+      }),
+    ).toThrow(/skills.taps\[0\]/);
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        skills: { disabled: [], taps: "openai/skills" },
+      }),
+    ).toThrow(/skills.taps/);
+  });
+
+  it("applies discord defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.discord).toEqual(USER_CONFIG_DEFAULTS.discord);
+    // Off and unpaired: a token alone must not start a channel that
+    // would then refuse every message.
+    expect(parsed.discord.enabled).toBe(false);
+    expect(parsed.discord.ownerUserIds).toEqual([]);
+  });
+
+  it("accepts a v52 file and fills in localModels.download.hfEndpoint (mirror support)", () => {
+    const parsed = parseUserConfigFile({
+      version: 52,
+      localModels: { download: { connections: 4 } },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.localModels.download).toEqual({
+      connections: 4,
+      hfEndpoint: "https://huggingface.co",
+    });
+  });
+
+  it("normalizes an explicit hfEndpoint to an origin", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { download: { hfEndpoint: "https://hf-mirror.com/" } },
+    });
+    expect(parsed.localModels.download.hfEndpoint).toBe(
+      "https://hf-mirror.com",
+    );
+  });
+
+  it("rejects an hfEndpoint that is not an http(s) origin", () => {
+    for (const hfEndpoint of ["hf-mirror.com", "ftp://x", "", 42]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          localModels: { download: { hfEndpoint } },
+        }),
+      ).toThrow(/localModels.download.hfEndpoint/);
+    }
+  });
+
+  it("accepts a v51 file and fills in localModels.download defaults (parallel downloads)", () => {
+    const parsed = parseUserConfigFile({ version: 51 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.localModels.download).toEqual({
+      connections: 16,
+      hfEndpoint: "https://huggingface.co",
+    });
+  });
+
+  it("honours an explicit localModels.download.connections", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { download: { connections: 1 } },
+    });
+    expect(parsed.localModels.download.connections).toBe(1);
+  });
+
+  it("rejects localModels.download.connections outside 1..64 or non-integer", () => {
+    for (const connections of [0, 65, -3, 2.5, "many"]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          localModels: { download: { connections } },
+        }),
+      ).toThrow(/localModels.download.connections/);
+    }
+  });
+
+  it("accepts a v50 file and fills in discord.* defaults transparently", () => {
+    const parsed = parseUserConfigFile({ version: 50 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.discord).toEqual(USER_CONFIG_DEFAULTS.discord);
+  });
+
+  it("applies notifications defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.notifications).toEqual(USER_CONFIG_DEFAULTS.notifications);
+    // `null` = not asked yet: the Models tab asks on the next pull.
+    expect(parsed.notifications.downloads.channel).toBeNull();
+  });
+
+  it("accepts a v51 file and fills in notifications.* defaults transparently", () => {
+    const parsed = parseUserConfigFile({ version: 51 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.notifications).toEqual(USER_CONFIG_DEFAULTS.notifications);
+  });
+
+  it("keeps a remembered download-notify channel and rejects an unknown one", () => {
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        notifications: { downloads: { channel: "telegram" } },
+      }).notifications.downloads.channel,
+    ).toBe("telegram");
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        notifications: { downloads: { channel: "off" } },
+      }).notifications.downloads.channel,
+    ).toBe("off");
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        notifications: { downloads: { channel: "pager" } },
+      }),
+    ).toThrow(/notifications\.downloads\.channel/);
+  });
+
+  it("applies atomicMail defaults when the section is absent, and accepts a v52 file", () => {
+    expect(
+      parseUserConfigFile({ version: USER_CONFIG_VERSION }).atomicMail,
+    ).toEqual(USER_CONFIG_DEFAULTS.atomicMail);
+    const parsed = parseUserConfigFile({ version: 52 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.atomicMail.address).toBeNull();
+  });
+
+  it("keeps a pending verification only when it is whole", () => {
+    const whole = {
+      email: "a@b.co",
+      codeHash: "ab".repeat(32),
+      expiresAt: "2026-09-09T00:00:00.000Z",
+    };
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        atomicMail: { pendingVerification: whole },
+      }).atomicMail.pendingVerification,
+    ).toEqual({ ...whole, attempts: 0 });
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        atomicMail: { pendingVerification: { email: "a@b.co" } },
+      }),
+    ).toThrow(/atomicMail\.pendingVerification/);
+  });
+
+  it("keeps every discord owner id a string", () => {
+    // Discord snowflakes exceed Number.MAX_SAFE_INTEGER: parsing one as
+    // a number silently corrupts the last digits, which would let the
+    // wrong account drive the agent.
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      discord: {
+        enabled: true,
+        ownerUserIds: ["123456789012345678", "223456789012345678"],
+      },
+    });
+    expect(parsed.discord.ownerUserIds).toEqual([
+      "123456789012345678",
+      "223456789012345678",
+    ]);
+  });
+
+  it("folds a v51 scalar discord.ownerUserId into the list", () => {
+    // The whole back-compat contract: an operator who paired under v51
+    // keeps working without touching config.json.
+    const parsed = parseUserConfigFile({
+      version: 51,
+      discord: { enabled: true, ownerUserId: "123456789012345678" },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.discord.ownerUserIds).toEqual(["123456789012345678"]);
+  });
+
+  it("lets the list win when a stale scalar is left beside it", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      discord: {
+        enabled: true,
+        ownerUserId: "999999999999999999",
+        ownerUserIds: ["123456789012345678"],
+      },
+    });
+    expect(parsed.discord.ownerUserIds).toEqual(["123456789012345678"]);
+  });
+
+  it("dedupes discord owner ids and keeps their order", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      discord: {
+        ownerUserIds: [
+          "223456789012345678",
+          "123456789012345678",
+          "223456789012345678",
+        ],
+      },
+    });
+    expect(parsed.discord.ownerUserIds).toEqual([
+      "223456789012345678",
+      "123456789012345678",
+    ]);
+  });
+
+  it("rejects a discord owner id that is not a snowflake", () => {
+    // A hand-edited id that can never match an author id would leave
+    // the channel silently refusing every message.
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        discord: { ownerUserIds: ["not-an-id"] },
+      }),
+    ).toThrow(/discord.ownerUserIds\[0\]/);
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        discord: { ownerUserIds: "123456789012345678" },
+      }),
+    ).toThrow(/expected string\[\]/);
+  });
+
+  it("applies composio defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.composio).toEqual(USER_CONFIG_DEFAULTS.composio);
+  });
+
+  it("accepts a v49 file and fills in composio.* defaults transparently", () => {
+    const parsed = parseUserConfigFile({ version: 49 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.composio).toEqual(USER_CONFIG_DEFAULTS.composio);
+    // Defaults must leave the integration inert: no cached session and
+    // no key means bootstrap mounts nothing.
+    expect(parsed.composio.sessionId).toBeNull();
+    expect(parsed.composio.mcpUrl).toBeNull();
+    expect(parsed.composio.userId).toBeNull();
+  });
+
+  it("round-trips a populated composio block", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      composio: {
+        enabled: true,
+        apiKeyEnv: "MY_COMPOSIO_KEY",
+        userId: "11111111-2222-3333-4444-555555555555",
+        sessionId: "trs_abc",
+        mcpUrl: "https://backend.composio.dev/tool_router/trs_abc/mcp",
+      },
+    });
+    expect(parsed.composio.apiKeyEnv).toBe("MY_COMPOSIO_KEY");
+    expect(parsed.composio.sessionId).toBe("trs_abc");
+  });
+
+  it("normalises blank composio cache entries back to null", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      composio: { sessionId: "   ", mcpUrl: "" },
+    });
+    expect(parsed.composio.sessionId).toBeNull();
+    expect(parsed.composio.mcpUrl).toBeNull();
+  });
+
+  it("rejects a non-string composio.sessionId", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        composio: { sessionId: 42 },
+      }),
+    ).toThrow(/composio.sessionId/);
+  });
+
+  it("applies telegram defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.telegram).toEqual(USER_CONFIG_DEFAULTS.telegram);
+  });
+
+  it("accepts a v8 file and fills in telegram.* defaults transparently", () => {
+    const parsed = parseUserConfigFile({ version: 8 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.telegram).toEqual(USER_CONFIG_DEFAULTS.telegram);
+  });
+
+  it("accepts a v9 file and fills in telegram.parseMode='html' transparently", () => {
+    const parsed = parseUserConfigFile({
+      version: 9,
+      telegram: { enabled: true, ownerUserId: 12345678 },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.telegram).toEqual({
+      enabled: true,
+      ownerUserId: 12345678,
+      parseMode: "html",
+      progressIndicator: true,
+    });
+  });
+
+  it("preserves a configured telegram block including parseMode", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      telegram: { enabled: true, ownerUserId: 12345678, parseMode: "plain" },
+    });
+    expect(parsed.telegram).toEqual({
+      enabled: true,
+      ownerUserId: 12345678,
+      parseMode: "plain",
+      progressIndicator: true,
+    });
+  });
+
+  it("accepts a v33 file and fills in telegram.progressIndicator=true transparently", () => {
+    const parsed = parseUserConfigFile({
+      version: 33,
+      telegram: { enabled: true, ownerUserId: 12345678, parseMode: "plain" },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.telegram.progressIndicator).toBe(true);
+  });
+
+  it("accepts a v35 file and fills in projects.roots=[] transparently", () => {
+    const parsed = parseUserConfigFile({ version: 35 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.projects).toEqual({ roots: [] });
+  });
+
+  it("preserves explicit projects.roots entries", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      projects: { roots: ["~/dev", "/data/projects"] },
+    });
+    expect(parsed.projects.roots).toEqual(["~/dev", "/data/projects"]);
+  });
+
+  it("rejects a non-array projects.roots", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        projects: { roots: "~/dev" },
+      }),
+    ).toThrow(/projects\.roots/);
+  });
+
+  it("accepts a v66 file and fills in the tools.shell defaults transparently", () => {
+    // v67: an existing file has no `tools` block; it takes the defaults so
+    // an omitted `timeoutMs` detaches at ten minutes from the next start,
+    // a detached job dies within the hour, and three may run at once.
+    const parsed = parseUserConfigFile({ version: 66 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.tools).toEqual({
+      shell: {
+        defaultTimeoutMs: 600_000,
+        jobMaxMs: 3_600_000,
+        maxJobs: 3,
+        envPassthrough: ["GITHUB_TOKEN", "NOTION_API_KEY"],
+      },
+      screen: { enabled: false },
+    });
+  });
+
+  it("parses tools.shell.envPassthrough, defaulting to the skills' tokens only (ATO-347)", () => {
+    expect(USER_CONFIG_DEFAULTS.tools.shell.envPassthrough).toEqual([
+      "GITHUB_TOKEN",
+      "NOTION_API_KEY",
+    ]);
+    const none = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tools: { shell: { envPassthrough: [] } },
+    });
+    expect(none.tools.shell.envPassthrough).toEqual([]);
+    const listed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tools: { shell: { envPassthrough: ["NPM_TOKEN"] } },
+    });
+    expect(listed.tools.shell.envPassthrough).toEqual(["NPM_TOKEN"]);
+    for (const value of ["GITHUB_TOKEN", [""], [1], true]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          tools: { shell: { envPassthrough: value } },
+        }),
+      ).toThrow(/tools\.shell\.envPassthrough/);
+    }
+  });
+
+  it("preserves explicit tools.shell.jobMaxMs and maxJobs, and rejects non-positive ones", () => {
+    const pinned = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tools: { shell: { jobMaxMs: 7_200_000, maxJobs: 1 } },
+    });
+    expect(pinned.tools.shell.jobMaxMs).toBe(7_200_000);
+    expect(pinned.tools.shell.maxJobs).toBe(1);
+    // A ceiling of 0 would be "kill at once" and a job limit of 0 "never
+    // detach" — neither is what the fields mean, so both are refused.
+    for (const field of ["jobMaxMs", "maxJobs"] as const) {
+      for (const value of [0, -1, 1.5, Infinity, NaN, "many", true]) {
+        expect(() =>
+          parseUserConfigFile({
+            version: USER_CONFIG_VERSION,
+            tools: { shell: { [field]: value } },
+          }),
+        ).toThrow(new RegExp(`tools\\.shell\\.${field}`));
+      }
+    }
+  });
+
+  it("keeps the shell default timeout at ten minutes or more", () => {
+    // A long install or test suite has to fit; the timeout message tells
+    // the model what to pass for longer, so the default must not shrink.
+    expect(
+      USER_CONFIG_DEFAULTS.tools.shell.defaultTimeoutMs,
+    ).toBeGreaterThanOrEqual(600_000);
+  });
+
+  it("preserves an explicit tools.shell.defaultTimeoutMs, including 0 (no default)", () => {
+    const pinned = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tools: { shell: { defaultTimeoutMs: 1_800_000 } },
+    });
+    expect(pinned.tools.shell.defaultTimeoutMs).toBe(1_800_000);
+    const unbounded = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tools: { shell: { defaultTimeoutMs: 0 } },
+    });
+    expect(unbounded.tools.shell.defaultTimeoutMs).toBe(0);
+  });
+
+  it("rejects a tools.shell.defaultTimeoutMs that is not a non-negative finite integer", () => {
+    for (const defaultTimeoutMs of [-1, 1.5, Infinity, NaN, "soon", true]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          tools: { shell: { defaultTimeoutMs } },
+        }),
+      ).toThrow(/tools\.shell\.defaultTimeoutMs/);
+    }
+  });
+
+  it("preserves an explicit telegram.progressIndicator=false", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      telegram: {
+        enabled: true,
+        ownerUserId: 12345678,
+        parseMode: "plain",
+        progressIndicator: false,
+      },
+    });
+    expect(parsed.telegram.progressIndicator).toBe(false);
+  });
+
+  it("rejects an unknown telegram.parseMode", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        telegram: { enabled: true, ownerUserId: 1, parseMode: "markdownV2" },
+      }),
+    ).toThrow(/telegram.parseMode/);
+  });
+
+  it("accepts a numeric-string telegram.ownerUserId", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      telegram: { enabled: true, ownerUserId: "12345678" },
+    });
+    expect(parsed.telegram.ownerUserId).toBe(12345678);
+  });
+
+  it("rejects a non-positive telegram.ownerUserId", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        telegram: { enabled: true, ownerUserId: 0 },
+      }),
+    ).toThrow(/telegram.ownerUserId/);
+  });
+
+  it("rejects a non-integer telegram.ownerUserId", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        telegram: { enabled: true, ownerUserId: 3.14 },
+      }),
+    ).toThrow(/telegram.ownerUserId/);
+  });
+
+  it("defaults telegram.parseMode to 'html' when absent", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      telegram: { enabled: true, ownerUserId: 1 },
+    });
+    expect(parsed.telegram.parseMode).toBe("html");
+  });
+
+  it("applies memory.voting defaults when the section is absent", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.memory.voting).toEqual(USER_CONFIG_DEFAULTS.memory.voting);
+    expect(parsed.memory.voting.enabled).toBe(true);
+  });
+
+  it("accepts user-supplied memory.voting overrides", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: {
+        voting: {
+          enabled: true,
+          maxVotePerItem: 100,
+          signalDecay: 0.9,
+          scoreBlend: 0.5,
+          eventLogMaxRows: 10_000,
+          profileFilterThreshold: 5,
+        },
+      },
+    });
+    expect(parsed.memory.voting).toEqual({
+      enabled: true,
+      maxVotePerItem: 100,
+      signalDecay: 0.9,
+      scoreBlend: 0.5,
+      eventLogMaxRows: 10_000,
+      profileFilterThreshold: 5,
+    });
+  });
+
+  // Scorecard 7a.C.3 — bootstrap fails fast on a non-positive vote clamp.
+  it("rejects memory.voting.maxVotePerItem <= 0 (scorecard 7a.C.3)", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { voting: { maxVotePerItem: 0 } },
+      }),
+    ).toThrow(/memory\.voting\.maxVotePerItem/);
+  });
+
+  // Scorecard 7a.C.4 — bootstrap fails fast on a decay outside (0, 1].
+  it("rejects memory.voting.signalDecay > 1 (scorecard 7a.C.4)", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { voting: { signalDecay: 1.5 } },
+      }),
+    ).toThrow(/memory\.voting\.signalDecay/);
+  });
+
+  it("rejects memory.voting.signalDecay = 0", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { voting: { signalDecay: 0 } },
+      }),
+    ).toThrow(/memory\.voting\.signalDecay/);
+  });
+
+  it("accepts memory.voting.signalDecay = 1 (decay disabled)", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: { voting: { signalDecay: 1 } },
+    });
+    expect(parsed.memory.voting.signalDecay).toBe(1);
+  });
+
+  it("rejects memory.voting.scoreBlend outside [0, 1]", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { voting: { scoreBlend: 1.2 } },
+      }),
+    ).toThrow(/memory\.voting\.scoreBlend/);
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { voting: { scoreBlend: -0.1 } },
+      }),
+    ).toThrow(/memory\.voting\.scoreBlend/);
+  });
+
+  it("accepts memory.voting.eventLogMaxRows = 0 (disables FIFO eviction)", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: { voting: { eventLogMaxRows: 0 } },
+    });
+    expect(parsed.memory.voting.eventLogMaxRows).toBe(0);
+  });
+
+  it("rejects negative memory.voting.eventLogMaxRows", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { voting: { eventLogMaxRows: -1 } },
+      }),
+    ).toThrow(/memory\.voting\.eventLogMaxRows/);
+  });
+
+  // --------------------------------------------------------------------------
+  // v2.5 memory fabric additions (config v18)
+  // --------------------------------------------------------------------------
+
+  it("transparently migrates v17 → v22 with advanced memory layers + links enabled", () => {
+    const parsed = parseUserConfigFile({ version: 17 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.memory.evolution.enabled).toBe(true);
+    expect(parsed.memory.lessons.enabled).toBe(true);
+    expect(parsed.memory.procedures.enabled).toBe(true);
+    expect(parsed.memory.consolidation.enabled).toBe(true);
+    expect(parsed.memory.voting.enabled).toBe(true);
+    expect(parsed.memory.retrieve.rewriter.enabled).toBe(true);
+    expect(parsed.memory.links.enabled).toBe(true);
+    expect(parsed.memory.embeddings.enabled).toBe(false);
+    expect(parsed.localModels.embeddings.enabled).toBe(false);
+    expect(parsed.memory.reflection.typedNotes.enabled).toBe(false);
+    expect(parsed.memory.reflection.segmentation.enabled).toBe(false);
+  });
+
+  it("migrates v20 → v22 enabling memory-v2 layers that were false on disk", () => {
+    const parsed = parseUserConfigFile({
+      version: 20,
+      memory: {
+        evolution: { enabled: false },
+        lessons: { enabled: false },
+        procedures: { enabled: false },
+        consolidation: { enabled: false },
+        voting: { enabled: false },
+        retrieve: { rewriter: { enabled: false } },
+      },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.memory.evolution.enabled).toBe(true);
+    expect(parsed.memory.lessons.enabled).toBe(true);
+    expect(parsed.memory.procedures.enabled).toBe(true);
+    expect(parsed.memory.consolidation.enabled).toBe(true);
+    expect(parsed.memory.voting.enabled).toBe(true);
+    expect(parsed.memory.retrieve.rewriter.enabled).toBe(true);
+    expect(parsed.memory.links.enabled).toBe(true);
+    expect(parsed.memory.embeddings.enabled).toBe(false);
+    expect(parsed.localModels.embeddings.enabled).toBe(false);
+  });
+
+  it("migrates v21 → v22 enabling links but leaving embeddings off by default", () => {
+    const parsed = parseUserConfigFile({
+      version: 21,
+      memory: {
+        links: { enabled: false },
+        embeddings: { enabled: false },
+      },
+      localModels: {
+        embeddings: { enabled: false, modelId: null },
+      },
+    });
+    expect(parsed.memory.links.enabled).toBe(true);
+    expect(parsed.memory.embeddings.enabled).toBe(false);
+    expect(parsed.localModels.embeddings.enabled).toBe(false);
+  });
+
+  it("transparently migrates v23 → v24 (MCP block preserved, version bumped)", () => {
+    const parsed = parseUserConfigFile({
+      version: 23,
+      mcp: {
+        servers: [
+          {
+            name: "github",
+            enabled: true,
+            transport: { kind: "stdio", command: "npx", args: ["-y", "mcp"] },
+          },
+        ],
+      },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.mcp.servers).toHaveLength(1);
+    expect(parsed.mcp.servers[0]?.name).toBe("github");
+  });
+
+  it("v22 honours explicit memory.lessons.enabled=false", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: { lessons: { enabled: false } },
+    });
+    expect(parsed.memory.lessons.enabled).toBe(false);
+  });
+
+  it("parses memory.reflection.typedNotes.enabled", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: { reflection: { typedNotes: { enabled: true } } },
+    });
+    expect(parsed.memory.reflection.typedNotes.enabled).toBe(true);
+  });
+
+  it("parses memory.reflection.segmentation block end-to-end", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: {
+        reflection: {
+          segmentation: { enabled: true, triggerEveryTurns: 5, windowTurns: 8 },
+        },
+      },
+    });
+    expect(parsed.memory.reflection.segmentation).toEqual({
+      enabled: true,
+      triggerEveryTurns: 5,
+      windowTurns: 8,
+    });
+  });
+
+  it("rejects non-positive memory.reflection.segmentation.triggerEveryTurns", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { reflection: { segmentation: { triggerEveryTurns: 0 } } },
+      }),
+    ).toThrow(/triggerEveryTurns/);
+  });
+
+  it("transparently migrates v19 → v20 with rewriter gate defaults", () => {
+    const parsed = parseUserConfigFile({ version: 19 });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.memory.retrieve.rewriter.gateMode).toBe("heuristic");
+    expect(parsed.memory.retrieve.rewriter.embeddingGate.threshold).toBe(0.65);
+    expect(parsed.memory.retrieve.rewriter.embeddingGate.exemplars).toBeNull();
+  });
+
+  it("parses memory.retrieve.rewriter block end-to-end", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      memory: {
+        retrieve: {
+          rewriter: {
+            enabled: true,
+            timeoutMs: 5_000,
+            historyTurns: 2,
+            gateMode: "embedding",
+            embeddingGate: { threshold: 0.7, exemplars: ["tell me more"] },
+          },
+        },
+      },
+    });
+    expect(parsed.memory.retrieve.rewriter).toEqual({
+      enabled: true,
+      timeoutMs: 5_000,
+      historyTurns: 2,
+      gateMode: "embedding",
+      embeddingGate: { threshold: 0.7, exemplars: ["tell me more"] },
+    });
+  });
+
+  it("rejects invalid memory.retrieve.rewriter.gateMode", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { retrieve: { rewriter: { gateMode: "magic" } } },
+      }),
+    ).toThrow(/gateMode/);
+  });
+
+  it("rejects non-positive memory.retrieve.rewriter.timeoutMs", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        memory: { retrieve: { rewriter: { timeoutMs: 0 } } },
+      }),
+    ).toThrow(/timeoutMs/);
+  });
+});
+
+describe("tui.whileBusySubmit", () => {
+  it("defaults to steer for a config file that predates the key", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { theme: "auto" },
+    });
+    expect(parsed.tui.whileBusySubmit).toBe("steer");
+  });
+
+  it("round-trips an explicit queue preference", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { theme: "nord", whileBusySubmit: "queue" },
+    });
+    expect(parsed.tui.whileBusySubmit).toBe("queue");
+    expect(parsed.tui.theme).toBe("nord");
+  });
+
+  it("rejects an unknown mode instead of silently defaulting", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { theme: "auto", whileBusySubmit: "interrupt" },
+      }),
+    ).toThrow(/whileBusySubmit/);
+  });
+});
+
+describe("numeric coercion of string config values", () => {
+  const base = { version: USER_CONFIG_VERSION };
+
+  it("loads a config whose integer was written as a decimal string", () => {
+    // Regression: a stricter `/^\d+$/` test rejected these, and because this
+    // parser runs on every startup a config.json holding "8080.0" made the
+    // whole CLI unbootable — with no way to repair it from inside the tool,
+    // since `config set` loads the config first. `parseInt` had converted
+    // them correctly all along, so they must keep working.
+    for (const raw of ["10.0", "25.0", "1e3", "+7"]) {
+      expect(() =>
+        parseUserConfigFile({ ...base, agent: { maxSteps: raw } }),
+      ).not.toThrow();
+    }
+    expect(
+      parseUserConfigFile({ ...base, agent: { maxSteps: "10.0" } }).agent
+        .maxSteps,
+    ).toBe(10);
+    expect(
+      parseUserConfigFile({ ...base, agent: { tokenBudget: "1e3" } }).agent
+        .tokenBudget,
+    ).toBe(1000);
+  });
+
+  it("still rejects a value that is not a complete number", () => {
+    for (const raw of ["60s", "100_000", "1,000", "10.9", "0x10", "abc"]) {
+      expect(() =>
+        parseUserConfigFile({ ...base, agent: { maxSteps: raw } }),
+      ).toThrow(/maxSteps/);
+    }
+  });
+
+  it("rejects an integer past the safe range instead of rounding it", () => {
+    // "9007199254740993" would be stored as ...992 — the same quiet
+    // corruption the strict parsing exists to prevent.
+    expect(() =>
+      parseUserConfigFile({
+        ...base,
+        agent: { tokenBudget: "9007199254740993" },
+      }),
+    ).toThrow(/tokenBudget/);
+  });
+});
+
+describe("swarm units (config v52)", () => {
+  const base = { version: USER_CONFIG_VERSION };
+  const unit = {
+    id: "ops",
+    kind: "telegram",
+    label: "Ops",
+    role: "deploys",
+    enabled: true,
+    tokenEnv: "TELEGRAM_BOT_TOKEN_OPS",
+    ownerUserId: "42",
+  };
+
+  it("defaults to no units, including for a v51 file that predates the block", () => {
+    expect(parseUserConfigFile(base).swarm).toEqual({ units: [] });
+    expect(parseUserConfigFile({ version: 51 }).swarm).toEqual({ units: [] });
+  });
+
+  it("accepts a well-formed unit list and fills optional fields", () => {
+    const parsed = parseUserConfigFile({
+      ...base,
+      swarm: {
+        units: [
+          unit,
+          {
+            ...unit,
+            id: "g",
+            kind: "discord",
+            tokenEnv: "DISCORD_BOT_TOKEN_G",
+            role: undefined,
+            ownerUserId: null,
+            enabled: undefined,
+          },
+        ],
+      },
+    });
+    expect(parsed.swarm.units).toEqual([
+      unit,
+      {
+        id: "g",
+        kind: "discord",
+        label: "Ops",
+        role: "",
+        enabled: false,
+        tokenEnv: "DISCORD_BOT_TOKEN_G",
+        ownerUserId: null,
+      },
+    ]);
+  });
+
+  it("rejects malformed units with the field named", () => {
+    const bad = (patch: Record<string, unknown>) => () =>
+      parseUserConfigFile({
+        ...base,
+        swarm: { units: [{ ...unit, ...patch }] },
+      });
+    expect(bad({ id: "Ops Bot" })).toThrow(/swarm\.units\[0\]\.id/);
+    expect(bad({ kind: "slack" })).toThrow(/swarm\.units\[0\]\.kind/);
+    expect(bad({ label: "" })).toThrow(/swarm\.units\[0\]\.label/);
+    expect(bad({ tokenEnv: "lower-case" })).toThrow(
+      /swarm\.units\[0\]\.tokenEnv/,
+    );
+    expect(bad({ ownerUserId: "not-a-number" })).toThrow(
+      /swarm\.units\[0\]\.ownerUserId/,
+    );
+    expect(() =>
+      parseUserConfigFile({ ...base, swarm: { units: "nope" } }),
+    ).toThrow(/swarm\.units/);
+  });
+
+  it("rejects duplicate ids and duplicate token env names", () => {
+    expect(() =>
+      parseUserConfigFile({
+        ...base,
+        swarm: { units: [unit, { ...unit, tokenEnv: "TELEGRAM_BOT_TOKEN_X" }] },
+      }),
+    ).toThrow(/duplicate id/);
+    expect(() =>
+      parseUserConfigFile({
+        ...base,
+        swarm: { units: [unit, { ...unit, id: "two" }] },
+      }),
+    ).toThrow(/duplicate token env/);
+  });
+});
+
+describe("tui.sessionRail (config v58)", () => {
+  it("gives a v51 file the recency default — an empty order", () => {
+    const parsed = parseUserConfigFile({ version: 51, tui: { theme: "nord" } });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.tui.sessionRail).toEqual({ order: [], pinned: [] });
+    expect(parsed.tui.theme).toBe("nord");
+  });
+
+  it("round-trips the operator's order", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { sessionRail: { order: ["s-b", "s-a", "s-c"] } },
+    });
+    expect(parsed.tui.sessionRail.order).toEqual(["s-b", "s-a", "s-c"]);
+  });
+
+  it("drops entries that are not ids and keeps the first of a duplicate", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { sessionRail: { order: ["s-b", 7, "", null, "s-a", "s-b"] } },
+    });
+    expect(parsed.tui.sessionRail.order).toEqual(["s-b", "s-a"]);
+  });
+
+  it("rejects an order that is not a list", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { sessionRail: { order: "s-a" } },
+      }),
+    ).toThrow(/tui\.sessionRail\.order/);
+  });
+});
+
+describe("tui.sessionRail.pinned (config v59)", () => {
+  it("gives a v52 file nothing pinned and keeps its order", () => {
+    const parsed = parseUserConfigFile({
+      version: 52,
+      tui: { sessionRail: { order: ["s-b", "s-a"] } },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.tui.sessionRail).toEqual({
+      order: ["s-b", "s-a"],
+      pinned: [],
+    });
+  });
+
+  it("round-trips the pinned block next to the order", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: {
+        sessionRail: { order: ["s-b", "s-a", "s-c"], pinned: ["s-c", "s-a"] },
+      },
+    });
+    expect(parsed.tui.sessionRail).toEqual({
+      order: ["s-b", "s-a", "s-c"],
+      pinned: ["s-c", "s-a"],
+    });
+  });
+
+  it("drops pinned entries that are not ids and dedupes them", () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      tui: { sessionRail: { pinned: ["s-b", 7, "", null, "s-a", "s-b"] } },
+    });
+    expect(parsed.tui.sessionRail).toEqual({
+      order: [],
+      pinned: ["s-b", "s-a"],
+    });
+  });
+
+  it("rejects a pinned block that is not a list", () => {
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        tui: { sessionRail: { pinned: "s-a" } },
+      }),
+    ).toThrow(/tui\.sessionRail\.pinned/);
+  });
+});
+
+describe("localModels.completionMaxTokens (config v60)", () => {
+  it('accepts 0 as "no client-side cap"', () => {
+    const parsed = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { completionMaxTokens: 0 },
+    });
+    expect(parsed.localModels.completionMaxTokens).toBe(0);
+  });
+
+  it("keeps the ordinary window and its bounds", () => {
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { completionMaxTokens: 32_000 },
+      }).localModels.completionMaxTokens,
+    ).toBe(32_000);
+    for (const bad of [63, 131_073, -1]) {
+      expect(() =>
+        parseUserConfigFile({
+          version: USER_CONFIG_VERSION,
+          localModels: { completionMaxTokens: bad },
+        }),
+      ).toThrow(/completionMaxTokens/);
+    }
+  });
+
+  it("leaves an older file on its positive default", () => {
+    expect(
+      parseUserConfigFile({ version: 51 }).localModels.completionMaxTokens,
+    ).toBe(16_384);
+  });
+});
+
+describe("localModels.useServerTemplate / thinking (F31)", () => {
+  it("defaults both to auto", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.localModels.useServerTemplate).toBe("auto");
+    expect(parsed.localModels.thinking).toBe("auto");
+    expect(USER_CONFIG_DEFAULTS.localModels.useServerTemplate).toBe("auto");
+  });
+
+  it("reads on/off and rejects anything else, naming the field", () => {
+    const set = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      localModels: { useServerTemplate: "on", thinking: "off" },
+    });
+    expect(set.localModels.useServerTemplate).toBe("on");
+    expect(set.localModels.thinking).toBe("off");
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { thinking: "maybe" },
+      }),
+    ).toThrow(/localModels\.thinking/);
+  });
+
+  it("fills an older file that lacks the fields", () => {
+    const parsed = parseUserConfigFile({ version: 60 });
+    expect(parsed.localModels.useServerTemplate).toBe("auto");
+    expect(parsed.localModels.thinking).toBe("auto");
+  });
+});
+
+describe("localModels.reasoningBudgetTokens (F49, config v68; default 0 since v78)", () => {
+  it("defaults to 0, no bound", () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.localModels.reasoningBudgetTokens).toBe(0);
+    expect(USER_CONFIG_DEFAULTS.localModels.reasoningBudgetTokens).toBe(0);
+  });
+
+  it("accepts 0 (unbounded) and an integer in [64, 32768], naming the field otherwise", () => {
+    const set = (reasoningBudgetTokens: unknown) =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        localModels: { reasoningBudgetTokens },
+      }).localModels.reasoningBudgetTokens;
+    expect(set(0)).toBe(0);
+    expect(set(64)).toBe(64);
+    expect(set(6000)).toBe(6000);
+    expect(set(32_768)).toBe(32_768);
+    for (const bad of [-1, 12, 32_769, 2.5, "lots"]) {
+      expect(() => set(bad), String(bad)).toThrow(
+        /localModels\.reasoningBudgetTokens/,
+      );
+    }
+  });
+
+  it("fills a v67 file that predates the field with the default", () => {
+    const parsed = parseUserConfigFile({
+      version: 67,
+      localModels: { thinking: "off" },
+    });
+    expect(parsed.localModels.reasoningBudgetTokens).toBe(0);
+    expect(parsed.localModels.thinking).toBe("off");
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+  });
+});
+
+describe("llm.runMode.fusion.reviewStallSteps (F41, config v69)", () => {
+  const llm = {
+    activeTextProvider: "openrouter",
+    providers: [
+      { id: "openrouter", kind: "openrouter", apiKey: "k" },
+      { id: "local-llama", kind: "llama-server", baseUrl: "http://127.0.0.1:8080" },
+    ],
+  };
+
+  it("round-trips the field and leaves it absent when not set", () => {
+    const set = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      llm: { ...llm, runMode: { mode: "fusion", fusion: { reviewStallSteps: 4 } } },
+    });
+    expect(set.llm?.runMode?.fusion?.reviewStallSteps).toBe(4);
+    const unset = parseUserConfigFile({
+      version: USER_CONFIG_VERSION,
+      llm: { ...llm, runMode: { mode: "fusion", fusion: { workers: 2 } } },
+    });
+    expect(unset.llm?.runMode?.fusion).toEqual({ workers: 2 });
+  });
+
+  it("upgrades a v68 file without touching its fusion block", () => {
+    const parsed = parseUserConfigFile({
+      version: 68,
+      llm: { ...llm, runMode: { mode: "fusion", fusion: { workers: 3 } } },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.llm?.runMode).toEqual({
+      mode: "fusion",
+      fusion: { workers: 3 },
+    });
+  });
+});
+
+describe("agent.sessionSectionsMaxTokens (config v74)", () => {
+  it('defaults to the "use the tokenBudget share" sentinel', () => {
+    const parsed = parseUserConfigFile({ version: USER_CONFIG_VERSION });
+    expect(parsed.agent.sessionSectionsMaxTokens).toBe(0);
+    expect(USER_CONFIG_DEFAULTS.agent.sessionSectionsMaxTokens).toBe(0);
+  });
+
+  it("round-trips a ceiling and rejects a negative one", () => {
+    expect(
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { sessionSectionsMaxTokens: 4000 },
+      }).agent.sessionSectionsMaxTokens,
+    ).toBe(4000);
+    expect(() =>
+      parseUserConfigFile({
+        version: USER_CONFIG_VERSION,
+        agent: { sessionSectionsMaxTokens: -1 },
+      }),
+    ).toThrow(/agent\.sessionSectionsMaxTokens/);
+  });
+
+  /**
+   * The upgrade has to be invisible: a v72 file keeps every field it set
+   * and inherits the sentinel, so the prompt it produced before the key
+   * existed is the prompt it produces after.
+   */
+  it("upgrades a v72 file to the sentinel with its other agent fields intact", () => {
+    const parsed = parseUserConfigFile({
+      version: 72,
+      agent: {
+        tokenBudget: 8000,
+        maxSteps: 40,
+        conversationMaxTokens: 24_000,
+        conversationMaxPairs: 50,
+        conversationLowWater: 0.5,
+        worldSnapshotMaxTokens: 12_000,
+        approvalLevel: 4,
+        readScope: "unrestricted",
+        nameSessions: false,
+      },
+    });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.agent.sessionSectionsMaxTokens).toBe(0);
+    expect(parsed.agent.tokenBudget).toBe(8000);
+    expect(parsed.agent.maxSteps).toBe(40);
+    expect(parsed.agent.conversationMaxTokens).toBe(24_000);
+    expect(parsed.agent.conversationMaxPairs).toBe(50);
+    expect(parsed.agent.conversationLowWater).toBe(0.5);
+    expect(parsed.agent.worldSnapshotMaxTokens).toBe(12_000);
+    expect(parsed.agent.approvalLevel).toBe(4);
+    expect(parsed.agent.readScope).toBe("unrestricted");
+    expect(parsed.agent.nameSessions).toBe(false);
+  });
+
+  /**
+   * v73 belongs to another open branch, so a file written by whichever
+   * build ships first must still load here — an input version is a claim
+   * about filling gaps, not about having produced the file.
+   */
+  it("accepts a v73 file as input", () => {
+    const parsed = parseUserConfigFile({ version: 73, agent: { maxSteps: 7 } });
+    expect(parsed.version).toBe(USER_CONFIG_VERSION);
+    expect(parsed.agent.maxSteps).toBe(7);
+  });
+});

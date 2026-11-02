@@ -1,0 +1,523 @@
+/**
+ * Strict allowlist scrubber. The product guarantee is that **no
+ * user-originated data** ever leaves the machine in an error report, so
+ * this module builds events from a fixed set of safe fields rather than
+ * trying to redact the raw error text (a blacklist approach that leaks:
+ * error messages routinely interpolate file paths, URLs, prompt output,
+ * or JSON snippets of user content).
+ */
+
+import { classifyTransportHost } from "./classify-transport-host.js";
+import { sanitizeLlmFailureTags, type LlmFailureContext } from "./llm-failure-tags.js";
+import { maskSecrets } from "./secret-detector.js";
+import { extractAnswerFailureTags } from "./answer-failure-tag.js";
+
+/** Neutral, transport-agnostic shape of a scrubbed error report. */
+export interface ScrubbedErrorEvent {
+  /** Error class name, e.g. `TransportError` / `TypeError`. */
+  errorType: string;
+  /**
+   * Class name of `err.cause`, when the top-level error is a generic
+   * wrapper (e.g. `ToolExecutionError("unknown", ...)` built by
+   * `toLlmFailure`'s catch-all branch). A class name is not
+   * user-originated data — same safety bar as `errorType` — but it
+   * distinguishes a `TypeError` from a `SyntaxError` etc. that would
+   * otherwise all collapse into the same wrapper type.
+   */
+  causeType?: string;
+  /** LLM failure taxonomy, when the error carries one. */
+  category?: string;
+  /** Where the error was captured (`uncaughtException`, `llm_failure`, …). */
+  source: string;
+  /**
+   * Error message — present ONLY for allowlisted static-message errors,
+   * and passed through the shared secret detector even then
+   * (`secret-detector.ts`): an audit that missed one interpolated key
+   * still sends a marker, not the key.
+   */
+  message?: string;
+  /** Safe scalar HTTP status, when present on the error. */
+  httpStatus?: number;
+  /** Safe errno-style code (e.g. `ECONNREFUSED`), when present. */
+  code?: string;
+  /**
+   * `ModelError.reason` when present. Restricted to the fixed 3-value
+   * enum (`truncated | empty | no_stop`) — never freeform.
+   */
+  reason?: string;
+  /**
+   * `ModelError.transport` when present — the effective tool-call
+   * transport the defective completion was parsed under. Restricted to
+   * the fixed 2-value `ToolCallTransport` enum
+   * (`grammar | native_tools`) — an internal build-time constant, never
+   * freeform and never user-originated. Without it `reason: "empty"` is
+   * undiagnosable: on `native_tools` it is the by-design route for a
+   * completion with nothing in any channel, while on grammar it means
+   * the one-shot repair came back empty too.
+   */
+  toolTransport?: string;
+  /**
+   * `ModelError.stage` when present — which attempt inside the step
+   * raised the defect. Restricted to the fixed 2-value
+   * `ModelFailureStage` enum (`initial | repair`) — an internal
+   * build-time constant, never freeform and never user-originated.
+   * `reason` + `toolTransport` do not cover this axis: within
+   * `native_tools`, `reason: "empty"` is raised both by the by-design
+   * first-attempt route and by "the one-shot repair came back empty
+   * too", and the Sentry fingerprint cannot split them either (it keys
+   * off a frame basename, and the shipped build is one bundled file).
+   */
+  failureStage?: string;
+  /**
+   * Which "no answer" story a `ModelError` tells (ATO-1031):
+   * `cut_at_limit` / `context_full` / `empty_answer` / `no_stop`. A
+   * fixed enum derived from `reason` and the truncation cause — see
+   * `answer-failure-tag.ts`.
+   */
+  answerFailure?: string;
+  /** `TruncationDetail.cause` of a truncated `ModelError`, a fixed 5-value enum. */
+  truncationCause?: string;
+  /**
+   * `ToolExecutionError.tool` when present. Restricted to a bounded
+   * identifier shape (registry tool names such as `os.fs.read`) — never
+   * freeform text, since a hallucinated tool name could in theory echo
+   * model output derived from the user's conversation.
+   */
+  tool?: string;
+  /**
+   * `ToolExecutionError.kind` when present. Restricted to the fixed
+   * `ToolExecutionErrorKind` enum (`unregistered`). For `unregistered`
+   * the name is the model's invention, so `tool` is NOT sent and
+   * {@link toolNameClass} stands in for it.
+   */
+  toolErrorKind?: string;
+  /**
+   * `ToolExecutionError.nameClass` for an unregistered tool, restricted
+   * to the fixed 3-value enum (`near_miss | mcp_like | other`).
+   */
+  toolNameClass?: string;
+  /**
+   * Class of the host in `TransportError.url`, when present
+   * (`localhost` / `private` / `known_cloud` / `other`). Neither the URL
+   * nor the host name itself ever travels.
+   */
+  transportHost?: string;
+  /**
+   * `error.type` out of an OpenAI-shaped upstream error body
+   * (`{"error":{"type":"exceed_context_size_error",…}}`) — the one field
+   * that says *why* a provider rejected a turn, where the status only
+   * says that it did.
+   *
+   * Unlike every other field here, this one is written by a server we do
+   * not control, so it is validated against a bounded enum shape and
+   * DROPPED when it does not match. A local llama-server / LM Studio /
+   * Ollama is free to put a sentence, a filesystem path, or a fragment
+   * of the user's own prompt in that field, and none of that may travel.
+   */
+  upstreamErrorType?: string;
+  /**
+   * `llm_failure` turn context as ready-made tags (`provider_id`,
+   * `local_engine`, `outage_waited_ms`, `outage_attempts`,
+   * `daemon_state`), already reduced to fixed words and numbers by
+   * `sanitizeLlmFailureTags`.
+   */
+  llmFailureTags?: Record<string, string>;
+  /** Path-stripped stack frames (basenames only — no home dir / username). */
+  frames: SentryStackFrame[];
+}
+
+/** Minimal Sentry stack-frame shape (path already reduced to a basename). */
+export interface SentryStackFrame {
+  function?: string;
+  filename: string;
+  lineno?: number;
+  colno?: number;
+}
+
+/** Known LLM failure categories (mirror of `src/llm/reliability`). */
+const KNOWN_CATEGORIES = new Set([
+  "transport",
+  "grammar",
+  "model",
+  "tool",
+  "cancelled",
+]);
+
+/**
+ * Curated allowlist of error class names whose `.message` is guaranteed
+ * to be static (no interpolated runtime / user data). **Empty by
+ * default** — add a class name here only after auditing every one of its
+ * constructor call sites and confirming the message is a fixed literal.
+ * Any error not in this set is reported without its message.
+ */
+export const STATIC_MESSAGE_ERRORS = new Set<string>([]);
+
+/** Mirror of `ModelFailureReason` in `src/llm/reliability/failure-category.ts` — a fixed 3-value enum, safe to allowlist verbatim. */
+const KNOWN_MODEL_FAILURE_REASONS = new Set(["truncated", "empty", "no_stop"]);
+
+/** Mirror of `ToolCallTransport` in `src/llm/provider/completion-types.ts` — a fixed 2-value enum, safe to allowlist verbatim. */
+const KNOWN_TOOL_CALL_TRANSPORTS = new Set(["grammar", "native_tools"]);
+
+/** Mirror of `ModelFailureStage` in `src/llm/reliability/failure-category.ts` — a fixed 2-value enum, safe to allowlist verbatim. */
+const KNOWN_MODEL_FAILURE_STAGES = new Set(["initial", "repair"]);
+
+/** Mirror of `ToolExecutionErrorKind` in `src/llm/reliability/llm-failures.ts` — a fixed enum, safe to allowlist verbatim. */
+const KNOWN_TOOL_ERROR_KINDS = new Set(["unregistered"]);
+
+/** Mirror of `UnregisteredToolNameClass` in `src/llm/reliability/llm-failures.ts` — a fixed 3-value enum, safe to allowlist verbatim. */
+const KNOWN_TOOL_NAME_CLASSES = new Set(["near_miss", "mcp_like", "other"]);
+
+/**
+ * Bounded identifier pattern for tool names (mirrors `MCP_TOOL_NAME_RE` in
+ * `src/mcp/mcp-types.ts`). A value that does not match this shape is
+ * dropped rather than sent — it could be arbitrary model output rather
+ * than a real registry tool name.
+ */
+const SAFE_IDENTIFIER_RE = /^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,63}$/;
+
+const MAX_FRAMES = 30;
+
+/**
+ * Enum shape for an errno-style code. A value that does not match could
+ * be freeform text (and therefore user data), so it is dropped rather
+ * than sent.
+ */
+const SAFE_CODE_RE = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * Enum shape for an upstream provider's `error.type`. Deliberately
+ * tighter than {@link SAFE_IDENTIFIER_RE}: that one guards a value our
+ * own registry produced, this one guards a value a third-party server
+ * wrote. Lowercase snake_case, 48 characters at most — which admits
+ * every type llama.cpp and OpenAI actually define
+ * (`exceed_context_size_error`, `invalid_request_error`, `server_error`,
+ * `unavailable_error`, `insufficient_quota`, `not_found_error`,
+ * `authentication_error`) and excludes anything carrying a space, a `/`
+ * or `\`, punctuation, a capital or a non-ASCII byte.
+ *
+ * What it does NOT exclude: a single lowercase word. `resignation`,
+ * `config_json` and 48 unbroken characters of a prompt all pass, because
+ * nothing here can tell one token of prose from one token of enum. The
+ * pattern buys the *multi-word* case — which is every shape a sentence,
+ * a path or a real prompt fragment actually takes — not the single-token
+ * one. {@link SAFE_CODE_RE} has had the identical property since it was
+ * written; the bound is the backstop for both.
+ */
+const SAFE_UPSTREAM_ERROR_TYPE_RE = /^[a-z][a-z0-9_]{0,47}$/;
+
+/** Depth cap on every `cause` walk in this module — longer is a cycle. */
+const MAX_CAUSE_DEPTH = 5;
+
+// `    at fn (/abs/path/file.js:12:34)` or `    at /abs/path/file.js:12:34`
+const FRAME_RE = /^\s*at (?:(.+?) \()?(.+?):(\d+):(\d+)\)?\s*$/;
+
+/** Read a known LLM failure category off an error, if it carries one. */
+export function readKnownCategory(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const category = (err as { category?: unknown }).category;
+  if (typeof category === "string" && KNOWN_CATEGORIES.has(category)) {
+    return category;
+  }
+  return undefined;
+}
+
+/** Reduce a stack-frame path to a basename, preserving `node:` internals. */
+function safeBasename(location: string): string {
+  if (location.startsWith("node:")) return location;
+  const stripped = location.replace(/^file:\/\//, "");
+  const lastSlash = Math.max(
+    stripped.lastIndexOf("/"),
+    stripped.lastIndexOf("\\"),
+  );
+  return lastSlash >= 0 ? stripped.slice(lastSlash + 1) : stripped;
+}
+
+/**
+ * Parse a Node `error.stack` into structured frames with every filesystem
+ * path reduced to a basename. This strips the home directory / username
+ * that dev-build stacks embed while keeping enough to locate the frame in
+ * our (bundled) code.
+ */
+export function sanitizeStack(stack: string | undefined): SentryStackFrame[] {
+  if (!stack) return [];
+  const frames: SentryStackFrame[] = [];
+  for (const line of stack.split("\n")) {
+    const match = FRAME_RE.exec(line);
+    if (!match) continue;
+    const [, fn, location, lineno, colno] = match;
+    const frame: SentryStackFrame = {
+      filename: safeBasename(location ?? ""),
+    };
+    if (fn) frame.function = fn;
+    if (lineno) frame.lineno = Number.parseInt(lineno, 10);
+    if (colno) frame.colno = Number.parseInt(colno, 10);
+    frames.push(frame);
+    if (frames.length >= MAX_FRAMES) break;
+  }
+  return frames;
+}
+
+/**
+ * Extract only safe, enum-like scalar codes from an error.
+ *
+ * The walk continues into `err.cause` because the error that reaches
+ * this function is usually a wrapper: `TransportError` carries no status
+ * of its own on the network path, and `GrammarError` carries none at all
+ * — the HTTP status lives on the `LlamaServerError` underneath, and the
+ * errno one level below that. Reading only the top object is why the
+ * largest issue in error reporting has neither an `http_status` nor a
+ * `code` tag on a single event.
+ *
+ * Each field is taken from the outermost link that has it, so a wrapper
+ * that DOES carry a status still wins over its cause.
+ */
+export function extractSafeCode(err: unknown): {
+  httpStatus?: number;
+  code?: string;
+} {
+  const out: { httpStatus?: number; code?: string } = {};
+  let current: unknown = err;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (typeof current !== "object" || current === null) break;
+    const status = (current as { status?: unknown }).status;
+    if (out.httpStatus === undefined && typeof status === "number") {
+      out.httpStatus = status;
+    }
+    const code = (current as { code?: unknown }).code;
+    if (
+      out.code === undefined &&
+      typeof code === "string" &&
+      SAFE_CODE_RE.test(code)
+    ) {
+      out.code = code;
+    }
+    if (out.httpStatus !== undefined && out.code !== undefined) break;
+    const next = (current as { cause?: unknown }).cause;
+    if (next === current) break;
+    current = next;
+  }
+  return out;
+}
+
+/** Read `ModelError.reason` off an error, restricted to the known enum. */
+export function extractSafeReason(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const reason = (err as { reason?: unknown }).reason;
+  return typeof reason === "string" && KNOWN_MODEL_FAILURE_REASONS.has(reason)
+    ? reason
+    : undefined;
+}
+
+/**
+ * Read `ModelError.transport` off an error, restricted to the known
+ * `ToolCallTransport` enum. Anything else is dropped rather than sent.
+ */
+export function extractSafeToolTransport(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const transport = (err as { transport?: unknown }).transport;
+  return typeof transport === "string" &&
+    KNOWN_TOOL_CALL_TRANSPORTS.has(transport)
+    ? transport
+    : undefined;
+}
+
+/**
+ * Read `ModelError.stage` off an error, restricted to the known
+ * `ModelFailureStage` enum. Anything else is dropped rather than sent.
+ */
+export function extractSafeFailureStage(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const stage = (err as { stage?: unknown }).stage;
+  return typeof stage === "string" && KNOWN_MODEL_FAILURE_STAGES.has(stage)
+    ? stage
+    : undefined;
+}
+
+/**
+ * Read `ToolExecutionError.tool` off an error, restricted to a bounded
+ * identifier shape so freeform / hallucinated text is never sent.
+ */
+export function extractSafeTool(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const tool = (err as { tool?: unknown }).tool;
+  return typeof tool === "string" && SAFE_IDENTIFIER_RE.test(tool)
+    ? tool
+    : undefined;
+}
+
+/**
+ * Read `ToolExecutionError.kind` and, for an unregistered tool, its
+ * `nameClass`, restricted to their fixed enums. Anything else is
+ * dropped rather than sent.
+ */
+export function extractSafeToolErrorKind(err: unknown): {
+  kind?: string;
+  nameClass?: string;
+} {
+  if (typeof err !== "object" || err === null) return {};
+  const { kind, nameClass } = err as { kind?: unknown; nameClass?: unknown };
+  if (typeof kind !== "string" || !KNOWN_TOOL_ERROR_KINDS.has(kind)) return {};
+  return typeof nameClass === "string" && KNOWN_TOOL_NAME_CLASSES.has(nameClass)
+    ? { kind, nameClass }
+    : { kind };
+}
+
+/**
+ * Classify the host of `TransportError.url` (see `classifyTransportHost`):
+ * `localhost` / `private` / `known_cloud` / `other`. The host itself never
+ * travels — a custom endpoint's name can identify a company or a machine.
+ */
+export function extractSafeTransportHost(err: unknown): string | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const url = (err as { url?: unknown }).url;
+  if (typeof url !== "string" || url.length === 0) return undefined;
+  return classifyTransportHost(url);
+}
+
+/**
+ * Read the upstream `error.type` off a provider error body
+ * (`OpenAiHttpError.body`, parsed by `parseProviderErrorBody`),
+ * restricted to a bounded enum shape so freeform server text is never
+ * sent. Only `.type` is read — the same object also holds `.message` and
+ * up to 2 kB of raw body, which are exactly what must not travel.
+ *
+ * The walk into `cause` is what makes the value reachable at all: the
+ * error that gets scrubbed is the `TransportError` wrapper `toLlmFailure`
+ * builds, and that wrapper copies only `status` and `url` off the
+ * `OpenAiHttpError` underneath — the parsed body stays on the cause. A
+ * link whose `.type` fails validation does not stop the walk; a valid
+ * one further down is still worth having, and `MAX_CAUSE_DEPTH` is what
+ * ends the walk.
+ *
+ * The walk takes the outermost link that has a `.body` at all rather than
+ * looking for an `OpenAiHttpError` specifically — `extractSafeTransportHost`
+ * reads `.url` the same duck-typed way. `OpenAiHttpError` and
+ * `LlamaServerError` (which keeps only `{ type }` of a llama-server error
+ * body) are the classes in this project that carry a `.body`; a third one
+ * would have to be checked here.
+ */
+export function extractSafeUpstreamErrorType(
+  err: unknown,
+): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (typeof current !== "object" || current === null) break;
+    const body = (current as { body?: unknown }).body;
+    if (body !== null && typeof body === "object") {
+      const type = (body as { type?: unknown }).type;
+      if (typeof type === "string" && SAFE_UPSTREAM_ERROR_TYPE_RE.test(type)) {
+        return type;
+      }
+    }
+    const next = (current as { cause?: unknown }).cause;
+    if (next === current) break;
+    current = next;
+  }
+  return undefined;
+}
+
+/**
+ * Choose the frames to report: the cause's, when it has any, else the
+ * wrapper's own.
+ *
+ * Preferring the cause is right — a generic wrapper's `.stack` points at
+ * the `new ToolExecutionError(...)` call site, not the throw site. But
+ * preferring it *unconditionally* meant that a cause with no parseable
+ * frames took the wrapper's frames down with it, and the event shipped
+ * with an empty stack. That is not hypothetical: it is how a
+ * 108-event issue ended up with no stack trace at all and no way to
+ * tell where it came from. Some causes genuinely have nothing — a
+ * `DOMException` from an abort, an error rebuilt from a serialized
+ * worker message, anything constructed without `Error.captureStackTrace`.
+ * A wrapper frame is worth strictly more than nothing.
+ */
+function pickFrames(
+  err: Error,
+  causeError: Error | undefined,
+): SentryStackFrame[] {
+  const causeFrames = causeError ? sanitizeStack(causeError.stack) : [];
+  if (causeFrames.length > 0) return causeFrames;
+  return sanitizeStack(err.stack);
+}
+
+/**
+ * Read the underlying `Error` off `err.cause`, when present. Only an
+ * `Error` instance is returned — a non-Error cause carries no `.stack` /
+ * `.name` worth extracting.
+ */
+function readCauseError(err: Error): Error | undefined {
+  const cause = (err as { cause?: unknown }).cause;
+  return cause instanceof Error ? cause : undefined;
+}
+
+/**
+ * Build a {@link ScrubbedErrorEvent} from an `Error` using the strict
+ * allowlist. `message` is included only when the error's class name is in
+ * {@link STATIC_MESSAGE_ERRORS}.
+ *
+ * When `err` is a generic wrapper built around an original failure (e.g.
+ * `toLlmFailure`'s catch-all `ToolExecutionError("unknown", ...)`), the
+ * wrapper's own `.stack` only points at the `new ToolExecutionError(...)`
+ * call site, not the original throw site — `err.cause` is where the
+ * actually useful frames live. Prefer the cause's stack whenever the
+ * cause is itself an `Error`; fall back to `err.stack` otherwise so
+ * ordinary (non-wrapped) errors are unaffected.
+ */
+export function scrubError(
+  err: Error,
+  opts: { source: string; category?: string; llmFailure?: LlmFailureContext },
+): ScrubbedErrorEvent {
+  const errorType = err.name || err.constructor?.name || "Error";
+  const category =
+    (opts.category && KNOWN_CATEGORIES.has(opts.category)
+      ? opts.category
+      : undefined) ?? readKnownCategory(err);
+  const { httpStatus, code } = extractSafeCode(err);
+  const reason = extractSafeReason(err);
+  const toolTransport = extractSafeToolTransport(err);
+  const failureStage = extractSafeFailureStage(err);
+  const toolErrorKind = extractSafeToolErrorKind(err);
+  // An unregistered name is whatever the model made up: never a tag.
+  const tool =
+    toolErrorKind.kind === "unregistered" ? undefined : extractSafeTool(err);
+  const transportHost = extractSafeTransportHost(err);
+  const upstreamErrorType = extractSafeUpstreamErrorType(err);
+  const causeError = readCauseError(err);
+  const causeType = causeError
+    ? causeError.name || causeError.constructor?.name || "Error"
+    : undefined;
+  const event: ScrubbedErrorEvent = {
+    errorType,
+    source: opts.source,
+    frames: pickFrames(err, causeError),
+  };
+  if (causeType) event.causeType = causeType;
+  if (category) event.category = category;
+  if (STATIC_MESSAGE_ERRORS.has(errorType) && err.message) {
+    event.message = maskSecrets(err.message);
+  }
+  if (httpStatus !== undefined) event.httpStatus = httpStatus;
+  if (code !== undefined) event.code = code;
+  if (reason !== undefined) event.reason = reason;
+  if (toolTransport !== undefined) event.toolTransport = toolTransport;
+  if (failureStage !== undefined) event.failureStage = failureStage;
+  const answerTags = extractAnswerFailureTags(err);
+  if (answerTags.answerFailure !== undefined) {
+    event.answerFailure = answerTags.answerFailure;
+  }
+  if (answerTags.truncationCause !== undefined) {
+    event.truncationCause = answerTags.truncationCause;
+  }
+  if (tool !== undefined) event.tool = tool;
+  if (toolErrorKind.kind !== undefined) event.toolErrorKind = toolErrorKind.kind;
+  if (toolErrorKind.nameClass !== undefined) {
+    event.toolNameClass = toolErrorKind.nameClass;
+  }
+  if (transportHost !== undefined) event.transportHost = transportHost;
+  if (upstreamErrorType !== undefined) {
+    event.upstreamErrorType = upstreamErrorType;
+  }
+  const llmFailureTags = sanitizeLlmFailureTags(opts.llmFailure);
+  if (llmFailureTags !== undefined) event.llmFailureTags = llmFailureTags;
+  return event;
+}

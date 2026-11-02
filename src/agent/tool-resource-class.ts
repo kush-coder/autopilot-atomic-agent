@@ -1,0 +1,472 @@
+import { OS_FS_READ_CONTRACT } from "../tools/os/fs/fs-read-contract.js";
+import { OS_FS_LIST_CONTRACT } from "../tools/os/fs/fs-list-contract.js";
+import { OS_FS_GLOB_CONTRACT } from "../tools/os/fs/fs-glob-contract.js";
+import { OS_FS_GREP_CONTRACT } from "../tools/os/fs/fs-grep-contract.js";
+import { OS_FS_DIFF_CONTRACT } from "../tools/os/fs/fs-diff-contract.js";
+import { OS_FS_WATCH_CONTRACT } from "../tools/os/fs/fs-watch-contract.js";
+import { OS_FS_WRITE_CONTRACT } from "../tools/os/fs/fs-write-contract.js";
+import { OS_FS_EDIT_CONTRACT } from "../tools/os/fs/fs-edit-contract.js";
+import { OS_FS_PATCH_CONTRACT } from "../tools/os/fs/fs-patch-contract.js";
+import { OS_FS_TRASH_CONTRACT } from "../tools/os/fs/fs-trash-contract.js";
+import { OS_FS_RESTORE_CONTRACT } from "../tools/os/fs/fs-restore-contract.js";
+import { OS_FS_MOVE_CONTRACT } from "../tools/os/fs/fs-move-contract.js";
+import { OS_FS_LOCATE_PROJECT_CONTRACT } from "../tools/os/fs/fs-locate-project-contract.js";
+/**
+ * Resource class taxonomy for parallel batched tool calls.
+ *
+ * The batch executor groups calls by `ResourceClass`:
+ *  - `pure_read`     — parallel-safe; no shared mutable state. Runs as
+ *                      `Promise.allSettled`.
+ *  - `fs_write`      — file-system writes. Serialised within its group
+ *                      to keep behaviour deterministic when the model
+ *                      writes multiple files in one batch. (Note: most
+ *                      fs_write verbs also require approval, so they
+ *                      additionally land in `approval_gated` and are
+ *                      forbidden inside a batch entirely.)
+ *  - `browser`       — Playwright is a single-process resource. All
+ *                      `browser.*` calls serialise within their group.
+ *  - `memory_write`  — `ProfileStore` / `MemoryStore` writes. Serialised
+ *                      to keep observation order predictable, even
+ *                      though `better-sqlite3` is synchronous.
+ *  - `tasks_write`   — Task store mutations. Same rationale.
+ *  - `vision`        — `vision.describe` issues HTTP calls to a separate
+ *                      llama-server slot; serialised to bound concurrent
+ *                      vision load on the backend.
+ *  - `approval_gated`— Virtual class. Tools that may invoke
+ *                      `requireApproval` synchronously inside `run()`.
+ *                      Forbidden inside a batch — the validator rejects
+ *                      the parse and the model is asked to split.
+ *  - `terminal`      — `reply` / `finish`. Allowed only as the LAST
+ *                      element of a multi-call batch; mid-batch or
+ *                      duplicated terminals are rejected. The executor
+ *                      runs the terminal call strictly after every
+ *                      non-terminal call has settled, so `[store, reply]`
+ *                      collapses into one inference whose transcript is
+ *                      `tool_call(store) → tool_result(store) →
+ *                      assistant_reply`. Solo terminal calls keep the
+ *                      legacy semantics (length-1 batch).
+ *
+ * Groups in distinct classes execute concurrently with each other; the
+ * total step wall is `max(group durations)`.
+ *
+ * Tools not listed here default to `unknown`, which the validator
+ * rejects from any batch (fail-closed). When you add a new tool, add
+ * its name here too — the test in `tool-resource-class.test.ts`
+ * asserts that every entry in `DEFAULT_TOOL_DESCRIPTORS` has an
+ * explicit class.
+ */
+import { OS_FS_HASH_CONTRACT } from "../tools/os/fs/fs-hash-contract.js";
+import {
+  isAutoApprovedAt,
+  isGrantableCategory,
+  type ApprovalCategory,
+  type ApprovalLevel,
+} from "../approval/approval-level.js";
+
+export type ResourceClass =
+  | "pure_read"
+  | "fs_write"
+  | "browser"
+  | "memory_write"
+  | "tasks_write"
+  | "vision"
+  | "approval_gated"
+  | "terminal"
+  | "unknown";
+
+const TOOL_RESOURCE_CLASS: Record<string, ResourceClass> = {
+  // browser.* — single Playwright backend per process
+  "browser.navigate": "browser",
+  "browser.click": "browser",
+  "browser.type": "browser",
+  "browser.read_aria": "browser",
+  "browser.search": "browser",
+  "browser.tabs": "browser",
+  "browser.scroll": "browser",
+  "browser.screenshot": "browser",
+
+  // os.shell.* — always approval-gated when approvals are on
+  "os.shell.run": "approval_gated",
+
+  // os.fs.* read-only
+  [OS_FS_READ_CONTRACT.name]: OS_FS_READ_CONTRACT.resourceClass,
+  "os.fs.read_document": "pure_read",
+  [OS_FS_LIST_CONTRACT.name]: OS_FS_LIST_CONTRACT.resourceClass,
+  [OS_FS_GLOB_CONTRACT.name]: OS_FS_GLOB_CONTRACT.resourceClass,
+  [OS_FS_LOCATE_PROJECT_CONTRACT.name]: OS_FS_LOCATE_PROJECT_CONTRACT.resourceClass,
+  [OS_FS_GREP_CONTRACT.name]: OS_FS_GREP_CONTRACT.resourceClass,
+  [OS_FS_HASH_CONTRACT.name]: OS_FS_HASH_CONTRACT.resourceClass,
+  [OS_FS_DIFF_CONTRACT.name]: OS_FS_DIFF_CONTRACT.resourceClass,
+  [OS_FS_WATCH_CONTRACT.name]: OS_FS_WATCH_CONTRACT.resourceClass,
+  "os.fs.archive.list": "pure_read",
+  "os.fs.archive.read_entry": "pure_read",
+
+  // os.fs.* mutating — all approval-gated
+  [OS_FS_WRITE_CONTRACT.name]: OS_FS_WRITE_CONTRACT.resourceClass,
+  [OS_FS_EDIT_CONTRACT.name]: OS_FS_EDIT_CONTRACT.resourceClass,
+  [OS_FS_TRASH_CONTRACT.name]: OS_FS_TRASH_CONTRACT.resourceClass,
+  [OS_FS_PATCH_CONTRACT.name]: OS_FS_PATCH_CONTRACT.resourceClass,
+  [OS_FS_RESTORE_CONTRACT.name]: OS_FS_RESTORE_CONTRACT.resourceClass,
+  [OS_FS_MOVE_CONTRACT.name]: OS_FS_MOVE_CONTRACT.resourceClass,
+  "os.fs.archive.extract": "approval_gated",
+
+  // os.git.* — read-only shell-outs
+  "os.git.status": "pure_read",
+  "os.git.log": "pure_read",
+  "os.git.diff": "pure_read",
+  "os.git.show": "pure_read",
+  "os.git.blame": "pure_read",
+  "os.git.branch": "pure_read",
+  // os.git.* — network verbs; gated by the remote-sync switch, then approval
+  "os.git.remote": "approval_gated",
+  "os.git.fetch": "approval_gated",
+  "os.git.pull": "approval_gated",
+  "os.git.push": "approval_gated",
+  "os.git.clone": "approval_gated",
+
+  // os.git.* — mutating locally; each goes through requireApproval
+  "os.git.checkout": "approval_gated",
+  "os.git.commit": "approval_gated",
+
+  // github.* — REST reads are free; writes publish under the user's name
+  "github.whoami": "pure_read",
+  "github.pr.list": "pure_read",
+  "github.issue.list": "pure_read",
+  "github.pr.create": "approval_gated",
+  "github.issue.create": "approval_gated",
+  "github.issue.comment": "approval_gated",
+
+  // os.git.* — local writes; approval-gated like fs writes
+  "os.git.init": "approval_gated",
+  "os.git.add": "approval_gated",
+
+  // os.proc.*
+  "os.proc.list": "pure_read",
+  "os.proc.kill": "approval_gated",
+
+  // os.http.*
+  "os.http.request": "approval_gated",
+
+  // os.web.* — read-only search/fetch + extract; SSRF-guarded, no mutation
+  "os.web.search": "pure_read",
+  "os.web.fetch": "pure_read",
+
+  // os.clipboard / window / notify — small mutating side effects on
+  // shared OS resources; safest to serialise.
+  "os.clipboard.read": "pure_read",
+  "os.clipboard.write": "memory_write",
+  "os.window.list": "pure_read",
+  "os.window.focus": "memory_write",
+  "os.notify": "memory_write",
+
+  // os.email.* — the agent's own inbox
+  "os.email.inbox": "pure_read",
+  "os.email.send": "approval_gated",
+
+  // os.screen.* — one shared desktop (ATO-525). All four in one serial
+  // class, so a batched click → capture runs in the order emitted and a
+  // screenshot is never taken while a click is still in flight (distinct
+  // groups run concurrently).
+  "os.screen.capture": "approval_gated",
+  "os.screen.click": "approval_gated",
+  "os.screen.type": "approval_gated",
+  "os.screen.key": "approval_gated",
+
+  // discovery
+  "skill.view": "pure_read",
+  "tool.view": "pure_read",
+  "skill.run_script": "approval_gated",
+
+  // memory.*
+  "memory.profile.list": "pure_read",
+  "memory.profile.history": "pure_read",
+  "memory.lessons.recall": "pure_read",
+  "memory.procedures.recall": "pure_read",
+  "memory.notes.recall": "pure_read",
+  "memory.profile.set": "memory_write",
+  "memory.profile.remove": "memory_write",
+  "memory.notes.store": "memory_write",
+  "memory.notes.forget": "memory_write",
+
+  // tasks.*
+  "tasks.list": "pure_read",
+  "tasks.show": "pure_read",
+  "tasks.schedule": "tasks_write",
+  "tasks.cron": "tasks_write",
+  "tasks.cancel": "tasks_write",
+
+  // vision
+  "vision.describe": "vision",
+
+  // image — a cloud generation asks before it bills the account, and a
+  // local one holds the GPU for minutes: solo either way.
+  "image.generate": "approval_gated",
+
+  // video — always a paid cloud clip that runs for minutes: solo.
+  "video.generate": "approval_gated",
+
+  // fusion — `approval_gated` is the "must be solo" class, and that is
+  // what this needs: one call runs several worker turns concurrently
+  // inside itself, for minutes. Batching it beside other tools would
+  // stack the orchestrator's own fan-out on top of the fan-out.
+  "fusion.delegate": "approval_gated",
+
+  // verify.* — read-only checks. `verify.syntax` spawns nothing that
+  // writes (node --check, tsc --noEmit, python compile(), bash -n), so
+  // several may run side by side.
+  "verify.syntax": "pure_read",
+  // `verify.run` executes a command, a server or a page — in a
+  // throwaway copy, so the workspace is untouched, but it still asks
+  // under the shell category below level 4, and it must be solo.
+  "verify.run": "approval_gated",
+
+  // mcp.* discovery / read tools — pure_read regardless of per-server
+  // trust because they only inspect the local catalog or fetch
+  // declared resources/prompts. Per-server-tool calls go through
+  // `mcp.<server>.<name>` and are classified by the dynamic resolver.
+  "mcp.resource.list": "pure_read",
+  "mcp.resource.read": "pure_read",
+  "mcp.prompt.list": "pure_read",
+  "mcp.prompt.get": "pure_read",
+
+  // terminal verbs
+  reply: "terminal",
+  finish: "terminal",
+};
+
+/**
+ * Optional resolver for tool names that are not in the static
+ * `TOOL_RESOURCE_CLASS` table. Set once at bootstrap by the MCP
+ * manager so MCP-namespaced tools (`mcp.<server>.<name>`) get a real
+ * class instead of falling through to `unknown` (which would forbid
+ * them from every batch — including length-1 batches). The resolver
+ * is consulted only when the static lookup misses, so it cannot
+ * override the built-in classes.
+ */
+let dynamicResourceClassResolver:
+  ((toolName: string) => ResourceClass | null) | null = null;
+
+/**
+ * Install a dynamic resolver. Pass `null` to unregister (e.g. during
+ * runtime shutdown). The setter is intentionally narrow — the
+ * resolver is read on every `resourceClassFor` call and must be
+ * cheap (a Map lookup at the call site).
+ */
+export function setDynamicResourceClassResolver(
+  resolver: ((toolName: string) => ResourceClass | null) | null,
+): void {
+  dynamicResourceClassResolver = resolver;
+}
+
+/**
+ * Lookup helper. Unknown tools land in `unknown` so the validator can
+ * reject them from any batch — this is the fail-closed default.
+ *
+ * For names not in the static table, the dynamic resolver (if any)
+ * is consulted. This is the seam through which MCP-namespaced tools
+ * (`mcp.<server>.<name>`) get a non-`unknown` class.
+ */
+export function resourceClassFor(toolName: string): ResourceClass {
+  const builtin = TOOL_RESOURCE_CLASS[toolName];
+  if (builtin) return builtin;
+  if (dynamicResourceClassResolver) {
+    const resolved = dynamicResourceClassResolver(toolName);
+    if (resolved) return resolved;
+  }
+  return "unknown";
+}
+
+/** True when the class may run alongside other calls in a batch. */
+export function isBatchable(cls: ResourceClass): boolean {
+  return cls !== "approval_gated" && cls !== "terminal" && cls !== "unknown";
+}
+
+/**
+ * True when the class can run concurrently with siblings of the same
+ * class (currently only `pure_read`). All other batchable classes
+ * serialise within their group.
+ */
+export function isParallelWithinGroup(cls: ResourceClass): boolean {
+  return cls === "pure_read";
+}
+
+/**
+ * A bookkeeping call: a write to the agent's own long-term memory
+ * (`memory.*` in the `memory_write` class — a note stored or forgotten,
+ * a profile fact set or removed). Its result carries nothing the answer
+ * depends on: "stored #4" does not change what the reply says. So a
+ * `reply` batched only with bookkeeping is the end of the turn, not a
+ * progress note (`progress-note-reply.ts`).
+ *
+ * Derived from the class, not a name list: a new `memory.*` write tool
+ * classed `memory_write` is bookkeeping the day it is added. Reads
+ * (`memory.*.recall`, `memory.profile.list` / `history`) are
+ * `pure_read` and stay work — their result is information the model
+ * has not seen yet. The other `memory_write` tenants
+ * (`os.clipboard.write`, `os.window.focus`, `os.notify`) sit in that
+ * class only to serialise; they act on the user's desktop and a reply
+ * may claim their outcome, so they are work too.
+ */
+export function isBookkeepingTool(toolName: string): boolean {
+  return (
+    toolName.startsWith("memory.") &&
+    resourceClassFor(toolName) === "memory_write"
+  );
+}
+
+/**
+ * Read-only snapshot of the registry — useful for tests and debugging.
+ */
+export function listKnownToolResourceClasses(): Readonly<
+  Record<string, ResourceClass>
+> {
+  return TOOL_RESOURCE_CLASS;
+}
+
+/** Every category an fs-write funnel call can land in (`categorizeFsMutation`). */
+const FS_WRITE_CATEGORIES: readonly ApprovalCategory[] = [
+  "fs_write_workspace",
+  "fs_write_home",
+  "trust_config",
+  "other",
+];
+
+/**
+ * Every `ApprovalCategory` an `approval_gated` tool's `requireApproval`
+ * call can name. The call site picks one at run time (a write inside the
+ * workspace is `fs_write_workspace`, the same write onto `config.json` is
+ * `trust_config`), and the batch planner cannot see that far ahead, so
+ * the list is the whole set and a call counts as unattended only when
+ * EVERY category in it would be. That is deliberately pessimistic: the
+ * fs writes carry `trust_config`, which is pinned at level 5, so below
+ * full trust a batched write still trims exactly as before.
+ *
+ * Kept next to `TOOL_RESOURCE_CLASS` because adding a gated tool means
+ * deciding both; `tool-resource-class.test.ts` fails when a static
+ * `approval_gated` entry has neither a row here nor a place in
+ * `SOLO_REGARDLESS_OF_APPROVAL`.
+ */
+const APPROVAL_CATEGORIES_BY_TOOL: Record<string, readonly ApprovalCategory[]> =
+  {
+    "os.shell.run": ["shell"],
+    // Same rung as a shell command: it runs one, in a copy.
+    "verify.run": ["shell"],
+    "os.fs.write": FS_WRITE_CATEGORIES,
+    "os.fs.edit": FS_WRITE_CATEGORIES,
+    "os.fs.patch": FS_WRITE_CATEGORIES,
+    // Puts a saved copy back: a write in every sense.
+    "os.fs.restore": FS_WRITE_CATEGORIES,
+    // Both ends ride the write funnel (`fs-move.ts`).
+    "os.fs.move": FS_WRITE_CATEGORIES,
+    "os.fs.trash": ["fs_trash", "trust_config", "other"],
+    "os.fs.archive.extract": ["fs_write_home", "other"],
+    // Local git writes ride the fs funnel against the repository root.
+    "os.git.init": FS_WRITE_CATEGORIES,
+    "os.git.add": FS_WRITE_CATEGORIES,
+    "os.git.commit": FS_WRITE_CATEGORIES,
+    "os.git.checkout": FS_WRITE_CATEGORIES,
+    "os.git.remote": ["git_remote"],
+    "os.git.fetch": ["git_remote"],
+    "os.git.pull": ["git_remote"],
+    "os.git.push": ["git_remote"],
+    "os.git.clone": ["git_remote"],
+    "github.pr.create": ["publish"],
+    "github.issue.create": ["publish"],
+    "github.issue.comment": ["publish"],
+    "os.proc.kill": ["proc_kill"],
+    "os.http.request": ["http"],
+    "os.email.send": ["email"],
+    // A screenshot asks below level 3 (`screen_capture`).
+    "os.screen.capture": ["screen_capture"],
+    "os.screen.click": ["screen_control"],
+    "os.screen.type": ["screen_control"],
+    "os.screen.key": ["screen_control"],
+    "skill.run_script": ["script"],
+    // A local generation asks nothing; the cloud one is `paid_generation`.
+    "image.generate": ["paid_generation"],
+    // Always cloud, always billed per second.
+    "video.generate": ["paid_generation"],
+  };
+
+/**
+ * `approval_gated` tools that must stay solo for a reason that has
+ * nothing to do with a prompt. `fusion.delegate` runs several worker
+ * turns concurrently inside one call, for minutes; no approval level
+ * makes it safe to line it up behind other calls.
+ */
+const SOLO_REGARDLESS_OF_APPROVAL: ReadonlySet<string> = new Set([
+  "fusion.delegate",
+]);
+
+/**
+ * The approval posture of the session a batch belongs to: the gate's
+ * live level plus the categories the session holds an `[s]` grant for.
+ * Shape grants (`[a]`) are not modelled — a shell call's binary is only
+ * known once the guard parses its command.
+ */
+export interface BatchApprovalPosture {
+  level: ApprovalLevel;
+  grantedCategories?: readonly ApprovalCategory[];
+}
+
+/**
+ * The categories an `approval_gated` call may ask under, or `null` when
+ * the runtime cannot say (an unlisted tool). MCP tools at the default
+ * trust ask as `other` (`mcp-tool-adapter.ts`).
+ */
+export function approvalCategoriesFor(
+  toolName: string,
+): readonly ApprovalCategory[] | null {
+  const listed = APPROVAL_CATEGORIES_BY_TOOL[toolName];
+  if (listed) return listed;
+  if (
+    toolName.startsWith("mcp.") &&
+    !(toolName in TOOL_RESOURCE_CLASS) &&
+    resourceClassFor(toolName) === "approval_gated"
+  ) {
+    return ["other"];
+  }
+  return null;
+}
+
+/**
+ * True when an `approval_gated` call would run without anyone being
+ * asked under `posture`: every category it could name is auto-approved
+ * at the level, or grantable and granted to the session. A tool the
+ * runtime cannot categorise, or one that is solo for other reasons,
+ * answers `false` — the caller keeps the batch solo.
+ *
+ * This decides whether a batch of gated calls may run in order instead
+ * of being trimmed to its first call. It does NOT approve anything: each
+ * call still goes through the gate when it runs.
+ */
+export function gatedCallRunsUnattended(
+  toolName: string,
+  posture: BatchApprovalPosture,
+): boolean {
+  if (SOLO_REGARDLESS_OF_APPROVAL.has(toolName)) return false;
+  const categories = approvalCategoriesFor(toolName);
+  if (categories === null) return false;
+  const granted = posture.grantedCategories ?? [];
+  return categories.every(
+    (category) =>
+      isAutoApprovedAt(posture.level, category) ||
+      (isGrantableCategory(category) && granted.includes(category)),
+  );
+}
+
+/** Read-only view of the gated-tool category table — for tests. */
+export function listApprovalCategoriesByTool(): Readonly<
+  Record<string, readonly ApprovalCategory[]>
+> {
+  return APPROVAL_CATEGORIES_BY_TOOL;
+}
+
+/**
+ * Whether a gated tool is solo for a reason other than approval. Read by
+ * the step's approval barriers too: such a call is never lined up behind
+ * other calls, approved or not.
+ */
+export function isSoloRegardlessOfApproval(toolName: string): boolean {
+  return SOLO_REGARDLESS_OF_APPROVAL.has(toolName);
+}

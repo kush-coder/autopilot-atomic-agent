@@ -1,0 +1,523 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type {
+  ApprovalDecision,
+  ApprovalRequest,
+} from "../../approval/index.js";
+import { StructuredLogger } from "../../tracing/structured-logger.js";
+
+import {
+  ApprovalBridge,
+  type ApprovalBridgeDeps,
+  type InboundCallbackUpdate,
+} from "./approval-bridge.js";
+
+interface ScheduledEntry {
+  fire: () => void;
+  ms: number;
+  cancelled: boolean;
+}
+
+interface TestHarness {
+  bridge: ApprovalBridge;
+  api: {
+    sendMessage: ReturnType<typeof vi.fn>;
+    editMessageText: ReturnType<typeof vi.fn>;
+    answerCallbackQuery: ReturnType<typeof vi.fn>;
+    sendTextDocument: ReturnType<typeof vi.fn>;
+  };
+  approvals: {
+    resolve: ReturnType<typeof vi.fn>;
+    decisions: ApprovalDecision[];
+  };
+  scheduled: ScheduledEntry[];
+  fireFirst: () => void;
+}
+
+function makeHarness(overrides: Partial<ApprovalBridgeDeps> = {}): TestHarness {
+  const decisions: ApprovalDecision[] = [];
+  const resolve = vi.fn((decision: ApprovalDecision) => {
+    decisions.push(decision);
+    return true;
+  });
+  const sendMessage = vi.fn(async () => ({ message_id: 99 }));
+  const editMessageText = vi.fn(async () => undefined);
+  const answerCallbackQuery = vi.fn(async () => undefined);
+  const sendTextDocument = vi.fn(async () => ({ message_id: 98 }));
+  const scheduled: ScheduledEntry[] = [];
+  const schedule = (cb: () => void, ms: number): (() => void) => {
+    const entry: ScheduledEntry = { fire: cb, ms, cancelled: false };
+    scheduled.push(entry);
+    return () => {
+      entry.cancelled = true;
+    };
+  };
+  const bridge = new ApprovalBridge({
+    api: {
+      sendMessage,
+      editMessageText,
+      answerCallbackQuery,
+      sendTextDocument,
+    },
+    approvals: { resolve },
+    ownerUserId: 42,
+    logger: new StructuredLogger({ level: "warn", sinks: [] }),
+    schedule,
+    timeoutMs: 1000,
+    ...overrides,
+  });
+  return {
+    bridge,
+    api: { sendMessage, editMessageText, answerCallbackQuery, sendTextDocument },
+    approvals: { resolve, decisions },
+    scheduled,
+    fireFirst: () => {
+      const next = scheduled.find((e) => !e.cancelled);
+      if (!next) throw new Error("no scheduled fire available");
+      next.cancelled = true;
+      next.fire();
+    },
+  };
+}
+
+function req(approvalId = "abc"): ApprovalRequest {
+  return {
+    approvalId,
+    sessionId: "s-1",
+    tool: "os.shell.run",
+    category: "shell",
+    reason: 'skill needs to run "git push"',
+    preview: "git push origin main",
+  };
+}
+
+function callback(
+  approvalId: string,
+  kind: "y" | "n",
+  fromId: number = 42,
+): InboundCallbackUpdate {
+  return {
+    id: "cb-1",
+    from: { id: fromId },
+    message: { chat: { id: 7 }, message_id: 99 },
+    data: `appr:${approvalId}:${kind}`,
+  };
+}
+
+describe("ApprovalBridge.dispatch", () => {
+  it("sends a 2-button inline keyboard with the right callback_data", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    expect(h.api.sendMessage).toHaveBeenCalledTimes(1);
+    const args = h.api.sendMessage.mock.calls[0]!;
+    expect(args[0]).toBe(7);
+    const text = args[1] as string;
+    expect(text).toContain("Approval requested");
+    expect(text).toContain("os.shell.run");
+    // R5: the ladder category is surfaced to the Telegram operator.
+    expect(text).toContain("kind: shell command");
+    expect(text).toContain("git push");
+    const opts = args[2] as { reply_markup: unknown };
+    expect(opts.reply_markup).toEqual({
+      inline_keyboard: [
+        [
+          { text: "✅ Approve", callback_data: "appr:abc:y" },
+          { text: "❌ Deny", callback_data: "appr:abc:n" },
+        ],
+      ],
+    });
+    expect(h.bridge.pendingCount()).toBe(1);
+  });
+
+  // ATO-434: a multi-line command must reach Telegram in full, and one
+  // too long for a single message must still send, saying what it hides.
+  it("shows every line of a multi-line command", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(
+      { ...req("ml"), preview: "echo hi\nmkdir -p out\nrm -rf out/cache" },
+      7,
+    );
+    const text = h.api.sendMessage.mock.calls[0]![1] as string;
+    expect(text).toContain("preview:\n  echo hi\n  mkdir -p out\n  rm -rf out/cache");
+    expect(text).not.toContain("more line");
+  });
+
+  it("keeps an oversized preview inside one message and counts the hidden lines", async () => {
+    const h = makeHarness();
+    const script = Array.from(
+      { length: 400 },
+      (_, i) => `echo ${String(i + 1).padStart(3, "0")} ${"x".repeat(20)}`,
+    ).join("\n");
+    await h.bridge.dispatch(
+      { ...req("big"), preview: script, affectedResources: ["/work"] },
+      7,
+    );
+    const text = h.api.sendMessage.mock.calls[0]![1] as string;
+    expect(text.length).toBeLessThanOrEqual(4096);
+    expect(text).toContain("  echo 001 ");
+    const shown = text.split("\n").filter((l) => l.startsWith("  echo ")).length;
+    expect(shown).toBeGreaterThan(50);
+    expect(text).toContain(`  … +${400 - shown} more lines`);
+    // The resource list after the preview survives the cut.
+    expect(text.endsWith("resources:\n- /work")).toBe(true);
+    expect(h.bridge.pendingCount()).toBe(1);
+  });
+
+  // ATO-876: the lines past the cut could not be read before deciding.
+  describe("full command as a file", () => {
+    const script = Array.from(
+      { length: 400 },
+      (_, i) => `echo ${String(i + 1).padStart(3, "0")} ${"x".repeat(20)}`,
+    );
+    script[398] = "echo safe #\u202e";
+    script[399] = "rm -rf ~ \u001b[8m";
+    const long = script.join("\n");
+    // Every line, with the display-rewriting characters escaped as in
+    // the prompt: a raw right-to-left override would reorder the hidden
+    // lines in the person's text viewer.
+    const visible = [
+      ...script.slice(0, 398),
+      "echo safe #\\u202e",
+      "rm -rf ~ \\x1b[8m",
+    ].join("\n");
+
+    it("sends every line of the preview as a .txt document before a cut prompt", async () => {
+      const h = makeHarness();
+      await h.bridge.dispatch({ ...req("big"), preview: long }, 7, 5);
+      expect(h.api.sendTextDocument).toHaveBeenCalledTimes(1);
+      const [chatId, doc] = h.api.sendTextDocument.mock.calls[0]!;
+      expect(chatId).toBe(7);
+      expect(doc).toEqual({
+        filename: "full-command.txt",
+        content: visible,
+        caption: "Full command (400 lines), for the approval below",
+        threadId: 5,
+      });
+      // The file comes first, so the prompt sits right under it.
+      expect(h.api.sendTextDocument.mock.invocationCallOrder[0]!).toBeLessThan(
+        h.api.sendMessage.mock.invocationCallOrder[0]!,
+      );
+      const text = h.api.sendMessage.mock.calls[0]![1] as string;
+      expect(text).toContain("more lines\n  full command: sent as a file above");
+      expect(text.length).toBeLessThanOrEqual(4096);
+      expect(h.bridge.pendingCount()).toBe(1);
+    });
+
+    it("sends no file when the whole preview fits", async () => {
+      const h = makeHarness();
+      await h.bridge.dispatch(
+        { ...req("ml"), preview: "echo hi\nrm -rf out/cache" },
+        7,
+      );
+      expect(h.api.sendTextDocument).not.toHaveBeenCalled();
+      const text = h.api.sendMessage.mock.calls[0]![1] as string;
+      expect(text).not.toContain("full command");
+    });
+
+    it("says the full command is missing when the upload fails, and still asks", async () => {
+      const h = makeHarness();
+      h.api.sendTextDocument.mockImplementationOnce(async () => {
+        throw new Error("network down");
+      });
+      await h.bridge.dispatch({ ...req("big"), preview: long }, 7);
+      const text = h.api.sendMessage.mock.calls[0]![1] as string;
+      expect(text).toContain(
+        "full command: could not be attached, deny if you cannot check it",
+      );
+      expect(text).not.toContain("sent as a file above");
+      expect(h.approvals.decisions).toEqual([]);
+      expect(h.bridge.pendingCount()).toBe(1);
+    });
+
+    it("says the full command is missing when the bot cannot upload", async () => {
+      const sendMessage = vi.fn(async (..._args: unknown[]) => ({
+        message_id: 99,
+      }));
+      const h = makeHarness({ api: { sendMessage } });
+      await h.bridge.dispatch({ ...req("big"), preview: long }, 7);
+      const text = sendMessage.mock.calls[0]![1] as string;
+      expect(text).toContain("full command: could not be attached");
+    });
+  });
+
+  it("auto-denies immediately when sendMessage rejects", async () => {
+    const h = makeHarness();
+    h.api.sendMessage.mockImplementationOnce(async () => {
+      throw new Error("network down");
+    });
+
+    await h.bridge.dispatch(req("abc"), 7);
+
+    expect(h.approvals.decisions).toEqual([
+      {
+        approvalId: "abc",
+        approved: false,
+        reason: "telegram delivery failed",
+        automatic: true,
+      },
+    ]);
+    expect(h.bridge.pendingCount()).toBe(0);
+    expect(h.scheduled).toHaveLength(0);
+  });
+
+  it("auto-denies when sendMessage returns no message_id", async () => {
+    const h = makeHarness();
+    h.api.sendMessage.mockImplementationOnce(async () => ({}));
+
+    await h.bridge.dispatch(req("abc"), 7);
+
+    expect(h.approvals.decisions).toEqual([
+      {
+        approvalId: "abc",
+        approved: false,
+        reason: "telegram delivery failed",
+        automatic: true,
+      },
+    ]);
+    expect(h.bridge.pendingCount()).toBe(0);
+  });
+
+  it("warns and drops a duplicate dispatch on the same approvalId", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+    await h.bridge.dispatch(req("abc"), 7);
+
+    expect(h.api.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.bridge.pendingCount()).toBe(1);
+  });
+});
+
+describe("ApprovalBridge.handleCallback", () => {
+  it("approves on `y`, resolves the gate, edits the message", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    await h.bridge.handleCallback(callback("abc", "y"));
+
+    expect(h.approvals.decisions).toEqual([
+      { approvalId: "abc", approved: true, reason: "telegram" },
+    ]);
+    expect(h.api.answerCallbackQuery).toHaveBeenCalledWith("cb-1", {
+      text: "Approved",
+    });
+    expect(h.api.editMessageText).toHaveBeenCalledTimes(1);
+    expect(h.api.editMessageText.mock.calls[0]![2]).toBe("✅ approved");
+    expect(h.bridge.pendingCount()).toBe(0);
+  });
+
+  it("denies on `n`, resolves the gate, edits the message", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    await h.bridge.handleCallback(callback("abc", "n"));
+
+    expect(h.approvals.decisions).toEqual([
+      // A person pressed the button, and a button carries no words: no
+      // reason, or the model would read "telegram" as what they said.
+      { approvalId: "abc", approved: false },
+    ]);
+    expect(h.api.editMessageText.mock.calls[0]![2]).toBe("❌ denied");
+  });
+
+  it("drops a non-owner callback silently — no resolve, no edit, no ack", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    await h.bridge.handleCallback(callback("abc", "y", 999));
+
+    expect(h.approvals.decisions).toEqual([]);
+    expect(h.api.editMessageText).not.toHaveBeenCalled();
+    expect(h.api.answerCallbackQuery).not.toHaveBeenCalled();
+    expect(h.bridge.pendingCount()).toBe(1);
+  });
+
+  it("drops every callback when ownerUserId is null", async () => {
+    const h = makeHarness({ ownerUserId: null });
+    await h.bridge.dispatch(req("abc"), 7);
+
+    await h.bridge.handleCallback(callback("abc", "y"));
+
+    expect(h.approvals.decisions).toEqual([]);
+    expect(h.bridge.pendingCount()).toBe(1);
+  });
+
+  it("drops a malformed callback (wrong prefix)", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    await h.bridge.handleCallback({
+      id: "cb-1",
+      from: { id: 42 },
+      data: "other:foo:bar",
+    });
+
+    expect(h.approvals.decisions).toEqual([]);
+  });
+
+  it("drops a malformed callback (wrong kind)", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    await h.bridge.handleCallback({
+      id: "cb-1",
+      from: { id: 42 },
+      data: "appr:abc:maybe",
+    });
+
+    expect(h.approvals.decisions).toEqual([]);
+  });
+
+  it("acknowledges a stale callback without re-resolving", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+    h.fireFirst(); // simulate timeout firing first
+
+    h.approvals.decisions.length = 0; // clear the timeout decision
+    await h.bridge.handleCallback(callback("abc", "y"));
+
+    expect(h.approvals.decisions).toEqual([]); // no new resolve
+    expect(h.api.answerCallbackQuery).toHaveBeenCalledWith("cb-1", {
+      text: "Already resolved",
+    });
+  });
+
+  it("cancels the timer once the button is clicked", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+    expect(h.scheduled).toHaveLength(1);
+    expect(h.scheduled[0]!.cancelled).toBe(false);
+
+    await h.bridge.handleCallback(callback("abc", "y"));
+
+    expect(h.scheduled[0]!.cancelled).toBe(true);
+  });
+});
+
+describe("ApprovalBridge timeout", () => {
+  it("auto-denies after timeoutMs and edits the message", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+
+    h.fireFirst();
+
+    expect(h.approvals.decisions).toEqual([
+      {
+        approvalId: "abc",
+        approved: false,
+        reason: "the approval prompt timed out with no answer",
+        automatic: true,
+      },
+    ]);
+    expect(h.api.editMessageText).toHaveBeenCalledTimes(1);
+    expect(h.api.editMessageText.mock.calls[0]![2]).toBe(
+      "⏱ timed out — auto-denied",
+    );
+    expect(h.bridge.pendingCount()).toBe(0);
+  });
+
+  it("does not edit the message when the gate has already been resolved elsewhere", async () => {
+    const h = makeHarness();
+    h.approvals.resolve.mockReturnValueOnce(false); // simulate already-resolved
+    await h.bridge.dispatch(req("abc"), 7);
+
+    h.fireFirst();
+
+    expect(h.api.editMessageText).not.toHaveBeenCalled();
+  });
+});
+
+describe("ApprovalBridge.cancelAll", () => {
+  it("cancels every pending timer and forgets state without resolving", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("a-1"), 7);
+    await h.bridge.dispatch(req("a-2"), 8);
+    expect(h.bridge.pendingCount()).toBe(2);
+
+    h.bridge.cancelAll();
+
+    expect(h.bridge.pendingCount()).toBe(0);
+    expect(h.scheduled.every((e) => e.cancelled)).toBe(true);
+    expect(h.approvals.decisions).toEqual([]);
+  });
+});
+
+describe("ApprovalBridge across a reconnect", () => {
+  it("rebind() keeps pending approvals, so a click through the new bot resolves them", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+    const answerCallbackQuery = vi.fn(async () => undefined);
+    const editMessageText = vi.fn(async () => undefined);
+
+    h.bridge.rebind(
+      { sendMessage: vi.fn(), answerCallbackQuery, editMessageText },
+      42,
+    );
+    await h.bridge.handleCallback(callback("abc", "y"));
+
+    expect(h.approvals.decisions).toEqual([
+      { approvalId: "abc", approved: true, reason: "telegram" },
+    ]);
+    // Answered and edited through the reconnected bot, not the dead one.
+    expect(answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    expect(h.api.answerCallbackQuery).not.toHaveBeenCalled();
+    expect(h.scheduled[0]!.cancelled).toBe(true);
+  });
+
+  it("rebind() picks up an owner that changed while the channel was down", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+    h.bridge.rebind(h.api as unknown as ApprovalBridgeDeps["api"], 43);
+
+    await h.bridge.handleCallback(callback("abc", "y", 42));
+    expect(h.approvals.decisions).toEqual([]);
+    await h.bridge.handleCallback(callback("abc", "y", 43));
+    expect(h.approvals.decisions).toHaveLength(1);
+  });
+
+  it("expireAll() denies every pending approval at once and stops their timers", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("a-1"), 7);
+    await h.bridge.dispatch(req("a-2"), 8);
+
+    h.bridge.expireAll("telegram channel down");
+
+    expect(h.approvals.decisions).toEqual([
+      { approvalId: "a-1", approved: false, reason: "telegram channel down" },
+      { approvalId: "a-2", approved: false, reason: "telegram channel down" },
+    ]);
+    expect(h.bridge.pendingCount()).toBe(0);
+    expect(h.scheduled.every((e) => e.cancelled)).toBe(true);
+    // A late click is a stale button, never a second resolution.
+    await h.bridge.handleCallback(callback("a-1", "y"));
+    expect(h.approvals.decisions).toHaveLength(2);
+  });
+
+  it("never holds the process open while an approval waits", async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    const h = makeHarness({ schedule: undefined });
+    await h.bridge.dispatch(req("abc"), 7);
+    const timer = setTimeoutSpy.mock.results.at(-1)?.value as NodeJS.Timeout;
+    expect(timer.hasRef()).toBe(false);
+    h.bridge.cancelAll();
+    setTimeoutSpy.mockRestore();
+  });
+});
+
+describe("ApprovalBridge.dispatch — forum topics", () => {
+  it("carries message_thread_id when a topic id is given", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7, 77);
+    const opts = h.api.sendMessage.mock.calls[0]![2] as Record<string, unknown>;
+    expect(opts.message_thread_id).toBe(77);
+    expect(opts.reply_markup).toBeDefined();
+  });
+
+  it("omits message_thread_id for a plain chat", async () => {
+    const h = makeHarness();
+    await h.bridge.dispatch(req("abc"), 7);
+    const opts = h.api.sendMessage.mock.calls[0]![2] as Record<string, unknown>;
+    expect(opts).not.toHaveProperty("message_thread_id");
+  });
+});

@@ -1,0 +1,477 @@
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { loadConfig } from "./load-config.js";
+import { resetConfigCache } from "./config-cache.js";
+import { getUserConfigPath, writeUserConfigFileSync } from "./config-file.js";
+import {
+  ENV_DEFAULTS,
+  USER_CONFIG_DEFAULTS,
+  USER_CONFIG_VERSION,
+} from "./config-schema.js";
+
+describe("loadConfig", () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "atomic-load-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    resetConfigCache();
+  });
+
+  afterEach(() => {
+    rmSync(stateDir, { recursive: true, force: true });
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    delete process.env.ATOMIC_AGENT_LLAMA_API_KEY;
+    delete process.env.ATOMIC_AGENT_LLAMA_MAX_TOKENS;
+    delete process.env.ATOMIC_AGENT_BROWSER_CHANNEL;
+    delete process.env.ATOMIC_AGENT_GRAMMARS_DIR;
+    delete process.env.ATOMIC_AGENT_SKILLS_CATALOG_BUDGET;
+    delete process.env.ATOMIC_LOADCONFIG_TEST_KEY;
+    resetConfigCache();
+    vi.restoreAllMocks();
+  });
+
+  it("creates a defaults-only config on first run", () => {
+    const config = loadConfig();
+    const path = getUserConfigPath(stateDir);
+    expect(existsSync(path)).toBe(true);
+    const written = JSON.parse(readFileSync(path, "utf8"));
+    expect(written.version).toBe(USER_CONFIG_VERSION);
+    expect(config.localModels.url).toBe("http://127.0.0.1:9931");
+    expect(config.localModels.completionMaxTokens).toBe(16_384);
+    expect(config.log.level).toBe("info");
+    expect(config.agent.approvalLevel).toBe(1);
+    // The transcript caps a first run is written with: auto (the window
+    // decides) and two hundred pairs.
+    expect(config.agent.conversationMaxTokens).toBe(0);
+    expect(config.agent.conversationMaxPairs).toBe(200);
+    expect(written.agent.conversationMaxTokens).toBe(0);
+    expect(written.agent.conversationMaxPairs).toBe(200);
+    // The session-sections cap ships on its sentinel, so a first run
+    // keeps the `tokenBudget * 0.15` share it always had.
+    expect(config.agent.sessionSectionsMaxTokens).toBe(0);
+    expect(written.agent.sessionSectionsMaxTokens).toBe(0);
+  });
+
+  /**
+   * File-only, exactly like `worldSnapshotMaxTokens` and
+   * `conversationMaxTokens`: the prompt-section caps are a config-file
+   * surface, and inventing an env override for one of the three would
+   * make the set inconsistent to reason about.
+   */
+  it("reads agent.sessionSectionsMaxTokens from the file only", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      agent: { ...USER_CONFIG_DEFAULTS.agent, sessionSectionsMaxTokens: 4096 },
+    });
+    resetConfigCache();
+    expect(loadConfig().agent.sessionSectionsMaxTokens).toBe(4096);
+    process.env.ATOMIC_AGENT_SESSION_SECTIONS_MAX_TOKENS = "99";
+    resetConfigCache();
+    try {
+      expect(loadConfig().agent.sessionSectionsMaxTokens).toBe(4096);
+    } finally {
+      delete process.env.ATOMIC_AGENT_SESSION_SECTIONS_MAX_TOKENS;
+    }
+  });
+
+  it("maps ATOMIC_AGENT_LLAMA_MAX_TOKENS to completionMaxTokens with bounds", () => {
+    process.env.ATOMIC_AGENT_LLAMA_MAX_TOKENS = "8192";
+    resetConfigCache();
+    expect(loadConfig().localModels.completionMaxTokens).toBe(8192);
+    process.env.ATOMIC_AGENT_LLAMA_MAX_TOKENS = "10";
+    resetConfigCache();
+    expect(loadConfig().localModels.completionMaxTokens).toBe(64);
+    process.env.ATOMIC_AGENT_LLAMA_MAX_TOKENS = "999999999";
+    resetConfigCache();
+    expect(loadConfig().localModels.completionMaxTokens).toBe(131_072);
+  });
+
+  it("gives the first token its own budget, longer than the idle timeout", () => {
+    // A fusion worker queued behind busy slots on a shared GPU waits
+    // minutes for its first byte; the 300 s idle budget killed it.
+    const config = loadConfig();
+    expect(config.localModels.firstTokenTimeoutMs).toBe(
+      ENV_DEFAULTS.FIRST_TOKEN_TIMEOUT_MS,
+    );
+    expect(config.localModels.firstTokenTimeoutMs).toBeGreaterThan(
+      config.localModels.requestTimeoutMs,
+    );
+    process.env.ATOMIC_AGENT_LLAMA_FIRST_TOKEN_TIMEOUT_MS = "90000";
+    try {
+      resetConfigCache();
+      expect(loadConfig().localModels.firstTokenTimeoutMs).toBe(90_000);
+    } finally {
+      delete process.env.ATOMIC_AGENT_LLAMA_FIRST_TOKEN_TIMEOUT_MS;
+    }
+  });
+
+  it("clamps ATOMIC_AGENT_SKILLS_CATALOG_BUDGET to a positive range", () => {
+    // The budget multiplies into the skill catalog's char cap; 0 or a
+    // negative value would collapse the catalog, so the loader clamps.
+    expect(loadConfig().skills.catalogTokenBudget).toBe(
+      ENV_DEFAULTS.SKILLS_CATALOG_BUDGET,
+    );
+    process.env.ATOMIC_AGENT_SKILLS_CATALOG_BUDGET = "0";
+    resetConfigCache();
+    expect(loadConfig().skills.catalogTokenBudget).toBe(1);
+    process.env.ATOMIC_AGENT_SKILLS_CATALOG_BUDGET = "-64";
+    resetConfigCache();
+    expect(loadConfig().skills.catalogTokenBudget).toBe(1);
+    process.env.ATOMIC_AGENT_SKILLS_CATALOG_BUDGET = "999999999";
+    resetConfigCache();
+    expect(loadConfig().skills.catalogTokenBudget).toBe(100_000);
+    process.env.ATOMIC_AGENT_SKILLS_CATALOG_BUDGET = "2048";
+    resetConfigCache();
+    expect(loadConfig().skills.catalogTokenBudget).toBe(2048);
+  });
+
+  // Issue #466: `skills.catalogTokenBudget` was env-only. A config.json
+  // carrying the key parsed clean and changed nothing, which is how the
+  // catalog stayed clipped for operators who thought they had raised it.
+  it("reads skills.catalogTokenBudget from the user config file", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      skills: { ...USER_CONFIG_DEFAULTS.skills, catalogTokenBudget: 2048 },
+    });
+    resetConfigCache();
+    expect(loadConfig().skills.catalogTokenBudget).toBe(2048);
+  });
+
+  it("ATOMIC_AGENT_SKILLS_CATALOG_BUDGET overrides the file value", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      skills: { ...USER_CONFIG_DEFAULTS.skills, catalogTokenBudget: 2048 },
+    });
+    process.env.ATOMIC_AGENT_SKILLS_CATALOG_BUDGET = "4096";
+    resetConfigCache();
+    expect(loadConfig().skills.catalogTokenBudget).toBe(4096);
+  });
+
+  it("reads localModels.completionMaxTokens from the user config file", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        completionMaxTokens: 8192,
+      },
+    });
+    resetConfigCache();
+    expect(loadConfig().localModels.completionMaxTokens).toBe(8192);
+  });
+
+  it("ATOMIC_AGENT_LLAMA_MAX_TOKENS overrides the file value", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        completionMaxTokens: 8192,
+      },
+    });
+    process.env.ATOMIC_AGENT_LLAMA_MAX_TOKENS = "16384";
+    resetConfigCache();
+    expect(loadConfig().localModels.completionMaxTokens).toBe(16_384);
+  });
+
+  describe("localModels.apiKey (#582)", () => {
+    function writeMode(mode: "managed" | "external"): void {
+      writeUserConfigFileSync(getUserConfigPath(stateDir), {
+        ...USER_CONFIG_DEFAULTS,
+        localModels: { ...USER_CONFIG_DEFAULTS.localModels, mode },
+      });
+      resetConfigCache();
+    }
+
+    it("managed mode: the key persisted next to the daemon's pid file, stable across loads", () => {
+      writeMode("managed");
+      const config = loadConfig();
+      const keyFile = join(config.paths.localModelsDataDir, "llama-server.key");
+      const key = config.localModels.apiKey;
+      expect(key).toMatch(/^[0-9a-f]{64}$/);
+      expect(readFileSync(keyFile, "utf8").trim()).toBe(key);
+      resetConfigCache();
+      expect(loadConfig().localModels.apiKey).toBe(key);
+    });
+
+    it("managed mode: ATOMIC_AGENT_LLAMA_API_KEY wins over the generated key", () => {
+      writeMode("managed");
+      process.env.ATOMIC_AGENT_LLAMA_API_KEY = "operator-key";
+      resetConfigCache();
+      expect(loadConfig().localModels.apiKey).toBe("operator-key");
+    });
+
+    it("external mode pointed at the managed daemon keeps the daemon's key (switch from managed)", () => {
+      writeMode("managed");
+      const managedKey = loadConfig().localModels.apiKey;
+      // What the TUI persists when the operator moves to external mode
+      // on a daemon they started with `atomic-agent models start`.
+      writeUserConfigFileSync(getUserConfigPath(stateDir), {
+        ...USER_CONFIG_DEFAULTS,
+        localModels: {
+          ...USER_CONFIG_DEFAULTS.localModels,
+          mode: "external",
+          url: "http://127.0.0.1:19091",
+        },
+      });
+      resetConfigCache();
+      expect(managedKey).toMatch(/^[0-9a-f]{64}$/);
+      expect(loadConfig().localModels.apiKey).toBe(managedKey);
+    });
+
+    it("external mode: no key is invented for someone else's server", () => {
+      writeMode("external");
+      const config = loadConfig();
+      expect(config.localModels.apiKey).toBeNull();
+      expect(
+        existsSync(join(config.paths.localModelsDataDir, "llama-server.key")),
+      ).toBe(false);
+    });
+  });
+
+  it("reads values from an existing user config file", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        url: "http://llama.internal:4444",
+      },
+      log: { level: "debug" },
+      agent: {
+        ...USER_CONFIG_DEFAULTS.agent,
+        tokenBudget: 3000,
+        maxSteps: 42,
+        toolTimeoutMs: 12_000,
+        approvalLevel: 5,
+      },
+      tools: {
+        shell: {
+          defaultTimeoutMs: 1_800_000,
+          jobMaxMs: 7_200_000,
+          maxJobs: 5,
+          envPassthrough: ["GITHUB_TOKEN"],
+        },
+        screen: { enabled: false },
+      },
+    });
+    const config = loadConfig();
+    expect(config.localModels.url).toBe("http://llama.internal:4444");
+    expect(config.log.level).toBe("debug");
+    expect(config.agent.maxSteps).toBe(42);
+    expect(config.agent.toolTimeoutMs).toBe(12_000);
+    expect(config.agent.approvalLevel).toBe(5);
+    expect(config.tools.shell).toEqual({
+      defaultTimeoutMs: 1_800_000,
+      jobMaxMs: 7_200_000,
+      maxJobs: 5,
+      envPassthrough: ["GITHUB_TOKEN"],
+    });
+  });
+
+  it("maps llm.runMode from the file onto the runtime config", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      llm: {
+        activeTextProvider: "openrouter",
+        activeEmbeddingProvider: "local-llama",
+        toolTransport: "auto",
+        providers: [
+          {
+            id: "local-llama",
+            kind: "llama-server",
+            url: "http://127.0.0.1:19091",
+          },
+          { id: "openrouter", kind: "openrouter", defaultChatModel: "gpt" },
+        ],
+        runMode: { mode: "fusion", fusion: { workers: 3 } },
+      },
+    });
+    expect(loadConfig().llm?.runMode).toEqual({
+      mode: "fusion",
+      fusion: { workers: 3 },
+    });
+  });
+
+  it("maps llm.openrouter from the file onto the runtime config (#548)", () => {
+    // The provider factory reads `config.llm.openrouter.preferCacheRoutes`
+    // and treats absence as `true`; dropping the block here made `false`
+    // in the file a no-op.
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      llm: {
+        activeTextProvider: "openrouter",
+        activeEmbeddingProvider: "local-llama",
+        toolTransport: "auto",
+        providers: [
+          {
+            id: "local-llama",
+            kind: "llama-server",
+            url: "http://127.0.0.1:19091",
+          },
+          { id: "openrouter", kind: "openrouter", defaultChatModel: "gpt" },
+        ],
+        openrouter: { preferCacheRoutes: false },
+      },
+    });
+    expect(loadConfig().llm?.openrouter).toEqual({ preferCacheRoutes: false });
+  });
+
+  it("keeps non-user-facing knobs on environment variables", () => {
+    process.env.ATOMIC_AGENT_LLAMA_API_KEY = "secret";
+    process.env.ATOMIC_AGENT_BROWSER_CHANNEL = "msedge";
+    const config = loadConfig();
+    expect(config.localModels.apiKey).toBe("secret");
+    expect(config.browser.channel).toBe("msedge");
+  });
+
+  it("paths point at the state dir and config file", () => {
+    const config = loadConfig();
+    expect(config.paths.stateDir).toBe(stateDir);
+    expect(config.paths.userConfigFile).toBe(getUserConfigPath(stateDir));
+    expect(config.paths.browserProfileDir).toBe(
+      join(stateDir, "browser-profile"),
+    );
+    expect(config.paths.tracesDir).toBe(join(stateDir, "traces"));
+  });
+
+  it("surfaces sessions.retention, off, with the file's caps", () => {
+    expect(loadConfig().sessions.retention).toEqual({
+      enabled: false,
+      maxAgeDays: 90,
+      maxRows: null,
+    });
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      sessions: { retention: { enabled: true, maxAgeDays: null, maxRows: 250 } },
+    });
+    resetConfigCache();
+    expect(loadConfig().sessions.retention).toEqual({
+      enabled: true,
+      maxAgeDays: null,
+      maxRows: 250,
+    });
+  });
+
+  it("tracing.trace defaults expose the per-session NDJSON dir", () => {
+    const config = loadConfig();
+    expect(config.tracing.trace.enabled).toBeNull();
+    expect(config.tracing.trace.dir).toBe(join(stateDir, "traces"));
+    expect(config.tracing.trace.maxBytesPerSession).toBe(10 * 1024 * 1024);
+  });
+
+  it("honours user-pinned tracing.trace.enabled", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      tracing: { trace: { enabled: false, maxBytesPerSession: 4096 } },
+    });
+    const config = loadConfig();
+    expect(config.tracing.trace.enabled).toBe(false);
+    expect(config.tracing.trace.maxBytesPerSession).toBe(4096);
+  });
+
+  it("overrides localModels.url to localhost when mode is managed", () => {
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        url: "http://127.0.0.1:8080",
+        mode: "managed",
+        managed: {
+          ...USER_CONFIG_DEFAULTS.localModels.managed,
+          port: 19_000,
+        },
+      },
+    });
+    resetConfigCache();
+    const config = loadConfig();
+    expect(config.localModels.mode).toBe("managed");
+    expect(config.localModels.url).toBe("http://127.0.0.1:19000");
+    expect(config.paths.localModelsDataDir).toBe(join(stateDir, "models"));
+  });
+
+  it("carries the .env load outcome as config.dotenv", () => {
+    delete process.env.ATOMIC_LOADCONFIG_TEST_KEY;
+    writeFileSync(
+      join(stateDir, ".env"),
+      "ATOMIC_LOADCONFIG_TEST_KEY=from-file\n",
+      "utf8",
+    );
+
+    const config = loadConfig();
+
+    expect(config.dotenv.path).toBe(join(stateDir, ".env"));
+    expect(config.dotenv.exists).toBe(true);
+    expect(config.dotenv.loaded).toContain("ATOMIC_LOADCONFIG_TEST_KEY");
+    expect(config.dotenv.error).toBeNull();
+    expect(process.env.ATOMIC_LOADCONFIG_TEST_KEY).toBe("from-file");
+  });
+
+  it("reports an unreadable .env in config.dotenv.error without throwing", () => {
+    // A directory named `.env` is the portable stand-in for a file that
+    // exists but cannot be read: readFileSync fails with EISDIR on POSIX
+    // and an access-denied flavour on Windows. Real EPERM needs ACL
+    // tricks that do not survive root test runs or CI images.
+    mkdirSync(join(stateDir, ".env"));
+
+    const config = loadConfig();
+
+    expect(config.dotenv.exists).toBe(false);
+    expect(config.dotenv.loaded).toEqual([]);
+    expect(config.dotenv.error).not.toBeNull();
+    expect(config.dotenv.error?.code).toMatch(/^(EISDIR|EACCES|EPERM)$/);
+    expect(config.dotenv.error?.attempts).toBeGreaterThanOrEqual(1);
+  });
+
+  it("uses localModelsDataDir override when set", () => {
+    const override = join(stateDir, "custom-local-llm");
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...USER_CONFIG_DEFAULTS,
+      localModels: {
+        ...USER_CONFIG_DEFAULTS.localModels,
+        managed: {
+          ...USER_CONFIG_DEFAULTS.localModels.managed,
+          dataDirOverride: override,
+        },
+      },
+    });
+    resetConfigCache();
+    expect(loadConfig().paths.localModelsDataDir).toBe(override);
+  });
+
+  it("resolves grammarsDir without consulting the working directory", () => {
+    // The Ctrl+N "new terminal window" spawn starts the agent by absolute
+    // path from the operator's home, so cwd holds no `grammars/` and the
+    // old cwd-relative default died on ENOENT tool-call.gbnf. Standing in
+    // an empty temp dir reproduces exactly that shape.
+    const elsewhere = mkdtempSync(join(tmpdir(), "atomic-cwd-"));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(elsewhere);
+      resetConfigCache();
+      const grammarsDir = loadConfig().paths.grammarsDir;
+      expect(grammarsDir.startsWith(elsewhere)).toBe(false);
+      expect(existsSync(join(grammarsDir, "tool-call.gbnf"))).toBe(true);
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it("still lets ATOMIC_AGENT_GRAMMARS_DIR win over the packaged copy", () => {
+    const override = join(stateDir, "custom-grammars");
+    mkdirSync(override);
+    process.env.ATOMIC_AGENT_GRAMMARS_DIR = override;
+    resetConfigCache();
+    expect(loadConfig().paths.grammarsDir).toBe(override);
+  });
+});

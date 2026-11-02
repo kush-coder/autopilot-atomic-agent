@@ -1,0 +1,316 @@
+import { describeReason } from "./describe-reason.js";
+import type { FailedAttempt } from "./failed-attempts.js";
+import type { ResolvedFallbackChain } from "./fallback-config.js";
+import { falloverCause } from "./link-failure-kind.js";
+import {
+  logFallbackAdvance,
+  type FallbackLogger,
+} from "./log-fallback-advance.js";
+import {
+  clearOverride,
+  freshBreaker,
+  freshPartition,
+  isStandIn,
+  registerBreakerFailure,
+  type BreakerEntry,
+  type PartitionState,
+} from "./partition-state.js";
+import { shouldAdvance } from "./should-advance.js";
+
+/** Emitted once per state transition; wired to an `AgentLoopEvent` by bootstrap. */
+export interface ProviderSwitchNotice {
+  direction: "away" | "back";
+  from: string;
+  to: string;
+  reason: string;
+  /**
+   * What the failure behind an "away" was, read off the error itself
+   * (`falloverCause`), when it is a cloud provider's answer. The reason
+   * text is cut short and can read a rate limit as billing; this cannot.
+   */
+  cause?: "billing" | "auth" | "other";
+}
+
+/** What `pickProvider` decided for the turn about to run. */
+export interface ProviderPick {
+  /** Provider id to route this turn through. */
+  providerId: string;
+  /** True when this turn is a throttled probe of the primary. */
+  isProbe: boolean;
+}
+
+export interface FallbackChainOptions {
+  /** Live resolver — re-read each turn so config hot-swaps take effect. */
+  resolve: () => ResolvedFallbackChain;
+  /** Injectable clock; defaults to `Date.now`. */
+  now?: () => number;
+  /** One-shot state-change notices (switch away / switch back). */
+  noticeSink?: (notice: ProviderSwitchNotice) => void;
+  /** Every advance, logged at `warn` — see `logFallbackAdvance`. */
+  logger?: FallbackLogger;
+}
+
+/**
+ * The default partition key. Callers that do not pass one (most tests,
+ * and any non-session-scoped caller) share this single partition — the
+ * pre-partitioning behaviour, preserved verbatim.
+ */
+const DEFAULT_PARTITION = "";
+
+/**
+ * Cross-provider circuit breaker layered over the single-provider
+ * reliability slice. Owns no timer: every decision is computed lazily
+ * from the wall clock at the moment a turn asks for a provider (see
+ * ../docs/fallback.md — lazy probe carve-out).
+ *
+ * The wrapper that drives real completions calls, per turn:
+ *   1. `pickProvider()` once, to choose the starting provider;
+ *   2. on a failure, `advanceFrom(id, err)` to get the next link (or null
+ *      when the chain is exhausted or the error is not fallover-worthy);
+ *   3. `recordSuccess(id, wasProbe)` when a provider answers.
+ */
+export class ProviderFallbackChain {
+  private readonly resolve: () => ResolvedFallbackChain;
+  private readonly now: () => number;
+  private readonly noticeSink?: (notice: ProviderSwitchNotice) => void;
+  private readonly logger?: FallbackLogger;
+
+  /**
+   * Breaker state partitioned by key (session id). One shared chain
+   * instance serves the main loop and every sub-runner across all
+   * concurrent sessions; without partitioning, one session's success
+   * would reset a cooldown another session just armed, and their failure
+   * counters would cross-contaminate. Each partition is fully isolated.
+   */
+  private readonly partitions = new Map<string, PartitionState>();
+
+  constructor(options: FallbackChainOptions) {
+    this.resolve = options.resolve;
+    this.now = options.now ?? Date.now;
+    if (options.noticeSink) this.noticeSink = options.noticeSink;
+    if (options.logger) this.logger = options.logger;
+  }
+
+  /**
+   * Choose the provider for the turn about to start, for partition
+   * `partitionKey` (default = the shared partition). Resolves the live
+   * chain, drops a stale override that no longer names a chain member,
+   * and — when the primary's cooldown has elapsed and the probe throttle
+   * allows — routes this one turn back to the primary as a probe. A
+   * stand-in (`isStandIn`) is probed past at once, cooldown or not.
+   */
+  pickProvider(partitionKey: string = DEFAULT_PARTITION): ProviderPick {
+    const { chain } = this.resolve();
+    const primary = chain[0];
+    if (!primary) {
+      // Degenerate: no configured chain. Caller will surface its own
+      // "no provider" error; return a harmless sentinel.
+      return { providerId: "", isProbe: false };
+    }
+
+    const p = this.partition(partitionKey);
+
+    // A user hot-swap (new primary) or a chain edit that dropped the
+    // override provider drops the override entirely.
+    if (p.overrideId && !chain.includes(p.overrideId)) {
+      clearOverride(p);
+    }
+
+    if (!p.overrideId) {
+      return { providerId: primary, isProbe: false };
+    }
+
+    // On an override: consider probing the primary.
+    const now = this.now();
+    const b = this.breaker(p, primary);
+    if (isStandIn(p)) {
+      b.lastProbeAt = now;
+      return { providerId: primary, isProbe: true };
+    }
+    const cooledDown = now >= b.cooldownUntil;
+    const throttleOk =
+      now - b.lastProbeAt >= this.resolve().timing.probeThrottleMs;
+    if (cooledDown && throttleOk) {
+      b.lastProbeAt = now;
+      return { providerId: primary, isProbe: true };
+    }
+    return { providerId: p.overrideId, isProbe: false };
+  }
+
+  /**
+   * A failure hit `fromId` in partition `partitionKey`. Update its breaker
+   * and return the next provider to try this turn, or null when there is
+   * nothing left to try (chain exhausted) or the error is not
+   * fallover-worthy.
+   */
+  advanceFrom(
+    fromId: string,
+    err: unknown,
+    partitionKey: string = DEFAULT_PARTITION,
+  ): string | null {
+    const decision = shouldAdvance(err);
+    if (!decision.advance) return null;
+
+    const { chain, timing } = this.resolve();
+    const p = this.partition(partitionKey);
+    registerBreakerFailure(
+      this.breaker(p, fromId),
+      this.now(),
+      decision.immediate,
+      timing,
+    );
+
+    const idx = chain.indexOf(fromId);
+    // Next healthy link after `fromId`. When `fromId` is not in the chain
+    // (raced config edit) start from the top.
+    const startFrom = idx < 0 ? 0 : idx + 1;
+    for (let i = startFrom; i < chain.length; i += 1) {
+      const candidate = chain[i]!;
+      if (candidate === fromId) continue;
+      logFallbackAdvance(this.logger, {
+        from: fromId,
+        to: candidate,
+        error: err,
+        sessionId: partitionKey,
+      });
+      this.switchAwayTo(p, chain[0]!, fromId, candidate, err);
+      return candidate;
+    }
+    return null;
+  }
+
+  /**
+   * A provider answered in partition `partitionKey`. Clear its breaker;
+   * fold a successful probe back to primary.
+   */
+  recordSuccess(
+    id: string,
+    wasProbe: boolean,
+    partitionKey: string = DEFAULT_PARTITION,
+  ): void {
+    const p = this.partition(partitionKey);
+    const b = this.breaker(p, id);
+    b.consecutiveFailures = 0;
+    b.cooldownUntil = 0;
+    b.cooldownStep = 0;
+    b.lastFailureAt = 0;
+    if (id === p.overrideId) {
+      p.overrideServed = true;
+      p.fallbackServed = true;
+      p.servingId = id;
+    }
+
+    const { chain } = this.resolve();
+    const primary = chain[0];
+    if (wasProbe && id === primary && p.overrideId) {
+      const from = p.overrideId;
+      clearOverride(p);
+      this.emit({
+        direction: "back",
+        from,
+        to: id,
+        reason: "primary recovered",
+      });
+    }
+  }
+
+  /** Test/inspection hook: sticky override on the shared partition. */
+  get activeOverride(): string | null {
+    return this.partitions.get(DEFAULT_PARTITION)?.overrideId ?? null;
+  }
+
+  /** Test/inspection hook: sticky override on a specific partition. */
+  activeOverrideFor(partitionKey: string): string | null {
+    return this.partitions.get(partitionKey)?.overrideId ?? null;
+  }
+
+  /** Why `partitionKey` is on an override: the primary's latest failure. */
+  overrideCause(partitionKey = DEFAULT_PARTITION): FailedAttempt | null {
+    return this.partitions.get(partitionKey)?.overrideCause ?? null;
+  }
+
+  /** Whether `id` heads the live chain: the provider the user picked. */
+  isPrimary(id: string): boolean {
+    return this.resolve().chain[0] === id;
+  }
+
+  /** Whether a fallback has served `partitionKey` since it left the primary. */
+  hasFallbackServed(partitionKey = DEFAULT_PARTITION): boolean {
+    return this.partitions.get(partitionKey)?.fallbackServed ?? false;
+  }
+
+  /**
+   * Whether `id` is the fallback `partitionKey` has been running on: the
+   * link that answered last since the chain left the primary.
+   */
+  isServingFallback(id: string, partitionKey = DEFAULT_PARTITION): boolean {
+    const servingId = this.partitions.get(partitionKey)?.servingId ?? null;
+    return servingId !== null && servingId === id;
+  }
+
+  /** The override the next call starts on (no stand-in), for the route note. */
+  standingOverrideFor(partitionKey: string): string | null {
+    const p = this.partitions.get(partitionKey);
+    if (!p?.overrideId) return null;
+    return isStandIn(p) ? null : p.overrideId;
+  }
+
+  private switchAwayTo(
+    p: PartitionState,
+    primary: string,
+    fromId: string,
+    toId: string,
+    err: unknown,
+  ): void {
+    // Only the first hop off the primary flips the sticky override and
+    // announces; deeper hops within the same turn stay silent.
+    if (fromId === primary && !p.overrideId) {
+      p.overrideId = toId;
+      p.announcedOverride = false;
+      p.overrideServed = false;
+      p.fallbackServed = false;
+      p.servingId = null;
+    } else if (p.overrideId) {
+      // Chain continued past a dead deeper link — keep the override
+      // pointed at the newest working candidate.
+      p.overrideId = toId;
+      p.overrideServed = false;
+    }
+    if (fromId === primary && p.overrideId) {
+      p.overrideCause = { providerId: fromId, error: err };
+    }
+    if (!p.announcedOverride) {
+      p.announcedOverride = true;
+      const cause = falloverCause(err);
+      this.emit({
+        direction: "away",
+        from: fromId,
+        to: toId,
+        reason: describeReason(err),
+        ...(cause !== undefined ? { cause } : {}),
+      });
+    }
+  }
+
+  private partition(key: string): PartitionState {
+    let p = this.partitions.get(key);
+    if (!p) {
+      p = freshPartition();
+      this.partitions.set(key, p);
+    }
+    return p;
+  }
+
+  private breaker(p: PartitionState, id: string): BreakerEntry {
+    let b = p.breakers.get(id);
+    if (!b) {
+      b = freshBreaker();
+      p.breakers.set(id, b);
+    }
+    return b;
+  }
+
+  private emit(notice: ProviderSwitchNotice): void {
+    this.noticeSink?.(notice);
+  }
+}

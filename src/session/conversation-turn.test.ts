@@ -1,0 +1,957 @@
+import { describe, it, expect } from "vitest";
+import {
+  appendTurn,
+  assistantReplyTurn,
+  assistantToolCallTurn,
+  findCurrentMacroTurnStart,
+  findReadRepeats,
+  isFinalReplyTurn,
+  isStoppedTurnMarker,
+  macroTurnBoundaries,
+  packConversation,
+  pairTokenCosts,
+  readRepeatRefs,
+  renderToolResultBody,
+  renderTurnForPrompt,
+  STOPPED_TURN_MARKER_TEXT,
+  stoppedTurnMarker,
+  toolResultTurn,
+  trimTurnsToTokens,
+  userTurn,
+  type ConversationTurn,
+  type ReadTurnIdentity,
+} from "./conversation-turn.js";
+import { estimateTokens } from "../prompt/token-budget.js";
+
+describe("conversation-turn helpers", () => {
+  it("builds typed turns with expected fields", () => {
+    const u = userTurn("hi", 1);
+    expect(u).toEqual({ kind: "user", text: "hi", at: 1 });
+
+    const call = assistantToolCallTurn({
+      tool: "browser.navigate",
+      args: { url: "https://example.com" },
+      reasoning: "thinking",
+      at: 2,
+    });
+    expect(call).toEqual({
+      kind: "assistant_tool_call",
+      tool: "browser.navigate",
+      args: { url: "https://example.com" },
+      reasoning: "thinking",
+      at: 2,
+    });
+
+    const noReasoning = assistantToolCallTurn({
+      tool: "finish",
+      args: {},
+      at: 3,
+    });
+    expect(noReasoning).not.toHaveProperty("reasoning");
+
+    const res = toolResultTurn({
+      tool: "browser.navigate",
+      status: "ok",
+      summary: "navigated",
+      truncated: true,
+      at: 4,
+    });
+    expect(res).toEqual({
+      kind: "tool_result",
+      tool: "browser.navigate",
+      status: "ok",
+      summary: "navigated",
+      truncated: true,
+      at: 4,
+    });
+
+    const reply = assistantReplyTurn("done", 5);
+    expect(reply).toEqual({ kind: "assistant_reply", text: "done", at: 5 });
+  });
+
+  it("carries reply attachments on the turn and in the prompt line", () => {
+    const reply = assistantReplyTurn("sent", {
+      at: 6,
+      attachments: ["/tmp/a.pdf", "/tmp/b.png"],
+    });
+    expect(reply).toEqual({
+      kind: "assistant_reply",
+      text: "sent",
+      at: 6,
+      attachments: ["/tmp/a.pdf", "/tmp/b.png"],
+    });
+    expect(renderTurnForPrompt(reply)).toBe(
+      "assistant: sent (attached: /tmp/a.pdf, /tmp/b.png)",
+    );
+    // An empty list is the same as none — no stray field, no suffix.
+    expect(assistantReplyTurn("x", { at: 7, attachments: [] })).toEqual({
+      kind: "assistant_reply",
+      text: "x",
+      at: 7,
+    });
+  });
+
+  it("renders each turn kind as a single line", () => {
+    expect(renderTurnForPrompt(userTurn("hello", 1))).toBe("user: hello");
+    expect(
+      renderTurnForPrompt(
+        assistantToolCallTurn({ tool: "finish", args: { x: 1 }, at: 2 }),
+      ),
+    ).toBe('assistant_tool_call: finish {"x":1}');
+    expect(
+      renderTurnForPrompt(
+        toolResultTurn({
+          tool: "os.fs.read",
+          status: "ok",
+          summary: "42 bytes",
+          at: 3,
+        }),
+      ),
+    ).toBe("tool_result[os.fs.read ok]: 42 bytes");
+    expect(
+      renderTurnForPrompt(
+        toolResultTurn({
+          tool: "os.fs.read",
+          status: "error",
+          summary: "nope",
+          truncated: true,
+          at: 3,
+        }),
+      ),
+    ).toBe("tool_result[os.fs.read error]: nope (truncated)");
+    expect(renderTurnForPrompt(assistantReplyTurn("there", 4))).toBe(
+      "assistant: there",
+    );
+  });
+
+  it("renders assistant turns in editorialised form (no reasoning leak)", () => {
+    expect(
+      renderTurnForPrompt(
+        assistantToolCallTurn({ tool: "finish", args: { x: 1 }, at: 2 }),
+      ),
+    ).toBe('assistant_tool_call: finish {"x":1}');
+    expect(renderTurnForPrompt(assistantReplyTurn("there", 4))).toBe(
+      "assistant: there",
+    );
+  });
+
+  it("caps oversized tool_result summaries at render time", () => {
+    const big = "x".repeat(20_000);
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.fs.read_document",
+        status: "ok",
+        summary: big,
+        at: 5,
+      }),
+    );
+    // The cap is 8000 chars minus a tail for the truncation marker, so the
+    // rendered block stays below the full 20k summary.
+    expect(rendered.length).toBeLessThan(big.length);
+    expect(rendered.length).toBeLessThanOrEqual(
+      "tool_result[os.fs.read_document ok]: ".length + 8000,
+    );
+    expect(rendered.startsWith("tool_result[os.fs.read_document ok]: ")).toBe(
+      true,
+    );
+    expect(rendered).toContain("[rendering-truncated");
+  });
+
+  it("cuts an oversized os.fs.read on a line boundary and names the range to read next", () => {
+    // ~26K chars against the 8000-char render cap, so the cut is certain.
+    const TOTAL_LINES = 600;
+    const fileLines = Array.from(
+      { length: TOTAL_LINES },
+      (_, i) => `const line${i + 1} = "${"x".repeat(24)}";`,
+    );
+    const summary = fileLines.join("\n");
+    expect(summary.length).toBeGreaterThan(3 * 8000);
+    const prefix = "tool_result[os.fs.read ok]: ";
+    const render = (readStartLine?: number) =>
+      renderTurnForPrompt(
+        toolResultTurn({ tool: "os.fs.read", status: "ok", summary, at: 5 }),
+        { readStartLine },
+      );
+
+    const fromTop = render(1);
+    const body = fromTop.slice(prefix.length).split("\n");
+    const hint = body.pop()!;
+    const shown = body.length;
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(TOTAL_LINES);
+    expect(fromTop.length).toBeLessThanOrEqual(prefix.length + 8000);
+    expect(body).toEqual(fileLines.slice(0, shown));
+    expect(hint).toContain(`${TOTAL_LINES - shown} more lines are not shown`);
+    expect(hint).toContain(`offset: ${shown + 1} and limit: ${shown}`);
+    expect(fromTop).not.toContain("[rendering-truncated");
+
+    expect(render(120)).toContain(`offset: ${120 + shown} and limit: ${shown}`);
+    expect(render()).toContain("the line after the last one shown as `offset`");
+  });
+
+  it("falls back to a character cut for an os.fs.read with no usable line break", () => {
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.fs.read",
+        status: "ok",
+        summary: "x".repeat(20_000),
+        at: 5,
+      }),
+      { readStartLine: 1 },
+    );
+    expect(rendered).toContain("[rendering-truncated");
+    expect(rendered.length).toBeLessThanOrEqual(
+      "tool_result[os.fs.read ok]: ".length + 8000,
+    );
+  });
+
+  it("renders fresh os.http.request results uncapped", () => {
+    const big = "x".repeat(10_000);
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.http.request",
+        status: "ok",
+        summary: big,
+        at: 7,
+      }),
+      { inCurrentMacroTurn: true },
+    );
+    expect(rendered).toBe(`tool_result[os.http.request ok]: ${big}`);
+    expect(rendered).not.toContain("[rendering-truncated");
+  });
+
+  // A listing summary is budgeted by `listingResultCaps` and can reach
+  // the full 8 000-char ceiling. Without the fresh-body entry that
+  // width would sit in `### conversation` for the rest of the session;
+  // with it the model gets the rows on the turn that has to choose
+  // from them, and history pays the same ~400 chars it always did.
+  it("gives the listing tools their rows fresh and 400 chars once aged", () => {
+    const listing = `PID      PPID     USER               CPU%   MEM%   COMMAND\n${Array.from(
+      { length: 80 },
+      (_, i) => `${1000 + i}    1        someone              0.0   0.0 /usr/bin/thing-${i}`,
+    ).join("\n")}`;
+    for (const tool of [
+      "os.git.log",
+      "os.git.status",
+      "os.git.branch",
+      "os.proc.list",
+      "os.window.list",
+      "browser.tabs",
+      "github.pr.list",
+      "github.issue.list",
+    ]) {
+      const turn = toolResultTurn({
+        tool,
+        status: "ok",
+        summary: listing,
+        at: 7,
+      });
+      if (turn.kind !== "tool_result") throw new Error("expected a listing tool result");
+      expect(renderToolResultBody(turn, { inCurrentMacroTurn: true })).toBe(
+        listing,
+      );
+      const aged = renderToolResultBody(turn, { inCurrentMacroTurn: false });
+      expect(aged.length).toBeLessThan(450);
+      expect(aged).toContain("[rendering-truncated");
+      // The head survives the history cut, so the column header and
+      // the newest rows are what the session keeps.
+      expect(aged.startsWith("PID      PPID")).toBe(true);
+    }
+    // `os.shell.run` is deliberately not in the set. Membership is
+    // only observable on the AGED path — the fresh path returns the
+    // body whole either way — so this has to check the aged render.
+    // It is either untouched (this tree: the generic 8 000-char cap
+    // leaves a 5 KB summary alone) or cut from its END by #470's
+    // `capSummaryToTail`, which leads with the marker. What it is
+    // never is a head-first 400-char clip, which is what a listing
+    // tool takes and what adding "os.shell.run" to the set would
+    // produce.
+    const shell = toolResultTurn({
+      tool: "os.shell.run",
+      status: "ok",
+      summary: listing,
+      at: 7,
+    });
+    if (shell.kind !== "tool_result") throw new Error("expected a shell tool result");
+    const agedShell = renderToolResultBody(shell, {
+      inCurrentMacroTurn: false,
+    });
+    expect(
+      agedShell === listing || agedShell.startsWith("… [rendering-truncated"),
+    ).toBe(true);
+  });
+
+  it("renders a fresh fusion.delegate result whole and gives it the generic cap once aged", () => {
+    const summary = `3 tasks: 3 ok\n${"r".repeat(18_000)}`;
+    const turn = toolResultTurn({
+      tool: "fusion.delegate",
+      status: "ok",
+      summary,
+      at: 7,
+    });
+    expect(renderTurnForPrompt(turn, { inCurrentMacroTurn: true })).toBe(
+      `tool_result[fusion.delegate ok]: ${summary}`,
+    );
+    const aged = renderTurnForPrompt(turn, { inCurrentMacroTurn: false });
+    expect(aged).toContain("[rendering-truncated");
+    expect(aged.startsWith("tool_result[fusion.delegate ok]: 3 tasks: 3 ok")).toBe(true);
+    // The generic 8000-char cap, not the 400-char history cap of the other
+    // fresh tools.
+    expect(aged.length).toBeGreaterThan(6_000);
+    expect(aged.length).toBeLessThanOrEqual(
+      "tool_result[fusion.delegate ok]: ".length + 8000,
+    );
+  });
+
+  it("gives fresh gog shell results a larger render budget", () => {
+    // Over the generic 8000-char cap, under the 16,000-char gog one.
+    const body = "x".repeat(12_000);
+    const summary = `$ gog --json --no-input gmail search is:unread\n${body}`;
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.shell.run",
+        status: "ok",
+        summary,
+        at: 7,
+      }),
+      { inCurrentMacroTurn: true },
+    );
+    expect(rendered).toContain(body);
+    expect(rendered).not.toContain("[rendering-truncated");
+  });
+
+  it("renders a fresh os.shell.run result from its end and drops to the old 400 chars in history", () => {
+    // What the tool stored at ingestion: a long log whose last line is
+    // the answer. 16 000 chars in, 8 000 renderable — the band where a
+    // head-first cut would show the start of a tail and hide the verdict.
+    const verdict = "Tests  948 passed (951)";
+    const summary = `$ npm test\nexit: 0\n${"x".repeat(12_000)}\n${verdict}`;
+    const turn = toolResultTurn({
+      tool: "os.shell.run",
+      status: "ok",
+      summary,
+      at: 7,
+    });
+
+    const fresh = renderTurnForPrompt(turn, { inCurrentMacroTurn: true });
+    expect(fresh).toContain("[rendering-truncated");
+    expect(fresh.endsWith(verdict)).toBe(true);
+    expect(fresh.length).toBeLessThanOrEqual(
+      "tool_result[os.shell.run ok]: ".length + 8_000,
+    );
+
+    // Aged out of the macro-turn it costs what it used to: ~400 chars,
+    // so the wider ingestion cap is not re-pasted on every later step.
+    const aged = renderTurnForPrompt(turn, { inCurrentMacroTurn: false });
+    expect(aged.endsWith(verdict)).toBe(true);
+    expect(aged.length).toBeLessThan(800);
+    // And the default (option omitted) is the history zone, not the fresh one.
+    expect(renderTurnForPrompt(turn)).toBe(aged);
+  });
+
+  it("leaves aged gog shell results on the generic render cap", () => {
+    const summary = `$ gog --json --no-input gmail search is:unread\n${"x".repeat(12_000)}`;
+    const aged = renderTurnForPrompt(
+      toolResultTurn({ tool: "os.shell.run", status: "ok", summary, at: 7 }),
+      { inCurrentMacroTurn: false },
+    );
+    expect(aged.startsWith("tool_result[os.shell.run ok]: $ gog ")).toBe(true);
+    expect(aged.length).toBeGreaterThan(6_000);
+    expect(aged.length).toBeLessThanOrEqual(
+      "tool_result[os.shell.run ok]: ".length + 8_000,
+    );
+  });
+
+  it("caps historical os.http.request results to ~400 chars", () => {
+    const big = "x".repeat(10_000);
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.http.request",
+        status: "ok",
+        summary: big,
+        at: 7,
+      }),
+      { inCurrentMacroTurn: false },
+    );
+    expect(rendered.length).toBeLessThan(800);
+    expect(rendered).toContain("[rendering-truncated");
+    expect(rendered.startsWith("tool_result[os.http.request ok]: ")).toBe(true);
+  });
+
+  it("defaults to history mode for os.http.request when option is omitted", () => {
+    const big = "x".repeat(10_000);
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.http.request",
+        status: "ok",
+        summary: big,
+        at: 7,
+      }),
+    );
+    expect(rendered).toContain("[rendering-truncated");
+  });
+
+  it("leaves short tool_result summaries untouched", () => {
+    const rendered = renderTurnForPrompt(
+      toolResultTurn({
+        tool: "os.fs.list",
+        status: "ok",
+        summary: "3 entries: a, b, c",
+        at: 6,
+      }),
+    );
+    expect(rendered).toBe("tool_result[os.fs.list ok]: 3 entries: a, b, c");
+  });
+
+  describe("findCurrentMacroTurnStart", () => {
+    it("returns 0 when no assistant_reply has been emitted", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("hi", 1),
+        assistantToolCallTurn({ tool: "x", args: {}, at: 2 }),
+        toolResultTurn({ tool: "x", status: "ok", summary: "s", at: 3 }),
+      ];
+      expect(findCurrentMacroTurnStart(turns)).toBe(0);
+    });
+
+    it("returns 0 for an empty list", () => {
+      expect(findCurrentMacroTurnStart([])).toBe(0);
+    });
+
+    it("returns the index right after the last assistant_reply", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("hi", 1),
+        assistantReplyTurn("done", 2),
+        userTurn("more", 3),
+        assistantToolCallTurn({ tool: "x", args: {}, at: 4 }),
+        toolResultTurn({ tool: "x", status: "ok", summary: "s", at: 5 }),
+      ];
+      expect(findCurrentMacroTurnStart(turns)).toBe(2);
+    });
+
+    it("returns turns.length when the last turn is an assistant_reply", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("hi", 1),
+        assistantReplyTurn("done", 2),
+      ];
+      expect(findCurrentMacroTurnStart(turns)).toBe(2);
+    });
+  });
+
+  it("appendTurn returns a new array without mutating", () => {
+    const turns = [userTurn("hi", 1)];
+    const next = appendTurn(turns, assistantReplyTurn("hey", 2));
+    expect(next).toHaveLength(2);
+    expect(turns).toHaveLength(1);
+  });
+
+  describe("trimTurnsToTokens", () => {
+    it("returns everything when it fits", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("hi", 1),
+        assistantReplyTurn("hey", 2),
+      ];
+      const out = trimTurnsToTokens(turns, 1000);
+      expect(out.truncated).toBe(false);
+      expect(out.turns).toEqual(turns);
+    });
+
+    it("drops the oldest turns first", () => {
+      const turns: ConversationTurn[] = [];
+      for (let i = 0; i < 20; i += 1) {
+        turns.push(userTurn(`msg${i} ${"x".repeat(40)}`, i));
+        turns.push(assistantReplyTurn(`reply${i} ${"y".repeat(40)}`, i));
+      }
+      const out = trimTurnsToTokens(turns, 60);
+      expect(out.truncated).toBe(true);
+      expect(out.turns.length).toBeLessThan(turns.length);
+      expect(out.turns.at(-1)).toEqual(turns.at(-1));
+    });
+
+    it("keeps the last user turn even if it does not fit by itself", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("old old old old", 1),
+        assistantReplyTurn("ok", 2),
+        userTurn("brand new user message with plenty of words here", 3),
+      ];
+      const out = trimTurnsToTokens(turns, 1);
+      expect(out.truncated).toBe(true);
+      expect(out.turns.at(-1)?.kind).toBe("user");
+    });
+
+    it("empty history returns empty", () => {
+      expect(trimTurnsToTokens([], 100)).toEqual({
+        turns: [],
+        truncated: false,
+      });
+    });
+
+    it("non-positive budget drops everything", () => {
+      const out = trimTurnsToTokens([userTurn("hi", 1)], 0);
+      expect(out).toEqual({ turns: [], truncated: true });
+    });
+  });
+
+  describe("packConversation", () => {
+    it("empty history returns a neutral pack", () => {
+      expect(packConversation([], 100)).toEqual({
+        visibleTurns: [],
+        droppedSummary: null,
+        droppedCount: 0,
+        visiblePairs: 0,
+        droppedPairs: 0,
+        boundBy: null,
+        packStart: null,
+      });
+    });
+
+    it("returns every turn visible and no summary when it fits", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("hi", 1),
+        assistantReplyTurn("hey", 2),
+      ];
+      const out = packConversation(turns, 1000);
+      expect(out.droppedSummary).toBeNull();
+      expect(out.droppedCount).toBe(0);
+      expect(out.visibleTurns).toEqual(turns);
+    });
+
+    it("drops the oldest turns and produces a deterministic summary", () => {
+      const base = Date.parse("2026-04-23T10:00:00Z");
+      const turns: ConversationTurn[] = [];
+      for (let i = 0; i < 10; i += 1) {
+        turns.push(userTurn(`msg${i} ${"x".repeat(50)}`, base + i * 1000));
+        turns.push(
+          assistantToolCallTurn({
+            tool: "fs.read",
+            args: { path: `/a/b/${i}` },
+            at: base + i * 1000 + 100,
+          }),
+        );
+        turns.push(
+          toolResultTurn({
+            tool: "fs.read",
+            status: "ok",
+            summary: `read ${i}`,
+            at: base + i * 1000 + 200,
+          }),
+        );
+        turns.push(
+          assistantReplyTurn(
+            `reply${i} ${"y".repeat(50)}`,
+            base + i * 1000 + 300,
+          ),
+        );
+      }
+      const out = packConversation(turns, 120);
+      expect(out.droppedCount).toBeGreaterThan(0);
+      expect(out.droppedCount).toBeLessThan(turns.length);
+      expect(out.visibleTurns.at(-1)).toEqual(turns.at(-1));
+      expect(out.droppedSummary).toMatch(
+        /^summary: \d+ older turns dropped(?: from \d+ earlier tasks?)? \(\d+ user, \d+ tool calls, \d+ replies; first at \S+, last at \S+\)$/,
+      );
+    });
+
+    it("counts turn kinds correctly in the summary", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("u1", 1),
+        userTurn("u2", 2),
+        assistantToolCallTurn({ tool: "t", args: {}, at: 3 }),
+        toolResultTurn({ tool: "t", status: "ok", summary: "s", at: 4 }),
+        assistantReplyTurn("r", 5),
+        userTurn("keep", 6),
+      ];
+      const out = packConversation(turns, 1);
+      expect(out.droppedSummary).toContain("2 user");
+      expect(out.droppedSummary).toContain("1 tool calls");
+      expect(out.droppedSummary).toContain("1 replies");
+      expect(out.visibleTurns.at(-1)?.kind).toBe("user");
+    });
+
+    it("keeps the last user turn even if the budget is tiny", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("old old old old", 1),
+        assistantReplyTurn("ok", 2),
+        userTurn("brand new user message with plenty of words here", 3),
+      ];
+      const out = packConversation(turns, 1);
+      expect(out.visibleTurns.at(-1)?.kind).toBe("user");
+      expect(out.droppedSummary).not.toBeNull();
+      expect(out.droppedCount).toBe(2);
+    });
+
+    it("non-positive budget moves everything into the summary", () => {
+      const turns: ConversationTurn[] = [
+        userTurn("a", 1),
+        assistantReplyTurn("b", 2),
+      ];
+      const out = packConversation(turns, 0);
+      expect(out.visibleTurns).toEqual([]);
+      expect(out.droppedCount).toBe(2);
+      expect(out.droppedSummary).toMatch(/^summary: 2 older turns dropped/);
+    });
+  });
+});
+
+// Regression: issue #121 — `packConversation` re-rendered and re-tokenised
+// every historical turn on every agent step, so a long turn burned O(N^2)
+// transient strings (~10MB across 25 steps). Costs are now memoised per
+// turn object; these tests pin the behaviour that memoisation must not change.
+describe("packConversation memoisation (issue #121)", () => {
+  function longTurns(steps: number): ConversationTurn[] {
+    const turns: ConversationTurn[] = [userTurn("go")];
+    for (let i = 0; i < steps; i += 1) {
+      turns.push(
+        assistantToolCallTurn({
+          tool: "os.fs.read",
+          args: { path: `/x/${i}` },
+        }),
+      );
+      turns.push(
+        toolResultTurn({
+          tool: "os.fs.read",
+          status: "ok",
+          summary: `body-${i} ${"s".repeat(2_000)}`,
+        }),
+      );
+    }
+    return turns;
+  }
+
+  it("returns identical results on repeated calls over the same turns", () => {
+    const turns = longTurns(20);
+    const first = packConversation(turns, 4_000);
+    const second = packConversation(turns, 4_000);
+    expect(second.droppedCount).toBe(first.droppedCount);
+    expect(second.droppedSummary).toBe(first.droppedSummary);
+    expect(second.visibleTurns).toEqual(first.visibleTurns);
+  });
+
+  it("keeps the fresh/aged distinction — a turn cached as fresh is not reused when aged", () => {
+    // `os.http.request` renders uncapped while fresh and capped once aged,
+    // so the same turn object has two different costs. Caching must key on
+    // the flag, not collapse the two.
+    const body = "h".repeat(5_000);
+    const httpResult = toolResultTurn({
+      tool: "os.http.request",
+      status: "ok",
+      summary: body,
+    });
+    const freshTurns: ConversationTurn[] = [userTurn("go"), httpResult];
+    const agedTurns: ConversationTurn[] = [
+      userTurn("go"),
+      httpResult,
+      assistantReplyTurn("done"),
+      userTurn("again"),
+    ];
+    // Pack fresh first so the fresh cost is the one cached first.
+    packConversation(freshTurns, 100_000);
+    const aged = packConversation(agedTurns, 100_000);
+    const agedRender = renderTurnForPrompt(httpResult, {
+      inCurrentMacroTurn: false,
+    });
+    expect(agedRender.length).toBeLessThan(body.length);
+    expect(aged.visibleTurns).toHaveLength(4);
+  });
+
+  it("still drops under budget pressure and pins the last user turn", () => {
+    // Two macro-turns: the first is droppable, the second is pinned. A
+    // single-macro-turn fixture would pin everything and drop nothing.
+    const turns: ConversationTurn[] = [
+      ...longTurns(30),
+      assistantReplyTurn("first answer"),
+      ...longTurns(5),
+    ];
+    const out = packConversation(turns, 2_000);
+    expect(out.droppedCount).toBeGreaterThan(0);
+    expect(out.droppedSummary).toMatch(/^summary: \d+ older turns dropped/);
+    expect(out.visibleTurns.length).toBeGreaterThan(0);
+  });
+});
+
+describe("a progress note is a reply row that did not end the macro-turn", () => {
+  const note = assistantReplyTurn("(reading first)", { at: 2, progressNote: true });
+
+  it("carries the flag only when asked for", () => {
+    expect(note).toEqual({
+      kind: "assistant_reply",
+      text: "(reading first)",
+      at: 2,
+      progressNote: true,
+    });
+    expect(assistantReplyTurn("done", 3)).not.toHaveProperty("progressNote");
+    expect(isFinalReplyTurn(note)).toBe(false);
+    expect(isFinalReplyTurn(assistantReplyTurn("done", 3))).toBe(true);
+    expect(isFinalReplyTurn(userTurn("hi", 1))).toBe(false);
+    expect(isFinalReplyTurn(undefined)).toBe(false);
+  });
+
+  it("renders like any reply and is skipped by the macro-turn scans", () => {
+    expect(renderTurnForPrompt(note)).toBe("assistant: (reading first)");
+    const turns: ConversationTurn[] = [
+      userTurn("build it", 1),
+      note,
+      assistantToolCallTurn({ tool: "os.fs.read", args: { path: "a" }, at: 3 }),
+      toolResultTurn({ tool: "os.fs.read", status: "ok", summary: "x", at: 4 }),
+      userTurn("also check b", 5),
+      assistantReplyTurn("done", 6),
+    ];
+    // The current macro-turn still opens at the user row, not after the note…
+    expect(findCurrentMacroTurnStart(turns.slice(0, 5))).toBe(0);
+    // …a reply that closed the turn is what the scan stops on…
+    expect(findCurrentMacroTurnStart(turns)).toBe(6);
+    // …and a steer after a note does not open a task of its own.
+    expect(macroTurnBoundaries(turns)).toEqual([0]);
+  });
+});
+
+describe("a stop marker closes the stopped request (ATO-233)", () => {
+  const marker = stoppedTurnMarker(2);
+
+  it("is a flagged reply row, and only it reads as one", () => {
+    expect(marker).toEqual({
+      kind: "assistant_reply",
+      text: STOPPED_TURN_MARKER_TEXT,
+      stopped: true,
+      at: 2,
+    });
+    expect(isStoppedTurnMarker(marker)).toBe(true);
+    expect(isStoppedTurnMarker(assistantReplyTurn("done", 3))).toBe(false);
+    expect(isStoppedTurnMarker(userTurn("hi", 1))).toBe(false);
+    expect(isStoppedTurnMarker(undefined)).toBe(false);
+    // It ends its macro-turn the way a reply does.
+    expect(isFinalReplyTurn(marker)).toBe(true);
+  });
+
+  it("tells the model the request was stopped and must not be picked up", () => {
+    const line = renderTurnForPrompt(marker);
+    expect(line).toBe(`assistant: ${STOPPED_TURN_MARKER_TEXT}`);
+    expect(line).toContain("stopped by the user");
+    expect(line).toContain("Do not continue it");
+    expect(line).toContain("unless the user asks for it again");
+  });
+
+  it("leaves the next message a task of its own", () => {
+    const turns: ConversationTurn[] = [
+      userTurn("write a 1000-word story about a dog", 1),
+      marker,
+      userTurn("how are you?", 3),
+    ];
+    // The stopped story is history; only the new message is current.
+    expect(findCurrentMacroTurnStart(turns)).toBe(2);
+    expect(macroTurnBoundaries(turns)).toEqual([0, 2]);
+  });
+});
+
+// ATO-60: a re-read of an unchanged range that is still in the prompt
+// renders as a pointer to the earlier read, never when that read is out
+// of view, and the packer prices it the way it renders.
+describe("repeated os.fs.read results", () => {
+  const identity: ReadTurnIdentity = {
+    path: "/repo/src/a.ts",
+    contentHash: "h1",
+    startLine: 1,
+    endLine: 80,
+    numbered: false,
+  };
+  const text = Array.from(
+    { length: 80 },
+    (_, i) => `line ${i + 1} ${"z".repeat(40)}`,
+  ).join("\n");
+
+  function readRow(
+    overrides: Partial<ReadTurnIdentity> = {},
+    summary = text,
+    status: "ok" | "error" = "ok",
+  ): ConversationTurn {
+    return toolResultTurn({
+      tool: "os.fs.read",
+      status,
+      summary,
+      read: { ...identity, ...overrides },
+    });
+  }
+
+  function call(): ConversationTurn {
+    return assistantToolCallTurn({
+      tool: "os.fs.read",
+      args: { path: "src/a.ts" },
+    });
+  }
+
+  it("keeps the read identity on the row", () => {
+    const row = readRow();
+    expect(row).toMatchObject({ kind: "tool_result", read: identity });
+    expect(
+      toolResultTurn({ tool: "os.fs.read", status: "ok", summary: "x" }),
+    ).not.toHaveProperty("read");
+  });
+
+  it("matches only the same file version, range, rendering and stored text", () => {
+    const turns: ConversationTurn[] = [
+      userTurn("go"),
+      readRow(), // 1
+      readRow(), // 2: repeat of 1
+      readRow({ contentHash: "h2" }), // 3: the file changed
+      readRow({ startLine: 2 }), // 4: another range
+      readRow({ numbered: true }), // 5: another rendering
+      readRow({}, `${text}\n… [cut]`), // 6: a different cut
+      readRow({}, text, "error"), // 7: a failed call
+      toolResultTurn({ tool: "os.fs.read", status: "ok", summary: text }), // 8: no identity
+      readRow(), // 9: no match — the latest row of this identity (6) holds another cut
+    ];
+    expect(findReadRepeats(turns)).toEqual([
+      -1, -1, 1, -1, -1, -1, -1, -1, -1, -1,
+    ]);
+  });
+
+  it("points a chain of repeats at the read that holds the text", () => {
+    const turns: ConversationTurn[] = [
+      userTurn("go"),
+      call(),
+      readRow(),
+      call(),
+      toolResultTurn({ tool: "os.fs.list", status: "ok", summary: "a.ts" }),
+      call(),
+      readRow(),
+      call(),
+      readRow(),
+    ];
+    const refs = readRepeatRefs(turns);
+    expect(refs[2]).toBeUndefined();
+    expect(refs[6]).toEqual({ resultsBack: 2 });
+    // The third read points past the second (itself a pointer).
+    expect(refs[8]).toEqual({ resultsBack: 3 });
+  });
+
+  it("renders a repeat as a pointer, flat and structured alike", () => {
+    const row = readRow();
+    const options = { readRepeat: { resultsBack: 1 } };
+    const line = renderTurnForPrompt(row, options);
+    expect(line).toBe(
+      "tool_result[os.fs.read ok]: [unchanged since your earlier read: same 80 lines (1-80), identical text — see the os.fs.read result just above; not repeated here]",
+    );
+    expect(line).toBe(
+      `tool_result[os.fs.read ok]: ${renderToolResultBody(
+        row as Extract<ConversationTurn, { kind: "tool_result" }>,
+        options,
+      )}`,
+    );
+    expect(
+      renderTurnForPrompt(readRow(), { readRepeat: { resultsBack: 4 } }),
+    ).toContain("see the os.fs.read result 4 tool results above");
+  });
+
+  it("drops the truncated mark from a pointer, which is whole", () => {
+    const row = toolResultTurn({
+      tool: "os.fs.read",
+      status: "ok",
+      summary: text,
+      truncated: true,
+      read: identity,
+    });
+    expect(renderTurnForPrompt(row)).toMatch(/\(truncated\)$/);
+    expect(
+      renderTurnForPrompt(row, { readRepeat: { resultsBack: 1 } }),
+    ).not.toContain("(truncated)");
+  });
+
+  it("keeps a short read whole when the pointer would be longer", () => {
+    const row = readRow({ endLine: 1 }, "x = 1");
+    expect(renderTurnForPrompt(row, { readRepeat: { resultsBack: 1 } })).toBe(
+      "tool_result[os.fs.read ok]: x = 1",
+    );
+  });
+
+  it("ignores the pointer option on any other tool", () => {
+    const row = toolResultTurn({
+      tool: "os.fs.grep",
+      status: "ok",
+      summary: text,
+      read: identity,
+    });
+    expect(renderTurnForPrompt(row, { readRepeat: { resultsBack: 1 } })).toBe(
+      `tool_result[os.fs.grep ok]: ${renderToolResultBody(
+        row as Extract<ConversationTurn, { kind: "tool_result" }>,
+        {},
+      )}`,
+    );
+  });
+
+  /** Tokens the visible turns cost as the prompt renders them. */
+  function renderedCost(visible: readonly ConversationTurn[]): number {
+    const refs = readRepeatRefs(visible);
+    const currentStart = findCurrentMacroTurnStart(visible);
+    return visible.reduce((sum, turn, i) => {
+      const ref = refs[i];
+      return (
+        sum +
+        estimateTokens(
+          renderTurnForPrompt(turn, {
+            inCurrentMacroTurn: i >= currentStart,
+            ...(ref !== undefined ? { readRepeat: ref } : {}),
+          }),
+        ) +
+        1
+      );
+    }, 0);
+  }
+
+  /** Three tasks re-reading one file, then a short current request. */
+  function rereadingTasks(): ConversationTurn[] {
+    return [
+      userTurn("read a.ts"),
+      call(),
+      readRow(),
+      assistantReplyTurn("read it"),
+      userTurn("read it again"),
+      call(),
+      readRow(),
+      assistantReplyTurn("same as before"),
+      userTurn("and again"),
+      call(),
+      readRow(),
+      assistantReplyTurn("still the same"),
+      userTurn("thanks"),
+    ];
+  }
+
+  it("prices a repeat as its pointer, so history that fits only that way is kept", () => {
+    const turns = rereadingTasks();
+    const asRendered = renderedCost(turns);
+    const inFull = turns.reduce(
+      (sum, turn) => sum + estimateTokens(renderTurnForPrompt(turn)) + 1,
+      0,
+    );
+    expect(asRendered).toBeLessThan(inFull / 2);
+    const packed = packConversation(turns, asRendered);
+    expect(packed.droppedCount).toBe(0);
+    // The readout's per-task projection charges a repeat that points into
+    // an earlier task in full (that task may be cut first): it may run
+    // high, never low.
+    const pairs = pairTokenCosts(turns);
+    expect(pairs.reduce((a, b) => a + b, 0)).toBeGreaterThanOrEqual(asRendered);
+  });
+
+  it("charges a repeat in full once its earlier read is cut, at every budget", () => {
+    const turns = rereadingTasks();
+    for (let budget = 100; budget <= 4_000; budget += 50) {
+      const packed = packConversation(turns, budget);
+      // Nothing pinned here but the short last request, so whatever the
+      // cut kept must fit the budget as it actually renders.
+      expect(renderedCost(packed.visibleTurns)).toBeLessThanOrEqual(budget);
+      const rendered = packed.visibleTurns
+        .map((turn, i) => {
+          const ref = readRepeatRefs(packed.visibleTurns)[i];
+          return renderTurnForPrompt(
+            turn,
+            ref !== undefined ? { readRepeat: ref } : {},
+          );
+        })
+        .join("\n");
+      // Whenever a read is in view, its text is too.
+      if (rendered.includes("tool_result[os.fs.read ok]")) {
+        expect(rendered).toContain("line 1 ");
+      }
+    }
+  });
+});

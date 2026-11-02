@@ -1,0 +1,348 @@
+import { describe, expect, it } from "vitest";
+
+import { parseSentryDsn } from "./sentry-config.js";
+import { buildEnvelope } from "./sentry-envelope.js";
+import type { ScrubbedErrorEvent } from "./error-scrubber.js";
+
+const DSN = parseSentryDsn("https://pub@o1.ingest.sentry.io/7")!;
+const META = { installId: "install-1", release: "1.2.3", platform: "darwin" };
+
+function parseEventPayload(body: string): {
+  tags: Record<string, string>;
+  fingerprint: string[];
+  exception: {
+    values: Array<{
+      type: string;
+      value: string;
+      stacktrace: {
+        frames: Array<{ filename: string; lineno?: number; in_app: boolean }>;
+      };
+    }>;
+  };
+} {
+  const lines = body.trim().split("\n");
+  return JSON.parse(lines[2]!);
+}
+
+describe("buildEnvelope", () => {
+  it("stamps a cause_type tag when the scrubbed event carries one", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "ToolExecutionError",
+      causeType: "RangeError",
+      source: "llm_failure",
+      category: "tool",
+      tool: "unknown",
+      frames: [],
+    };
+    const { body } = buildEnvelope(DSN, ev, META);
+    const payload = parseEventPayload(body);
+    expect(payload.tags.cause_type).toBe("RangeError");
+  });
+
+  it("stamps a tool_transport tag that splits ModelError reason=empty by transport", () => {
+    const base = {
+      errorType: "ModelError",
+      source: "llm_failure",
+      category: "model",
+      reason: "empty",
+      frames: [],
+    } as const;
+    const nativePayload = parseEventPayload(
+      buildEnvelope(DSN, { ...base, toolTransport: "native_tools" }, META).body,
+    );
+    const grammarPayload = parseEventPayload(
+      buildEnvelope(DSN, { ...base, toolTransport: "grammar" }, META).body,
+    );
+    expect(nativePayload.tags.tool_transport).toBe("native_tools");
+    expect(grammarPayload.tags.tool_transport).toBe("grammar");
+    expect(nativePayload.tags.reason).toBe(grammarPayload.tags.reason);
+    expect(nativePayload.tags.tool_transport).not.toBe(
+      grammarPayload.tags.tool_transport,
+    );
+  });
+
+  it("omits tool_transport when the scrubbed event has none", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "ModelError",
+      source: "llm_failure",
+      category: "model",
+      reason: "empty",
+      frames: [],
+    };
+    const { body } = buildEnvelope(DSN, ev, META);
+    expect(parseEventPayload(body).tags.tool_transport).toBeUndefined();
+  });
+
+  it("stamps a failure_stage tag that splits an otherwise identical native_tools reason=empty", () => {
+    // The pair the transport tag alone cannot split: same errorType,
+    // same category, same reason, same transport — only the stage
+    // differs, and the Sentry fingerprint (a frame basename, in a
+    // single-file bundle) groups both into one issue.
+    const base = {
+      errorType: "ModelError",
+      source: "llm_failure",
+      category: "model",
+      reason: "empty",
+      toolTransport: "native_tools",
+      frames: [],
+    } as const;
+    const initialPayload = parseEventPayload(
+      buildEnvelope(DSN, { ...base, failureStage: "initial" }, META).body,
+    );
+    const repairPayload = parseEventPayload(
+      buildEnvelope(DSN, { ...base, failureStage: "repair" }, META).body,
+    );
+    expect(initialPayload.tags.failure_stage).toBe("initial");
+    expect(repairPayload.tags.failure_stage).toBe("repair");
+    expect(initialPayload.tags.reason).toBe(repairPayload.tags.reason);
+    expect(initialPayload.tags.tool_transport).toBe(
+      repairPayload.tags.tool_transport,
+    );
+  });
+
+  it("omits failure_stage when the scrubbed event has none", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "ModelError",
+      source: "llm_failure",
+      category: "model",
+      reason: "empty",
+      frames: [],
+    };
+    const { body } = buildEnvelope(DSN, ev, META);
+    expect(parseEventPayload(body).tags.failure_stage).toBeUndefined();
+  });
+
+  it("omits cause_type when the scrubbed event has none", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "TransportError",
+      source: "llm_failure",
+      frames: [],
+    };
+    const { body } = buildEnvelope(DSN, ev, META);
+    const payload = parseEventPayload(body);
+    expect(payload.tags.cause_type).toBeUndefined();
+  });
+
+  it("uses the innermost frame (frames[0]) for the fingerprint, not the outermost", () => {
+    const evInnermostFirst: ScrubbedErrorEvent = {
+      errorType: "ToolExecutionError",
+      source: "llm_failure",
+      tool: "unknown",
+      frames: [
+        { filename: "build-prompt.ts", lineno: 87 },
+        { filename: "step-executor.ts", lineno: 272 },
+        { filename: "chat-orchestrator.ts", lineno: 372 },
+      ],
+    };
+    const { body } = buildEnvelope(DSN, evInnermostFirst, META);
+    const payload = parseEventPayload(body);
+    // The last fingerprint entry is the topFrame discriminator.
+    expect(payload.fingerprint.at(-1)).toBe("build-prompt.ts");
+    expect(payload.fingerprint.at(-1)).not.toBe("chat-orchestrator.ts");
+  });
+
+  it("prioritises causeType over the generic 'unknown' tool literal in the fingerprint", () => {
+    const evA: ScrubbedErrorEvent = {
+      errorType: "ToolExecutionError",
+      causeType: "TypeError",
+      source: "llm_failure",
+      tool: "unknown",
+      frames: [{ filename: "build-prompt.ts", lineno: 1 }],
+    };
+    const evB: ScrubbedErrorEvent = {
+      errorType: "ToolExecutionError",
+      causeType: "RangeError",
+      source: "llm_failure",
+      tool: "unknown",
+      frames: [{ filename: "build-prompt.ts", lineno: 1 }],
+    };
+    const payloadA = parseEventPayload(buildEnvelope(DSN, evA, META).body);
+    const payloadB = parseEventPayload(buildEnvelope(DSN, evB, META).body);
+    // Different original causes must not collapse into the same
+    // fingerprint just because they share the generic "unknown" tool tag.
+    expect(payloadA.fingerprint).not.toEqual(payloadB.fingerprint);
+  });
+
+  it("sends frames oldest-first, the way Sentry reads a stack", () => {
+    // V8 puts the throw site at index 0; Sentry's protocol wants it
+    // LAST. Sending V8 order rendered every stack upside-down and made
+    // Sentry read the culprit off the outermost caller — which is why
+    // the issue list was a wall of `async run` / `async runOneTurn`.
+    const ev: ScrubbedErrorEvent = {
+      errorType: "TransportError",
+      source: "llm_failure",
+      frames: [
+        { filename: "prime-stream.ts", lineno: 24, function: "primeStream" },
+        { filename: "llm-fallback-seam.ts", lineno: 160 },
+        { filename: "step-executor.ts", lineno: 272 },
+      ],
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    const frames = payload.exception.values[0]!.stacktrace.frames;
+    expect(frames.map((f) => f.filename)).toEqual([
+      "step-executor.ts",
+      "llm-fallback-seam.ts",
+      "prime-stream.ts",
+    ]);
+    // The crash site is the last frame — that is what Sentry names as
+    // the culprit.
+    expect(frames.at(-1)!.filename).toBe("prime-stream.ts");
+  });
+
+  it("marks our own frames in_app and node internals not", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "Error",
+      source: "uncaughtException",
+      frames: [
+        { filename: "node:internal/streams/writable", lineno: 1 },
+        { filename: "stdio-protocol.js", lineno: 114 },
+      ],
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    const frames = payload.exception.values[0]!.stacktrace.frames;
+    expect(frames.map((f) => [f.filename, f.in_app])).toEqual([
+      ["stdio-protocol.js", true],
+      ["node:internal/streams/writable", false],
+    ]);
+  });
+
+  it("does not reorder the caller's array (the fingerprint reads frames[0])", () => {
+    const frames = [
+      { filename: "inner.ts", lineno: 1 },
+      { filename: "outer.ts", lineno: 2 },
+    ];
+    const ev: ScrubbedErrorEvent = {
+      errorType: "TransportError",
+      source: "llm_failure",
+      frames,
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    // Reversing in place would flip the fingerprint's topFrame and
+    // re-group every existing issue.
+    expect(frames[0]!.filename).toBe("inner.ts");
+    expect(payload.fingerprint.at(-1)).toBe("inner.ts");
+  });
+
+  it("stamps an upstream_error_type tag when the scrubbed event carries one", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "TransportError",
+      causeType: "OpenAiHttpError",
+      source: "llm_failure",
+      category: "transport",
+      httpStatus: 400,
+      transportHost: "localhost",
+      upstreamErrorType: "exceed_context_size_error",
+      frames: [],
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    expect(payload.tags.upstream_error_type).toBe("exceed_context_size_error");
+  });
+
+  it("omits upstream_error_type when the scrubbed event has none", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "TransportError",
+      source: "llm_failure",
+      frames: [],
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    expect(payload.tags.upstream_error_type).toBeUndefined();
+  });
+
+  it("splits two same-status failures whose only difference is the upstream type", () => {
+    // Every provider failure shares causeType `OpenAiHttpError`, so the
+    // existing discriminator cannot tell these two apart: llama.cpp
+    // answers both a too-large prompt and a malformed request with 400,
+    // and both landed in one issue.
+    const base = {
+      errorType: "TransportError",
+      causeType: "OpenAiHttpError",
+      source: "llm_failure",
+      category: "transport",
+      httpStatus: 400,
+      transportHost: "localhost",
+      frames: [{ filename: "openai-http.js", lineno: 519 }],
+    } as const;
+    const exceeded = parseEventPayload(
+      buildEnvelope(
+        DSN,
+        { ...base, upstreamErrorType: "exceed_context_size_error" },
+        META,
+      ).body,
+    ).fingerprint;
+    const invalid = parseEventPayload(
+      buildEnvelope(
+        DSN,
+        { ...base, upstreamErrorType: "invalid_request_error" },
+        META,
+      ).body,
+    ).fingerprint;
+    expect(exceeded).not.toEqual(invalid);
+  });
+
+  it("keeps the status out of the fingerprint — two statuses still group as one", () => {
+    // Deliberate, and the reason this PR does not re-group anything live:
+    // `http_status` is already a tag on every transport issue, so adding
+    // it here would give every one of them a new shortId. Pinned so that
+    // a future PR that wants the status split has to say so out loud and
+    // ship the release note with it.
+    const base = {
+      errorType: "TransportError",
+      causeType: "OpenAiHttpError",
+      source: "llm_failure",
+      category: "transport",
+      transportHost: "localhost",
+      frames: [{ filename: "openai-http.js", lineno: 519 }],
+    } as const;
+    const contextTooSmall = parseEventPayload(
+      buildEnvelope(DSN, { ...base, httpStatus: 400 }, META).body,
+    ).fingerprint;
+    const deadProxy = parseEventPayload(
+      buildEnvelope(DSN, { ...base, httpStatus: 502 }, META).body,
+    ).fingerprint;
+    expect(contextTooSmall).toEqual(deadProxy);
+  });
+
+  it("leaves an untagged event's fingerprint exactly as it was", () => {
+    // The element is spread in, not defaulted to `""`, so an event with
+    // no upstream type keeps the fingerprint it has on `main` element for
+    // element — nothing already live re-groups. This array is the literal
+    // `main` output; changing it means re-grouping live issues.
+    const ev: ScrubbedErrorEvent = {
+      errorType: "ToolExecutionError",
+      causeType: "RangeError",
+      source: "llm_failure",
+      category: "tool",
+      tool: "unknown",
+      frames: [{ filename: "build-prompt.js", lineno: 87 }],
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    expect(payload.fingerprint).toEqual([
+      "{{ default }}",
+      "ToolExecutionError",
+      "tool",
+      "RangeError",
+      "build-prompt.js",
+    ]);
+  });
+
+  it("adds exactly one element for a tagged event", () => {
+    const ev: ScrubbedErrorEvent = {
+      errorType: "TransportError",
+      causeType: "OpenAiHttpError",
+      source: "llm_failure",
+      category: "transport",
+      httpStatus: 400,
+      upstreamErrorType: "exceed_context_size_error",
+      frames: [{ filename: "openai-http.js", lineno: 519 }],
+    };
+    const payload = parseEventPayload(buildEnvelope(DSN, ev, META).body);
+    expect(payload.fingerprint).toEqual([
+      "{{ default }}",
+      "TransportError",
+      "transport",
+      "OpenAiHttpError",
+      "exceed_context_size_error",
+      "openai-http.js",
+    ]);
+  });
+});

@@ -1,0 +1,790 @@
+import type { AgentLoopEvent } from "../../agent/agent-contract.js";
+import type { StepEvent } from "../../agent/step-events.js";
+import type { ToolCallPayload } from "../../llm/grammar/tool-call-grammar.js";
+import type { LlmFailureCategory } from "../../llm/reliability/index.js";
+import type { ProviderWaitCause } from "../../llm/reliability/provider-wait-cause.js";
+import type { SessionRoute } from "../../session/session-route.js";
+
+// The module, not the fallback barrel: it has no imports of its own, so
+// tracing does not pull the provider clients in behind it.
+import { summarizeFailedAttempts } from "../../llm/fallback/failed-attempts.js";
+// A leaf for the same reason: the errno walk, without the classifier
+// (`classifyProviderWaitCause`) and the clients it would bring along.
+import { readErrnoCode } from "../../llm/errno-code.js";
+import { readGenerationId } from "../../llm/provider/openai/generation-id.js";
+
+import type {
+  TraceError,
+  TraceEvent,
+  TraceProviderWaiting,
+} from "./trace-event.js";
+import type { TraceSink } from "./trace-bus.js";
+
+/** The `generationId` field of an `error` row, or nothing. */
+function generationIdOf(error: unknown): Pick<TraceError, "generationId"> {
+  const id = readGenerationId(error);
+  return id === undefined ? {} : { generationId: id };
+}
+
+/** The `fallbackFailures` field of an `error` row, or nothing. */
+function fallbackFailuresOf(
+  error: unknown,
+): Pick<TraceError, "fallbackFailures"> {
+  const failures = summarizeFailedAttempts(error);
+  return failures.length > 0 ? { fallbackFailures: failures } : {};
+}
+
+/**
+ * The `causeCode` field of an `error` row, or nothing: the errno a
+ * `transport` failure left on its `cause` chain. Every other category
+ * is left without one — a cancelled request can carry `ABORT_ERR`,
+ * which says nothing about the provider.
+ */
+function causeCodeOf(
+  error: unknown,
+  category: LlmFailureCategory,
+): Pick<TraceError, "causeCode"> {
+  if (category !== "transport") return {};
+  const code = readErrnoCode(error);
+  return code === undefined ? {} : { causeCode: code };
+}
+
+/**
+ * A wait cause as the `provider_waiting` row records it: `kind`, plus
+ * `status` only when it is a number. The event's `stream_error` may hold
+ * `status: null` (the provider reported none); the row leaves it out, as
+ * the SSE frame does, so a reader meets one shape.
+ */
+function waitCauseOf(
+  cause: ProviderWaitCause,
+): NonNullable<TraceProviderWaiting["cause"]> {
+  return "status" in cause && typeof cause.status === "number"
+    ? { kind: cause.kind, status: cause.status }
+    : { kind: cause.kind };
+}
+
+export interface TraceRecorderOptions {
+  sessionId: string;
+  /**
+   * Destination for the transformed events. Typically a
+   * `TraceBus.emit`, but tests may inject a plain collector.
+   */
+  emit: TraceSink;
+  /** Optional clock override — used by tests for deterministic timestamps. */
+  now?: () => number;
+}
+
+export interface TraceRecorderBeginInfo {
+  workingDir: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TraceRecorder {
+  /**
+   * Emit the synthetic `session_started` event. Must be called exactly
+   * once per NDJSON file — the runtime calls it when a fresh session is
+   * created or when it starts writing traces for an existing session.
+   */
+  beginSession(info: TraceRecorderBeginInfo): void;
+  /** Transform and forward one `AgentLoopEvent` to the sink. */
+  onAgentEvent(event: AgentLoopEvent): void;
+  /**
+   * The route the next turn runs on, resolved by `executeTurn` before the
+   * loop starts. Held like the user message and written onto that turn's
+   * `turn_started`, then dropped, so a turn that did not note one never
+   * inherits the previous turn's.
+   */
+  noteTurnRoute(route: SessionRoute): void;
+  /**
+   * Memory-v2 phase 7a. Emit a `vote_applied` trace event. Called
+   * from the reflection-slot `VoteRunner` after a vote landed in
+   * `VoteStore` successfully. The recorder owns the monotonic
+   * `seq` counter so per-session traces stay totally ordered even
+   * when reflection fires after `turn_finished`.
+   *
+   * Fire-safe: payload errors never propagate; the recorder
+   * defaults `turnIndex` / `stepIndex` to the last observed values.
+   */
+  recordVoteApplied(payload: {
+    kind: "memory" | "lesson" | "profile" | "procedure";
+    targetId: number;
+    direction: 1 | -1;
+    score: number;
+    clampHit: boolean;
+  }): void;
+  /**
+   * Memory-v2 phase 7a. Emit a `vote_rejected` trace event for any
+   * vote that failed before reaching (or after rejecting from) the
+   * store — out-of-allowlist, target missing, clamp hit, parser
+   * rejection. One event per rejection.
+   */
+  recordVoteRejected(payload: {
+    kind: "memory" | "lesson" | "profile" | "procedure" | "unknown";
+    targetId: number | null;
+    direction: 1 | -1 | null;
+    reason: string;
+  }): void;
+  /**
+   * Emit the run-level `vote` trace event for a vote turn that ended
+   * before `VoteRunner.run` was reached — the `vote-aware-reflection`
+   * decorator's bail-outs. The runner's own outcomes travel in
+   * `run()`'s result, so this is the only row that separates "nothing
+   * surfaced" and "the stores could not be read" from voting being
+   * switched off.
+   */
+  recordVote(payload: {
+    outcome: "skipped" | "failed";
+    candidates?: number;
+    reason: string;
+  }): void;
+  /**
+   * Memory-v2. Emit a `reflection` trace event for the end-of-turn
+   * SET/NOTE/EVOLVE extraction sub-call. Fired fire-and-forget after
+   * `turn_finished`; the recorder owns the monotonic `seq`.
+   */
+  recordReflection(payload: {
+    outcome: "ok" | "none" | "aborted" | "timeout" | "failed";
+    factsWritten?: number;
+    notesWritten?: number;
+    reason?: string;
+  }): void;
+  /**
+   * Memory-v2 phase 2. Emit a `link_generator` trace event for the
+   * reactive link-graph generation sub-call.
+   */
+  recordLinkGenerator(payload: {
+    outcome: "ok" | "none" | "skipped" | "aborted" | "timeout" | "failed";
+    linksWritten?: number;
+    candidates?: number;
+    reason?: string;
+  }): void;
+  /**
+   * Memory v2.5 phase A. Emit a `query_rewriter` trace event for the
+   * recall-side rewriter sub-call.
+   */
+  recordQueryRewriter(payload: {
+    outcome:
+      | "ok"
+      | "skipped_not_referential"
+      | "skipped_no_history"
+      | "aborted"
+      | "timeout"
+      | "failed";
+    reason?: string;
+  }): void;
+  /**
+   * Issue #407. Emit a `profile_facts_evicted` row: a profile write
+   * pushed the active unpinned facts over `memory.profile.maxEntries`.
+   * Called from the store's eviction listener, outside the loop's event
+   * stream, so the recorder owns `seq` here as it does for votes.
+   */
+  recordProfileFactsEvicted(payload: {
+    maxEntries: number;
+    activeUnpinned: number;
+    ids: readonly number[];
+    keys: readonly string[];
+  }): void;
+}
+
+/**
+ * Stateful transformer that maps `AgentLoopEvent` / inner `StepEvent`
+ * streams into the append-only `TraceEvent` union. Handles:
+ * - buffering `user_message` so it can be attached to the next
+ *   `turn_started` trace entry;
+ * - pairing `tool_call_parsed` + `tool_call_executed` into a single
+ *   `tool_invocation` trace event with both args and result;
+ * - assigning a monotonic `seq` within the session.
+ *
+ * The recorder never throws: unknown event shapes are ignored.
+ */
+export function createTraceRecorder(
+  options: TraceRecorderOptions,
+): TraceRecorder {
+  const now = options.now ?? (() => Date.now());
+  const sessionId = options.sessionId;
+  let seq = 0;
+  let currentTurnIndex = 0;
+  let currentStepIndex: number | null = null;
+  let pendingUserMessage: string | null = null;
+  let pendingRoute: SessionRoute | null = null;
+  // For a batched step, multiple `tool_call_parsed` events may arrive
+  // before any `tool_call_executed`. We keep the parsed calls keyed by
+  // their `batchIndex` so the executed callback can pair them
+  // deterministically. Solo steps land in `pendingCalls.get(0)`.
+  let pendingCalls = new Map<number, ToolCallPayload>();
+  // One thrown failure reaches the recorder twice: `executeStep` emits
+  // `step_error` and then rethrows the very same object, which the loop
+  // catches and reports as `loop_failed`. Both map onto an `error` row,
+  // so the trace carried the same failure under two `seq` numbers and
+  // everything reading it — `/trace`, the formatter, issue reports,
+  // benchmark analysis — counted one failure as two. We remember the
+  // `error` row last recorded from a `step_error` and drop the
+  // `loop_failed` one when it would repeat it verbatim. A `loop_failed`
+  // that differs is a genuinely different failure and still lands: the
+  // loop can fail outside `executeStep`, and the truncation-retry path
+  // swaps in `truncationRetry.original` before emitting. The memo is
+  // cleared when a new turn or step begins, so only the failure that
+  // just happened can suppress anything. `causeCode` is part of what is
+  // compared because it is part of the row: the same object reads the
+  // same code twice, so the rethrow is still dropped, while a different
+  // failure that happens to share the message is not.
+  let lastStepError: {
+    message: string;
+    stack: string | undefined;
+    category: LlmFailureCategory;
+    causeCode: string | undefined;
+    stepIndex: number | null;
+  } | null = null;
+
+  const nextSeq = (): number => seq++;
+  const push = (event: TraceEvent): void => options.emit(event);
+
+  const onStepEvent = (inner: StepEvent): void => {
+    if (currentStepIndex === null) return;
+    switch (inner.type) {
+      case "prompt_captured":
+        push({
+          type: "prompt_captured",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          stablePrefixHash: inner.stablePrefixHash,
+          tail: inner.tail,
+          tokens: inner.tokens,
+          slotId: inner.slotId,
+          cacheReused: inner.cacheReused,
+        });
+        return;
+      case "llm_raw_completion": {
+        const completion = inner.completion;
+        const reasoning =
+          typeof completion.reasoningContent === "string" &&
+          completion.reasoningContent.length > 0
+            ? completion.reasoningContent
+            : undefined;
+        push({
+          type: "llm_completion",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          attempt: inner.attempt,
+          content: completion.content,
+          ...(reasoning !== undefined ? { reasoningContent: reasoning } : {}),
+          ...(inner.reasoningTokens !== undefined
+            ? { reasoningTokens: inner.reasoningTokens }
+            : {}),
+          ...(completion.timing
+            ? {
+                timing: {
+                  promptMs: completion.timing.promptMs,
+                  predictedMs: completion.timing.predictedMs,
+                  promptTokens: completion.timing.promptTokens,
+                  predictedTokens: completion.timing.predictedTokens,
+                },
+              }
+            : {}),
+          cacheHitTokens: completion.cacheHitTokens,
+          modelId: completion.modelId,
+          stop: completion.stop,
+          truncated: completion.truncated,
+          ...(completion.stopType !== undefined
+            ? { stopType: completion.stopType }
+            : {}),
+          ...(completion.generationId !== undefined
+            ? { generationId: completion.generationId }
+            : {}),
+        });
+        return;
+      }
+      case "tool_call_parsed":
+        pendingCalls.set(inner.batchIndex, inner.call);
+        return;
+      case "tool_call_executed": {
+        const call = pendingCalls.get(inner.batchIndex);
+        pendingCalls.delete(inner.batchIndex);
+        push({
+          type: "tool_invocation",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: currentStepIndex,
+          tool: inner.result.tool,
+          args: call?.args ?? {},
+          status: inner.result.status,
+          summary: inner.result.summary,
+          ...(inner.result.details !== undefined
+            ? { details: inner.result.details }
+            : {}),
+          ...(inner.result.truncated ? { toolTruncated: true } : {}),
+          ...(inner.batchSize > 1
+            ? { batchIndex: inner.batchIndex, batchSize: inner.batchSize }
+            : {}),
+        });
+        return;
+      }
+      case "parse_retry":
+        push({
+          type: "parse_retry",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          attempt: inner.attempt,
+          reason: inner.reason,
+        });
+        return;
+      case "answer_continued":
+        push({
+          type: "answer_continued",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          cause: inner.cause,
+          partialChars: inner.partialChars,
+          outcome: inner.outcome,
+        });
+        return;
+      case "batch_trimmed":
+        push({
+          type: "batch_trimmed",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          originalSize: inner.originalSize,
+          kept: inner.kept,
+          dropped: [...inner.dropped],
+          ...(inner.refused !== undefined ? { refused: [...inner.refused] } : {}),
+          reason: inner.reason,
+        });
+        return;
+      case "batch_approval_barriers":
+        push({
+          type: "batch_approval_barriers",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: inner.stepIndex,
+          originalSize: inner.originalSize,
+          waves: inner.waves,
+          barriers: inner.barriers,
+          retained: inner.retained,
+          invalidated: inner.invalidated,
+          ...(inner.stoppedBy !== undefined
+            ? { stoppedBy: { ...inner.stoppedBy } }
+            : {}),
+          cancelled: inner.cancelled,
+        });
+        return;
+      case "step_error": {
+        const codeField = causeCodeOf(inner.error, inner.category);
+        lastStepError = {
+          message: inner.error.message,
+          stack: inner.error.stack,
+          category: inner.category,
+          causeCode: codeField.causeCode,
+          stepIndex: currentStepIndex,
+        };
+        push({
+          type: "error",
+          seq: nextSeq(),
+          sessionId,
+          ts: now(),
+          turnIndex: currentTurnIndex,
+          stepIndex: currentStepIndex,
+          message: inner.error.message,
+          ...(inner.error.stack ? { stack: inner.error.stack } : {}),
+          category: inner.category,
+          ...codeField,
+          ...generationIdOf(inner.error),
+          ...fallbackFailuresOf(inner.error),
+        });
+        return;
+      }
+      default:
+        return;
+    }
+  };
+
+  return {
+    recordVoteApplied(payload) {
+      push({
+        type: "vote_applied",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        kind: payload.kind,
+        targetId: payload.targetId,
+        direction: payload.direction,
+        score: payload.score,
+        clampHit: payload.clampHit,
+      });
+    },
+    recordVoteRejected(payload) {
+      push({
+        type: "vote_rejected",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        kind: payload.kind,
+        targetId: payload.targetId,
+        direction: payload.direction,
+        reason: payload.reason,
+      });
+    },
+    recordVote(payload) {
+      push({
+        type: "vote",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(typeof payload.candidates === "number"
+          ? { candidates: payload.candidates }
+          : {}),
+        reason: payload.reason,
+      });
+    },
+    recordReflection(payload) {
+      push({
+        type: "reflection",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(typeof payload.factsWritten === "number"
+          ? { factsWritten: payload.factsWritten }
+          : {}),
+        ...(typeof payload.notesWritten === "number"
+          ? { notesWritten: payload.notesWritten }
+          : {}),
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+    },
+    recordLinkGenerator(payload) {
+      push({
+        type: "link_generator",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(typeof payload.linksWritten === "number"
+          ? { linksWritten: payload.linksWritten }
+          : {}),
+        ...(typeof payload.candidates === "number"
+          ? { candidates: payload.candidates }
+          : {}),
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+    },
+    recordQueryRewriter(payload) {
+      push({
+        type: "query_rewriter",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        outcome: payload.outcome,
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+    },
+    recordProfileFactsEvicted(payload) {
+      push({
+        type: "profile_facts_evicted",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        maxEntries: payload.maxEntries,
+        activeUnpinned: payload.activeUnpinned,
+        evicted: payload.keys.length,
+        ids: [...payload.ids],
+        keys: [...payload.keys],
+      });
+    },
+    beginSession(info) {
+      push({
+        type: "session_started",
+        seq: nextSeq(),
+        sessionId,
+        ts: now(),
+        workingDir: info.workingDir,
+        ...(info.metadata !== undefined ? { metadata: info.metadata } : {}),
+      });
+    },
+    noteTurnRoute(route) {
+      pendingRoute = route;
+    },
+    onAgentEvent(event) {
+      switch (event.type) {
+        case "compaction_started":
+        case "compaction_progress":
+        case "compaction_completed":
+        case "compaction_failed":
+          push({ ...event, sessionId, seq: nextSeq(), ts: now() });
+          return;
+        case "user_message":
+          pendingUserMessage = event.text;
+          return;
+        case "turn_started":
+          currentTurnIndex = event.turnIndex;
+          lastStepError = null;
+          push({
+            type: "turn_started",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: event.turnIndex,
+            ...(pendingUserMessage !== null
+              ? { userMessage: pendingUserMessage }
+              : {}),
+            ...(pendingRoute !== null ? { route: pendingRoute } : {}),
+          });
+          pendingUserMessage = null;
+          pendingRoute = null;
+          return;
+        case "turn_finished":
+          push({
+            type: "turn_finished",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: event.turnIndex,
+            reason: event.reason,
+            stepCount: event.stepCount,
+            durationMs: event.durationMs,
+          });
+          return;
+        case "step_started":
+          currentStepIndex = event.stepIndex;
+          pendingCalls = new Map();
+          lastStepError = null;
+          push({
+            type: "step_started",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+          });
+          return;
+        case "step_finished":
+          push({
+            type: "step_finished",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            summary: event.summary,
+            durationMs: event.durationMs,
+            ...(event.progressNote === true ? { progressNote: true } : {}),
+            ...(event.reviewStall !== undefined
+              ? { reviewStall: event.reviewStall }
+              : {}),
+          });
+          currentStepIndex = null;
+          pendingCalls = new Map();
+          return;
+        case "task_continued":
+          push({
+            type: "task_continued",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepsTaken: event.stepsTaken,
+            elapsedMs: event.elapsedMs,
+            stepCeiling: event.stepCeiling,
+          });
+          return;
+        case "parse_failure_recovered":
+          push({
+            type: "parse_failure_recovered",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            attempt: event.attempt,
+            budget: event.budget,
+            reason: event.reason,
+          });
+          return;
+        case "empty_completion_recovered":
+          push({
+            type: "empty_completion_recovered",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            attempt: event.attempt,
+            budget: event.budget,
+          });
+          return;
+        case "provider_waiting":
+          push({
+            type: "provider_waiting",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            ...(currentStepIndex !== null
+              ? { stepIndex: currentStepIndex }
+              : {}),
+            attempt: event.attempt,
+            waitedMs: event.waitedMs,
+            maxWaitMs: event.maxWaitMs,
+            nextRetryMs: event.nextRetryMs,
+            reason: event.reason,
+            // `reason` alone was a bare `fetch failed` in the field: a
+            // stopped local server read as a network outage. The kind
+            // and the errno travel with it.
+            ...(event.cause !== undefined
+              ? { cause: waitCauseOf(event.cause) }
+              : {}),
+            ...(event.causeCode !== undefined
+              ? { causeCode: event.causeCode }
+              : {}),
+            ...(event.providerId !== undefined
+              ? { providerId: event.providerId }
+              : {}),
+          });
+          return;
+        case "provider_recovered":
+          push({
+            type: "provider_recovered",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            waitedMs: event.waitedMs,
+          });
+          return;
+        case "completion_truncated":
+          push({
+            type: "completion_truncated",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            cause: event.cause,
+            completionTokens: event.completionTokens,
+            promptTokens: event.promptTokens,
+            ...(event.requestedMaxTokens !== undefined
+              ? { requestedMaxTokens: event.requestedMaxTokens }
+              : {}),
+            ...(event.repetitive === true ? { repetitive: true } : {}),
+            retry: event.retry.kind,
+            retryValue:
+              event.retry.kind === "fit_window"
+                ? event.retry.contextWindow
+                : event.retry.maxTokens,
+          });
+          return;
+        case "prompt_repacked":
+          push({
+            type: "prompt_repacked",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            contextWindow: event.contextWindow,
+            source: event.source,
+            promptTokens: event.promptTokens,
+          });
+          return;
+        case "loop_detected":
+          push({
+            type: "loop_detected",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            tool: event.tool,
+            count: event.count,
+            ...(event.level !== undefined ? { level: event.level } : {}),
+            ...(event.detector !== undefined
+              ? { detector: event.detector }
+              : {}),
+            ...(event.read !== undefined ? { read: event.read } : {}),
+          });
+          return;
+        case "profile_clipped":
+          push({
+            type: "profile_clipped",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            stepIndex: event.stepIndex,
+            rendered: event.rendered,
+            dropped: event.dropped,
+            pinnedDropped: event.pinnedDropped,
+            maxTokens: event.maxTokens,
+          });
+          return;
+        case "loop_failed": {
+          const codeField = causeCodeOf(event.error, event.category);
+          const duplicate =
+            lastStepError !== null &&
+            lastStepError.message === event.error.message &&
+            lastStepError.stack === event.error.stack &&
+            lastStepError.category === event.category &&
+            lastStepError.causeCode === codeField.causeCode &&
+            lastStepError.stepIndex === currentStepIndex;
+          lastStepError = null;
+          if (duplicate) return;
+          push({
+            type: "error",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            ...(currentStepIndex !== null
+              ? { stepIndex: currentStepIndex }
+              : {}),
+            message: event.error.message,
+            ...(event.error.stack ? { stack: event.error.stack } : {}),
+            category: event.category,
+            ...codeField,
+            ...generationIdOf(event.error),
+            ...fallbackFailuresOf(event.error),
+          });
+          return;
+        }
+        case "memory_health_warning":
+          push({
+            type: "memory_health_warning",
+            seq: nextSeq(),
+            sessionId,
+            ts: now(),
+            turnIndex: currentTurnIndex,
+            kind: event.kind,
+            outcome: event.outcome,
+            consecutive: event.consecutive,
+            setting: event.setting,
+            ...(event.reason !== undefined ? { reason: event.reason } : {}),
+          });
+          return;
+        case "llm_event":
+          onStepEvent(event.event);
+          return;
+        default:
+          return;
+      }
+    },
+  };
+}

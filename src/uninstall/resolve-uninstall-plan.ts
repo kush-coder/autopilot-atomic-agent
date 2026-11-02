@@ -1,0 +1,145 @@
+import { access } from "node:fs/promises";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+
+import {
+  detectDesktopSharing,
+  type DesktopSharing,
+  type DetectDesktopSharingInput,
+} from "./detect-desktop-sharing.js";
+import {
+  measureUninstallPlan,
+  type MeasuredPlan,
+} from "./measure-uninstall-plan.js";
+import {
+  installDirFor,
+  isInstalledBinary,
+  planUninstallTargets,
+  type UninstallTarget,
+} from "./uninstall-targets.js";
+import {
+  detectInstallSource,
+  type InstallSource,
+} from "../update/install-source.js";
+
+export interface ResolvedUninstallPlan {
+  readonly targets: readonly UninstallTarget[];
+  readonly measured: MeasuredPlan;
+  /**
+   * True when the process is `node`/`tsx` against a checkout, or the
+   * installed binary is gone. Both mean there is no program half to
+   * remove, and the caller says so instead of pretending it removed one.
+   */
+  readonly devCheckout: boolean;
+  /** `dirname(execPath)`, shown so the operator can check it themselves. */
+  readonly installDir: string;
+  /**
+   * Set when a deb, rpm or AUR package installed the binary. The plan then
+   * holds data only; the program is removed with the package manager
+   * (`packageRemoveHint` in `src/update/install-source.ts`).
+   */
+  readonly installSource?: InstallSource;
+  /**
+   * Whether the desktop app shares the state directory, and whether an
+   * old desktop directory was left behind. Read for warnings only: it
+   * never adds or drops a target.
+   */
+  readonly desktop: DesktopSharing;
+}
+
+/**
+ * The install dir to take off the Windows user `Path`, or `undefined`
+ * when the plan removes no program: under a dev runtime `installDir` is
+ * node's own directory, and under `--keep-binary` the binary stays and
+ * still needs to be found.
+ */
+export function pathEntryToRemove(
+  plan: ResolvedUninstallPlan,
+): string | undefined {
+  if (plan.devCheckout) return undefined;
+  if (!plan.targets.some((target) => target.group === "program")) {
+    return undefined;
+  }
+  return plan.installDir;
+}
+
+export interface ResolveUninstallPlanOptions {
+  /** `getConfig().paths.stateDir`. Required — never guessed here. */
+  readonly stateDir: string;
+  readonly execPath?: string;
+  readonly homeDir?: string;
+  readonly platform?: NodeJS.Platform;
+  /** Drop the state dir and debug bundles from the plan (`--keep-data`). */
+  readonly keepData?: boolean;
+  /** Drop the binary and its assets from the plan (`--keep-binary`). */
+  readonly keepBinary?: boolean;
+  /** Environment for the desktop lookup. Defaults to `process.env`. */
+  readonly env?: NodeJS.ProcessEnv;
+  /**
+   * The Linux package that installed `execPath`. Defaults to reading the
+   * package marker for the real process; tests pass it in.
+   */
+  readonly installSource?: InstallSource;
+  /** File-system probes for the desktop lookup, injectable for tests. */
+  readonly desktopProbe?: Pick<DetectDesktopSharingInput, "exists" | "readFile">;
+}
+
+/**
+ * The one place the CLI and the TUI both build their plan from, so the
+ * list the confirm screen shows is byte-for-byte the list that gets
+ * removed. Two code paths that each assemble "what uninstall means"
+ * would eventually disagree, and the disagreement would only show up
+ * after the deletion.
+ */
+export async function resolveUninstallPlan(
+  options: ResolveUninstallPlanOptions,
+): Promise<ResolvedUninstallPlan> {
+  const execPath = options.execPath ?? process.execPath;
+  const homeDir = options.homeDir ?? homedir();
+  const platform = options.platform ?? process.platform;
+  const installDir = installDirFor(execPath);
+  const exeSuffix = platform === "win32" ? ".exe" : "";
+  const binaryPresent =
+    isInstalledBinary(execPath) &&
+    (await exists(resolve(installDir, `atomic-agent${exeSuffix}`)));
+  const installSource =
+    options.installSource ?? detectInstallSource(platform, execPath);
+
+  const all = planUninstallTargets({
+    stateDir: options.stateDir,
+    execPath,
+    homeDir,
+    platform,
+    binaryPresent,
+    ...(installSource ? { installSource } : {}),
+  });
+  const targets = all.filter((target) => {
+    if (options.keepData && target.group === "data") return false;
+    if (options.keepBinary && target.group === "program") return false;
+    return true;
+  });
+
+  return {
+    targets,
+    measured: await measureUninstallPlan(targets),
+    devCheckout: !binaryPresent,
+    installDir,
+    ...(installSource ? { installSource } : {}),
+    desktop: detectDesktopSharing({
+      stateDir: options.stateDir,
+      homeDir,
+      platform,
+      env: options.env ?? process.env,
+      ...options.desktopProbe,
+    }),
+  };
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}

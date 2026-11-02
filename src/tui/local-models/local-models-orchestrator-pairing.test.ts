@@ -1,0 +1,452 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../../local-llm/index.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../local-llm/index.js")
+  >("../../local-llm/index.js");
+  return {
+    ...actual,
+    getDaemonStatus: vi.fn(),
+    // Never the real one: it would stop or move whatever holds this machine's port.
+    reclaimManagedPort: vi.fn(async () => ({ kind: "free" })),
+    fetchServedModelIds: vi.fn(async () => null),
+    getEmbeddingDaemonStatus: vi.fn(),
+    startEmbeddingDaemon: vi.fn(),
+    stopEmbeddingDaemon: vi.fn(),
+    maybeAutoUpdateBackend: vi.fn(),
+    holdEmbeddingForLowMemory: vi.fn(async () => ({ ok: true })),
+  };
+});
+
+import { getConfig, resetConfigCache } from "../../config/index.js";
+import * as localLlm from "../../local-llm/index.js";
+import {
+  getEmbeddingModelDef,
+  resolveBackendDir,
+  resolveModelFilePath,
+  resolveServerBinPath,
+} from "../../local-llm/index.js";
+import { resolvePlatformAsset } from "../../local-llm/backend/platform-assets.js";
+import { resetLowMemoryEmbeddingNote } from "../../local-llm/server/embedding-memory-gate.js";
+import {
+  getUserConfigPath,
+  readUserConfigFileSync,
+  writeUserConfigFileSync,
+} from "../../config/config-file.js";
+import { persistUserLocalModelsConfig } from "../persist-user-local-models-config.js";
+import { persistMemoryEmbeddingsEnabled } from "../persist-embedding-hybrid-recall.js";
+import { LocalModelsOrchestrator } from "./local-models-orchestrator.js";
+
+type Emitted = { type: string; line?: string };
+
+/**
+ * Memory-v2 phase 1B regression tests for the embedding-pairing
+ * invariant: when the chat daemon is alive, the embedding daemon must
+ * be reconciled to `embeddings.enabled && modelId valid && downloaded`
+ * by every code path that mutates embedding-side config outside the
+ * main `startDaemon` / `stopDaemon` flows. Locks the user-reported
+ * bug ("embedding stopped after start") so it cannot regress.
+ */
+describe("LocalModelsOrchestrator embedding pairing", () => {
+  let stateDir: string;
+
+  beforeEach(() => {
+    stateDir = mkdtempSync(join(tmpdir(), "local-models-pair-"));
+    process.env.ATOMIC_AGENT_STATE_DIR = stateDir;
+    resetConfigCache();
+    // These tests cover the llama.cpp engine; Atomic Core is the default since config v77.
+    persistUserLocalModelsConfig({ managed: { engine: "llama-server" } });
+    vi.mocked(localLlm.getDaemonStatus).mockReset();
+    vi.mocked(localLlm.getEmbeddingDaemonStatus).mockReset();
+    vi.mocked(localLlm.startEmbeddingDaemon).mockReset();
+    vi.mocked(localLlm.stopEmbeddingDaemon).mockReset();
+    vi.mocked(localLlm.maybeAutoUpdateBackend).mockReset();
+    vi.mocked(localLlm.maybeAutoUpdateBackend).mockResolvedValue({
+      action: "skipped",
+    });
+    vi.mocked(localLlm.holdEmbeddingForLowMemory).mockReset().mockResolvedValue({ ok: true });
+    resetLowMemoryEmbeddingNote();
+  });
+
+  afterEach(() => {
+    delete process.env.ATOMIC_AGENT_STATE_DIR;
+    resetConfigCache();
+    rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("starts the embedding daemon when chat is up and a downloaded model is activated", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    stubChatStatus(true);
+    stubEmbeddingStatus(false);
+    vi.mocked(localLlm.startEmbeddingDaemon).mockResolvedValue({ pid: 4242 });
+
+    const actions: Emitted[] = [];
+    const orchestrator = new LocalModelsOrchestrator({
+      emit(a: unknown) {
+        actions.push(a as Emitted);
+      },
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.setActiveEmbedding("bge-m3");
+
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: "bge-m3", dataDir }),
+    );
+    expect(actions.map((a) => a.line).filter(Boolean)).toContain(
+      "local-llm: embedding daemon up (bge-m3, pid 4242) — hybrid recall on",
+    );
+  });
+
+  it("does not start the embedding daemon on a machine with little memory, and says so once (ATO-379)", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubChatModelDownloaded(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    persistUserLocalModelsConfig({
+      mode: "managed",
+      managed: { modelId: "qwen-3.5-4b" },
+      embeddings: { enabled: true, modelId: "bge-m3" },
+    });
+    persistMemoryEmbeddingsEnabled(true);
+    resetConfigCache();
+    stubChatStatus(true);
+    stubEmbeddingStatus(false);
+    vi.mocked(localLlm.holdEmbeddingForLowMemory).mockResolvedValue({
+      ok: false, reason: "total-ram", totalBytes: 4 * 1024 ** 3, freeBytes: 1024 ** 3,
+    });
+
+    const actions: Emitted[] = [];
+    const orchestrator = new LocalModelsOrchestrator({
+      emit(a: unknown) {
+        actions.push(a as Emitted);
+      },
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    // Launch: adopts the running chat model and pairs the memory model.
+    await orchestrator.autoStartIfReady();
+    expect(vi.mocked(localLlm.holdEmbeddingForLowMemory)).toHaveBeenCalledWith(dataDir);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).not.toHaveBeenCalled();
+    // Held back, not switched off: the operator's opt-in stays on.
+    expect(getConfig().memory.embeddings.enabled).toBe(true);
+    expect(readUserConfigFileSync(getUserConfigPath(stateDir))!.memory.embeddings.enabled).toBe(true);
+
+    // A second pass is held back again, without a second note.
+    await orchestrator.setActiveEmbedding("bge-m3");
+    expect(vi.mocked(localLlm.holdEmbeddingForLowMemory)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).not.toHaveBeenCalled();
+    const notes = actions
+      .map((a) => a.line)
+      .filter((line) => line === "local-llm: Low memory: memory search uses keywords only.");
+    expect(notes).toHaveLength(1);
+  });
+
+  it("does NOT start the embedding daemon when chat is down — leaves it to the next paired startDaemon", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    stubChatStatus(false);
+    stubEmbeddingStatus(false);
+
+    const orchestrator = new LocalModelsOrchestrator({
+      emit() {},
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.setActiveEmbedding("bge-m3");
+
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).not.toHaveBeenCalled();
+    expect(vi.mocked(localLlm.stopEmbeddingDaemon)).not.toHaveBeenCalled();
+  });
+
+  it("hot-swaps the embedding daemon when a different model is activated and the old daemon is alive", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    stubChatStatus(true);
+    stubEmbeddingStatus(true);
+    vi.mocked(localLlm.stopEmbeddingDaemon).mockResolvedValue();
+    vi.mocked(localLlm.startEmbeddingDaemon).mockResolvedValue({ pid: 9090 });
+
+    const orchestrator = new LocalModelsOrchestrator({
+      emit() {},
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.setActiveEmbedding("bge-m3");
+
+    expect(vi.mocked(localLlm.stopEmbeddingDaemon)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).toHaveBeenCalledTimes(1);
+  });
+
+  // ATO-351: the runtime's memory client is told to follow the new model,
+  // and only after the hot swap, so it probes the daemon that serves it.
+  it("tells the runtime the embedding model changed after the hot swap, not before", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    stubChatStatus(true);
+    stubEmbeddingStatus(true);
+    const order: string[] = [];
+    vi.mocked(localLlm.stopEmbeddingDaemon).mockResolvedValue();
+    vi.mocked(localLlm.startEmbeddingDaemon).mockImplementation(async () => {
+      order.push("start");
+      return { pid: 9090 };
+    });
+
+    const orchestrator = new LocalModelsOrchestrator(
+      { emit() {}, subscribe: () => () => {} },
+      { onEmbeddingModelChanged: () => order.push("changed") },
+    );
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.setActiveEmbedding("bge-m3");
+
+    expect(order).toEqual(["start", "changed"]);
+  });
+
+  it("tells the runtime when a picked embedding model is not on disk yet (embeddings go off)", async () => {
+    const changed = vi.fn();
+    const orchestrator = new LocalModelsOrchestrator(
+      { emit() {}, subscribe: () => () => {} },
+      { onEmbeddingModelChanged: changed },
+    );
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.setActiveEmbedding("bge-m3");
+
+    expect(changed).toHaveBeenCalledTimes(1);
+    expect(getConfig().memory.embeddings.enabled).toBe(false);
+  });
+
+  it("stops the embedding daemon when the master switch is flipped off while it is running", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    persistUserLocalModelsConfig({
+      embeddings: { enabled: true, modelId: "bge-m3" },
+    });
+    resetConfigCache();
+    stubChatStatus(true);
+    stubEmbeddingStatus(true);
+    vi.mocked(localLlm.stopEmbeddingDaemon).mockResolvedValue();
+
+    const orchestrator = new LocalModelsOrchestrator({
+      emit() {},
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.toggleEmbeddingEnabled();
+
+    expect(vi.mocked(localLlm.stopEmbeddingDaemon)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).not.toHaveBeenCalled();
+    const onDisk = readUserConfigFileSync(getUserConfigPath(stateDir));
+    expect(onDisk.localModels.embeddings.enabled).toBe(false);
+    expect(onDisk.memory.embeddings.enabled).toBe(false);
+  });
+
+  it("autoStartIfReady adopts a running chat and pairs the embedding daemon", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubChatModelDownloaded(dataDir);
+    stubEmbeddingModelDownloaded(dataDir, "bge-m3");
+    persistUserLocalModelsConfig({
+      mode: "managed",
+      managed: { modelId: "qwen-3.5-4b" },
+      embeddings: { enabled: true, modelId: "bge-m3" },
+    });
+    resetConfigCache();
+    stubChatStatus(true);
+    stubEmbeddingStatus(false);
+    vi.mocked(localLlm.startEmbeddingDaemon).mockResolvedValue({ pid: 11195 });
+
+    const orchestrator = new LocalModelsOrchestrator({
+      emit() {},
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.autoStartIfReady();
+
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: "bge-m3" }),
+    );
+  });
+
+  it("autoStartIfReady restarts, not adopts, a running daemon that serves another model", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubChatModelDownloaded(dataDir);
+    persistUserLocalModelsConfig({
+      mode: "managed",
+      managed: { modelId: "qwen-3.5-4b" },
+    });
+    resetConfigCache();
+    stubChatStatus(true);
+    stubEmbeddingStatus(false);
+    vi.mocked(localLlm.fetchServedModelIds).mockResolvedValueOnce(["gemma-4-12b"]);
+
+    const lines: string[] = [];
+    const orchestrator = new LocalModelsOrchestrator({
+      emit(a: unknown) {
+        const line = (a as Emitted).line;
+        if (line) lines.push(line);
+      },
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+    const stop = vi.spyOn(orchestrator, "stopChatDaemonOnly").mockResolvedValue(true);
+    const start = vi.spyOn(orchestrator, "startDaemon").mockResolvedValue(true);
+
+    await orchestrator.autoStartIfReady();
+
+    expect(lines).toEqual([
+      expect.stringMatching(/^local-llm: the running server is not .+ — restarting it$/),
+    ]);
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledWith({ backendAlreadyChecked: true });
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).not.toHaveBeenCalled();
+  });
+
+  it("autoStartIfReady does not report a model activation — it is a launch, not a setup", async () => {
+    // Regression: `model_configured` used to hang off the daemon-restart
+    // hook, which this launch-time path also fires. Every existing local
+    // user would then report a first-time backend setup on their next
+    // app start, dating the funnel step to the launch instead of the
+    // setup that actually happened long before.
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubChatModelDownloaded(dataDir);
+    persistUserLocalModelsConfig({
+      mode: "managed",
+      managed: { modelId: "qwen-3.5-4b" },
+      embeddings: { enabled: false },
+    });
+    resetConfigCache();
+    // A daemon left running by a previous session: `autoStartIfReady`
+    // adopts it and fires the restart/selected hooks. That is precisely
+    // the shape the old wiring mistook for a setup.
+    stubChatStatus(true);
+    stubEmbeddingStatus(false);
+
+    const onManagedModelActivated = vi.fn();
+    const onManagedDaemonRestarted = vi.fn();
+    const onManagedModelSelected = vi.fn();
+    const orchestrator = new LocalModelsOrchestrator(
+      { emit() {}, subscribe: () => () => {} },
+      {
+        onManagedModelActivated,
+        onManagedDaemonRestarted,
+        onManagedModelSelected,
+      },
+    );
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.autoStartIfReady();
+
+    // The launch path ran to completion on an existing daemon and never
+    // reports an activation — `model_configured` stays unsent.
+    expect(onManagedModelActivated).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-start local daemons when a cloud text provider is active", async () => {
+    const dataDir = getConfig().paths.localModelsDataDir;
+    stubBackendInstalled(dataDir);
+    stubChatModelDownloaded(dataDir);
+    const file = readUserConfigFileSync(getUserConfigPath(stateDir));
+    writeUserConfigFileSync(getUserConfigPath(stateDir), {
+      ...file,
+      llm: {
+        activeTextProvider: "openrouter",
+        activeEmbeddingProvider: "local-llama",
+        toolTransport: "auto",
+        providers: [
+          {
+            id: "local-llama",
+            kind: "llama-server",
+            url: "http://127.0.0.1:19091",
+          },
+          {
+            id: "openrouter",
+            kind: "openrouter",
+            apiKey: "test",
+            defaultChatModel: "openai/gpt-5.5",
+          },
+        ],
+      },
+    });
+    resetConfigCache();
+
+    const orchestrator = new LocalModelsOrchestrator({
+      emit() {},
+      subscribe: () => () => {},
+    });
+    vi.spyOn(orchestrator, "startDaemon").mockResolvedValue(true);
+    vi.spyOn(orchestrator, "refresh").mockResolvedValue();
+
+    await orchestrator.autoStartIfReady();
+
+    expect(orchestrator.startDaemon).not.toHaveBeenCalled();
+    expect(vi.mocked(localLlm.getDaemonStatus)).not.toHaveBeenCalled();
+    expect(vi.mocked(localLlm.startEmbeddingDaemon)).not.toHaveBeenCalled();
+  });
+});
+
+/** Materialise a fake llama-server binary so `isBackendDownloaded` returns true. */
+function stubBackendInstalled(dataDir: string): void {
+  const backendDir = resolveBackendDir(dataDir);
+  mkdirSync(backendDir, { recursive: true });
+  const { binaryName } = resolvePlatformAsset();
+  writeFileSync(resolveServerBinPath(dataDir, binaryName), "");
+}
+
+function stubChatModelDownloaded(dataDir: string): void {
+  const def = localLlm.getLocalModelDef("qwen-3.5-4b");
+  const modelDir = join(dataDir, "models", def.id);
+  mkdirSync(modelDir, { recursive: true });
+  writeFileSync(resolveModelFilePath(dataDir, def.id, def.filename), "stub");
+}
+
+function stubEmbeddingModelDownloaded(
+  dataDir: string,
+  id: Parameters<typeof getEmbeddingModelDef>[0],
+): void {
+  const def = getEmbeddingModelDef(id);
+  const path = resolveModelFilePath(dataDir, def.id, def.filename);
+  mkdirSync(join(dataDir, "models", def.id), { recursive: true });
+  writeFileSync(path, "stub");
+}
+
+function stubChatStatus(running: boolean): void {
+  vi.mocked(localLlm.getDaemonStatus).mockResolvedValue({
+    running,
+    healthy: running,
+    loading: false,
+    pid: running ? 1234 : null,
+    port: 19091,
+  });
+}
+
+function stubEmbeddingStatus(running: boolean): void {
+  vi.mocked(localLlm.getEmbeddingDaemonStatus).mockResolvedValue({
+    running,
+    healthy: running,
+    loading: false,
+    pid: running ? 5678 : null,
+    port: 19092,
+  });
+}

@@ -1,0 +1,709 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { AgentRuntime } from "../../runtime/bootstrap.js";
+import type { AtomicAgentConfig } from "../../config/index.js";
+import type { UserLlmProviderEntry } from "../../config/llm-config.js";
+import { loadConfig } from "../../config/load-config.js";
+import { createProvidersWizardState } from "./providers-wizard-state.js";
+import type { ProvidersWizardState } from "./providers-wizard-state.js";
+
+vi.mock("../../config/index.js", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("../../config/index.js")>();
+  return {
+    ...original,
+    getConfig: () => currentConfig,
+  };
+});
+
+let currentConfig: AtomicAgentConfig;
+
+/**
+ * Load a complete config from the test setup's isolated state directory.
+ * Pin the probe's parallel-call budget independently of environment defaults.
+ */
+function completeConfigBaseline(): AtomicAgentConfig {
+  const config = loadConfig();
+  return {
+    ...config,
+    agent: { ...config.agent, maxParallelToolCalls: 8 },
+  };
+}
+
+function configWithGemini(): AtomicAgentConfig {
+  return {
+    ...completeConfigBaseline(),
+    llm: {
+      activeTextProvider: "gemini",
+      activeEmbeddingProvider: "local-llama-embed",
+      toolTransport: "auto",
+      providers: [
+        {
+          id: "gemini",
+          kind: "gemini",
+          defaultChatModel: "gemini-2.5-flash",
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * The catalog caches live at module scope inside the fetch modules, so
+ * every test builds the orchestrator from a fresh module registry: a
+ * warm cache inherited from a previous test would silently skip the
+ * network path under test.
+ */
+async function importFreshOrchestrator() {
+  vi.resetModules();
+  return import("./providers-orchestrator.js");
+}
+
+function fakeBus() {
+  return {
+    subscribe: vi.fn(() => () => {}),
+    emit: vi.fn(),
+  };
+}
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 4; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+function stubCatalogFetch() {
+  const fetchMock = vi.fn(async (url: unknown) => {
+    if (String(url).includes("openrouter")) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: [
+            {
+              id: "vendor/live-or",
+              context_length: 128_000,
+              supported_parameters: ["tools"],
+            },
+          ],
+        }),
+      };
+    }
+    return {
+      ok: true,
+      json: async () => ({
+        data: [{ id: "vendor/live-aiml", type: "chat-completion" }],
+      }),
+    };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+describe("ProvidersOrchestrator.prefetchCloudCatalogs", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("fetches both catalogs when cold and reports via providers_status", async () => {
+    const fetchMock = stubCatalogFetch();
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      {} as AgentRuntime,
+      bus as never,
+    );
+
+    orchestrator.prefetchCloudCatalogs();
+    await flush();
+
+    const urls = fetchMock.mock.calls.map((call) => String(call[0])).sort();
+    expect(urls).toEqual([
+      "https://api.aimlapi.com/v1/models",
+      "https://openrouter.ai/api/v1/models",
+    ]);
+    // The status emits are what re-render already-mounted panels so
+    // they re-read the now-live module cache.
+    expect(bus.emit).toHaveBeenCalledWith({
+      type: "providers_status",
+      line: "OpenRouter model list updated from API",
+    });
+    expect(bus.emit).toHaveBeenCalledWith({
+      type: "providers_status",
+      line: "AI/ML API model list updated from API",
+    });
+  });
+
+  it("skips the network entirely while the caches are warm", async () => {
+    const fetchMock = stubCatalogFetch();
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      {} as AgentRuntime,
+      bus as never,
+    );
+
+    orchestrator.prefetchCloudCatalogs();
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Wired to tab activation, this runs on every providers/LLM tab
+    // visit; within the cache TTL it must stay free.
+    orchestrator.prefetchCloudCatalogs();
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves the static fallback intact when both fetches fail", async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error("offline");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      {} as AgentRuntime,
+      bus as never,
+    );
+
+    orchestrator.prefetchCloudCatalogs();
+    await flush();
+
+    // No success status lines and no crash; the pickers keep serving
+    // the static catalog.
+    expect(bus.emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "providers_status" }),
+    );
+
+    // A cold cache means the next visit retries instead of latching
+    // onto the failure.
+    orchestrator.prefetchCloudCatalogs();
+    await flush();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+});
+
+describe("isCloudProviderKind", () => {
+  it("allows an existing Gemini provider to enter configure and key-repair flows", async () => {
+    const { isCloudProviderKind } = await importFreshOrchestrator();
+
+    expect(isCloudProviderKind("gemini")).toBe(true);
+  });
+
+  it("stays false for subscription-cli, which is not a key-based cloud kind", async () => {
+    const { isCloudProviderKind } = await importFreshOrchestrator();
+
+    expect(isCloudProviderKind("subscription-cli")).toBe(false);
+  });
+});
+
+describe("configureWizardKindForRow", () => {
+  it("recovers the wizard row behind a stored subscription-cli entry", async () => {
+    const { configureWizardKindForRow } = await importFreshOrchestrator();
+
+    // Two wizard rows collapse onto one config kind, so the CLI name on
+    // the entry is the only thing that can tell them apart.
+    expect(
+      configureWizardKindForRow({
+        kind: "subscription-cli",
+        subscriptionCli: { cli: "claude" },
+      }),
+    ).toBe("claude-cli");
+    expect(
+      configureWizardKindForRow({
+        kind: "subscription-cli",
+        subscriptionCli: { cli: "codex" },
+      }),
+    ).toBe("codex-cli");
+  });
+
+  it("passes key-based cloud kinds through unchanged", async () => {
+    const { configureWizardKindForRow } = await importFreshOrchestrator();
+
+    expect(configureWizardKindForRow({ kind: "gemini" })).toBe("gemini");
+    expect(configureWizardKindForRow({ kind: "openai-compatible" })).toBe(
+      "openai-compatible",
+    );
+  });
+
+  it("has no wizard for the local daemon or an unknown CLI", async () => {
+    const { configureWizardKindForRow } = await importFreshOrchestrator();
+
+    expect(configureWizardKindForRow({ kind: "llama-server" })).toBeNull();
+    expect(
+      configureWizardKindForRow({
+        kind: "subscription-cli",
+        subscriptionCli: null,
+      }),
+    ).toBeNull();
+    expect(
+      configureWizardKindForRow({
+        kind: "subscription-cli",
+        subscriptionCli: { cli: "not-a-cli" },
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("ProvidersOrchestrator.ensureInlineModels", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("warms the Gemini model catalog through the Cloud pane path", async () => {
+    currentConfig = configWithGemini();
+    const fetchMock = vi.fn(async (url: unknown) => ({
+      ok: true,
+      json: async () => ({
+        data: [{ id: "gemini-2.5-pro" }, { id: "gemini-2.5-flash" }],
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      {} as AgentRuntime,
+      bus as never,
+    );
+
+    await orchestrator.ensureInlineModels("gemini");
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "https://generativelanguage.googleapis.com/v1beta/openai/models",
+    );
+    expect(bus.emit).toHaveBeenCalledWith({
+      type: "providers_inline_models_loading",
+      providerId: "gemini",
+      generation: 1,
+    });
+    expect(bus.emit).toHaveBeenCalledWith({
+      type: "providers_inline_models_loaded",
+      providerId: "gemini",
+      generation: 1,
+      models: ["gemini-2.5-flash", "gemini-2.5-pro"],
+    });
+  });
+
+  it("reports failure without latching when the Gemini catalog fetch fails", async () => {
+    currentConfig = configWithGemini();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("offline");
+      }),
+    );
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      {} as AgentRuntime,
+      bus as never,
+    );
+
+    await orchestrator.ensureInlineModels("gemini");
+
+    expect(bus.emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "providers_inline_models_failed",
+        providerId: "gemini",
+      }),
+    );
+  });
+});
+
+describe("ProvidersOrchestrator.completeWizard", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.doUnmock("../../config/llm-provider-commands.js");
+  });
+
+  function wizardFor(kind: "openrouter" | "aimlapi"): ProvidersWizardState {
+    return {
+      ...createProvidersWizardState("add", { kind }),
+      phase: "api_key",
+      apiKeyBuffer: "sk-wizard-key",
+    };
+  }
+
+  function fakeRuntime() {
+    return {
+      providerRegistry: {
+        setActive: vi.fn(async () => {}),
+        listIds: () => [] as string[],
+      },
+      reloadLlmProvider: vi.fn(async () => {}),
+      reloadLlmProviders: vi.fn(async () => {}),
+      reportModelConfigured: vi.fn(),
+    } as unknown as AgentRuntime;
+  }
+
+  it("refuses to save a key the provider will not honour", async () => {
+    currentConfig = configWithGemini();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "Insufficient credits" }), {
+            status: 402,
+          }),
+      ),
+    );
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const runtime = fakeRuntime();
+    const orchestrator = new ProvidersOrchestrator(runtime, bus as never);
+
+    await orchestrator.completeWizard(wizardFor("openrouter"));
+
+    const types = bus.emit.mock.calls.map(
+      (call) => (call[0] as { type: string }).type,
+    );
+    expect(types).toContain("providers_wizard_failed");
+    expect(types).not.toContain("providers_wizard_succeeded");
+    // Nothing reloaded means nothing was written: the save never ran.
+    expect(runtime.reloadLlmProviders).not.toHaveBeenCalled();
+    expect(runtime.reloadLlmProvider).not.toHaveBeenCalled();
+  });
+
+  it("reports the failure in words the operator can act on", async () => {
+    currentConfig = configWithGemini();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "No auth credentials found" }), {
+            status: 401,
+          }),
+      ),
+    );
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(fakeRuntime(), bus as never);
+
+    await orchestrator.completeWizard(wizardFor("aimlapi"));
+
+    const failure = bus.emit.mock.calls
+      .map((call) => call[0] as { type: string; error?: string })
+      .find((action) => action.type === "providers_wizard_failed");
+    expect(failure?.error).toContain("rejected this key");
+  });
+
+  /**
+   * The save path with only the disk writes stubbed: the real key
+   * check, the real contract probe and the real gate between them.
+   * Everything above this point in the file stops at a refused key, so
+   * without it nothing ever reaches the code that decides whether this
+   * install may be reported as having a working backend.
+   */
+  async function importOrchestratorWithStubbedDisk() {
+    vi.doMock("../../config/llm-provider-commands.js", async (importOriginal) => {
+      const original =
+        await importOriginal<typeof import("../../config/llm-provider-commands.js")>();
+      return {
+        ...original,
+        upsertLlmProvider: vi.fn((entry: UserLlmProviderEntry) => entry),
+        writeProviderApiKeyToDotenv: vi.fn(),
+        setActiveTextProviderInConfig: vi.fn(),
+      };
+    });
+    return importFreshOrchestrator();
+  }
+
+  /**
+   * Answers the pre-save key check with a live key, and hands the probe
+   * request — the streamed one, carrying `tools` — to the caller.
+   */
+  function stubSaveFetch(probeAnswer: () => Response) {
+    const bodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: unknown, init?: RequestInit) => {
+        if (!String(url).includes("/chat/completions")) {
+          return new Response(JSON.stringify({ data: [] }), { status: 200 });
+        }
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<
+          string,
+          unknown
+        >;
+        bodies.push(body);
+        if (body.stream !== true) {
+          return new Response(
+            JSON.stringify({ choices: [{ message: { content: "ok" } }] }),
+            { status: 200 },
+          );
+        }
+        return probeAnswer();
+      }),
+    );
+    return { bodies: () => bodies };
+  }
+
+  const PROBE_TOOL_CALL_SSE = `data: ${JSON.stringify({
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              type: "function",
+              function: {
+                name: "atomic_contract_probe",
+                arguments: '{"ok":true}',
+              },
+            },
+          ],
+        },
+      },
+    ],
+  })}\n\ndata: ${JSON.stringify({
+    choices: [{ delta: {}, finish_reason: "tool_calls" }],
+  })}\n\ndata: [DONE]\n\n`;
+
+  /** Truncated mid-argument, with nothing announcing the end. */
+  const PROBE_EARLY_EOF_SSE = `data: ${JSON.stringify({
+    choices: [
+      {
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              type: "function",
+              function: { name: "atomic_contract_probe", arguments: '{"ok"' },
+            },
+          ],
+        },
+      },
+    ],
+  })}\n\n`;
+
+  function wizardWithModel(): ProvidersWizardState {
+    return {
+      ...wizardFor("openrouter"),
+      selectedChatModelId: "vendor/picked-model",
+    };
+  }
+
+  it("probes the route on save and reports a backend only once it is proven", async () => {
+    currentConfig = configWithGemini();
+    const fetches = stubSaveFetch(
+      () => new Response(PROBE_TOOL_CALL_SSE, { status: 200 }),
+    );
+    const { ProvidersOrchestrator } = await importOrchestratorWithStubbedDisk();
+    const bus = fakeBus();
+    const runtime = fakeRuntime();
+    const orchestrator = new ProvidersOrchestrator(runtime, bus as never);
+
+    await orchestrator.completeWizard(wizardWithModel());
+
+    // The key check, then the turn contract itself: streamed, with the
+    // tools payload, on the model the operator picked.
+    const probeBody = fetches.bodies()[1];
+    expect(probeBody?.stream).toBe(true);
+    expect(probeBody?.model).toBe("vendor/picked-model");
+    expect(JSON.stringify(probeBody?.tools)).toContain("atomic_contract_probe");
+
+    const types = bus.emit.mock.calls.map(
+      (call) => (call[0] as { type: string }).type,
+    );
+    expect(types).toContain("providers_wizard_succeeded");
+    expect(runtime.reportModelConfigured).toHaveBeenCalledWith(
+      "openrouter",
+      "cloud",
+    );
+  });
+
+  it("saves but reports no working backend when the probe fails", async () => {
+    currentConfig = configWithGemini();
+    stubSaveFetch(() => new Response(PROBE_EARLY_EOF_SSE, { status: 200 }));
+    const { ProvidersOrchestrator } = await importOrchestratorWithStubbedDisk();
+    const bus = fakeBus();
+    const runtime = fakeRuntime();
+    const orchestrator = new ProvidersOrchestrator(runtime, bus as never);
+
+    await orchestrator.completeWizard(wizardWithModel());
+
+    // The key is live, so the save stands — the probe is advisory and
+    // may never refuse one.
+    const types = bus.emit.mock.calls.map(
+      (call) => (call[0] as { type: string }).type,
+    );
+    expect(types).toContain("providers_wizard_succeeded");
+    // But the route was never shown to run a turn, so "this install has
+    // a working cloud backend" must not be claimed on its behalf.
+    expect(runtime.reportModelConfigured).not.toHaveBeenCalled();
+    const lines = bus.emit.mock.calls
+      .map((call) => call[0] as { type: string; line?: string })
+      .filter((action) => action.type === "providers_status")
+      .map((action) => action.line ?? "");
+    expect(lines.some((line) => line.includes("closed the stream"))).toBe(true);
+  });
+
+  it("runs the contract probe on explicit request and reports the verdict", async () => {
+    currentConfig = {
+      ...completeConfigBaseline(),
+      llm: {
+        activeTextProvider: "openrouter",
+        activeEmbeddingProvider: "local-llama-embed",
+        toolTransport: "auto",
+        providers: [
+          {
+            id: "openrouter",
+            kind: "openrouter",
+            apiKey: "sk-saved-key",
+            defaultChatModel: "vendor/configured-model",
+          },
+        ],
+      },
+    };
+    const bodies: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: unknown, init?: RequestInit) => {
+        bodies.push(String(init?.body ?? ""));
+        return new Response(
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      type: "function",
+                      function: {
+                        name: "atomic_contract_probe",
+                        arguments: '{"ok":true}',
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          })}\n\ndata: ${JSON.stringify({
+            choices: [{ delta: {}, finish_reason: "tool_calls" }],
+          })}\n\ndata: [DONE]\n\n`,
+          { status: 200 },
+        );
+      }),
+    );
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(fakeRuntime(), bus as never);
+
+    await orchestrator.runContractProbe(null);
+
+    const lines = bus.emit.mock.calls
+      .map((call) => call[0] as { type: string; line?: string })
+      .filter((action) => action.type === "providers_status")
+      .map((action) => action.line ?? "");
+    expect(lines.some((line) => line.includes("can run a turn"))).toBe(true);
+    // The configured model, streamed, with the tools payload — the real
+    // turn contract, not a cheap stand-in.
+    expect(bodies[0]).toContain("vendor/configured-model");
+    expect(bodies[0]).toContain('"stream":true');
+    expect(bodies[0]).toContain("atomic_contract_probe");
+    // Nothing was written and nothing was activated: this is a read-only
+    // check an operator can run whenever they like.
+    expect(bodies).toHaveLength(1);
+  });
+
+  it("hands the cancel back to the wizard while a check is in flight", async () => {
+    currentConfig = configWithGemini();
+    let releaseFetch: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        await gate;
+        return new Response("{}", { status: 401 });
+      }),
+    );
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const runtime = fakeRuntime();
+    const orchestrator = new ProvidersOrchestrator(runtime, bus as never);
+
+    const running = orchestrator.completeWizard(wizardFor("openrouter"));
+    await flush();
+    // Still waiting on the provider: submitting is on, nothing saved.
+    const midTypes = bus.emit.mock.calls.map(
+      (call) => (call[0] as { type: string }).type,
+    );
+    expect(midTypes).toContain("providers_wizard_submit_started");
+    expect(midTypes).not.toContain("providers_wizard_succeeded");
+
+    orchestrator.cancelWizardVerification();
+    const cancelTypes = bus.emit.mock.calls.map(
+      (call) => (call[0] as { type: string }).type,
+    );
+    expect(cancelTypes).toContain("providers_wizard_verify_cancelled");
+
+    releaseFetch();
+    await running;
+    expect(runtime.reloadLlmProviders).not.toHaveBeenCalled();
+    // The late answer from the abandoned check stays quiet: the wizard is
+    // already back under the operator's hands.
+    const finalTypes = bus.emit.mock.calls.map(
+      (call) => (call[0] as { type: string }).type,
+    );
+    expect(finalTypes).not.toContain("providers_wizard_failed");
+  });
+});
+
+describe("ProvidersOrchestrator.setActiveText with an unknown id", () => {
+  function runtimeRefusing(registered: string[]) {
+    return {
+      providerRegistry: {
+        setActive: vi.fn(async (id: string) => {
+          throw new Error(`llm provider "${id}" is not configured`);
+        }),
+        listIds: () => registered,
+      },
+    } as unknown as AgentRuntime;
+  }
+
+  it("says so in the chat, naming the ids that would work", async () => {
+    // `/llm provider <id>` takes free text; the registry's refusal
+    // alone only reached the LLM pane's status row.
+    currentConfig = configWithGemini();
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      runtimeRefusing(["local-llama", "gemini"]),
+      bus as never,
+    );
+
+    await orchestrator.setActiveText("aimlpai");
+
+    expect(bus.emit).toHaveBeenCalledWith({
+      type: "system_message",
+      text: 'unknown provider "aimlpai" — configured: gemini, local-llama',
+    });
+    expect(bus.emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "runtime_info",
+        line: expect.stringContaining("Switched"),
+      }),
+    );
+  });
+
+  it("keeps a known provider's failure on the status row only", async () => {
+    currentConfig = configWithGemini();
+    const { ProvidersOrchestrator } = await importFreshOrchestrator();
+    const bus = fakeBus();
+    const orchestrator = new ProvidersOrchestrator(
+      runtimeRefusing(["gemini"]),
+      bus as never,
+    );
+
+    await orchestrator.setActiveText("gemini");
+
+    expect(bus.emit).toHaveBeenCalledWith({
+      type: "providers_status",
+      line: 'llm provider "gemini" is not configured',
+    });
+    expect(bus.emit).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "system_message" }),
+    );
+  });
+});

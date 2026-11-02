@@ -1,0 +1,754 @@
+import { FanoutScopeRegistry, isInside } from "./fanout-scope.js";
+import { ReadScopeGrants } from "./read-scope-grants.js";
+import { randomUUID } from "node:crypto";
+import { resolve as resolvePath } from "node:path";
+import {
+  currentApprovalLedger,
+  type ToolApprovalRecord,
+} from "./approval-ledger.js";
+import {
+  clampApprovalLevel,
+  isAutoApprovedAt,
+  isGrantableCategory,
+  MIN_APPROVAL_LEVEL,
+  type ApprovalCategory,
+  type ApprovalLevel,
+} from "./approval-level.js";
+
+export interface ApprovalRequest {
+  approvalId: string;
+  sessionId: string;
+  tool: string;
+  /**
+   * What kind of action is being gated. Decides whether the current
+   * approval level auto-approves the request; call sites categorise
+   * because only they know the context (fs tools know the target path,
+   * the shell tool knows the guard verdict, and so on).
+   */
+  category: ApprovalCategory;
+  reason: string;
+  /** Human-readable preview of the action (command, diff snippet, URL, …). */
+  preview?: string;
+  affectedResources?: string[];
+  /**
+   * Normalised command binary (argv[0]) for `category: "shell"` requests,
+   * e.g. `git`. It is the unit a shape grant (`[a]`) covers: "always
+   * allow `git` this session". Set only by the shell tool; absent means
+   * the shape option is not offered.
+   */
+  commandShape?: string;
+  /**
+   * Absolute path this request would write, when the host may offer to
+   * retarget it before approving (`[e]` in the TUI). Set only by tools
+   * whose target is a free choice rather than a file the model just
+   * read — currently `os.fs.write`. Absent means "no redirect offered",
+   * and a host that ignores the field behaves exactly as before.
+   */
+  redirectablePath?: string;
+  /**
+   * Absolute paths of the files this call would replace, move or remove
+   * as a whole, when the tool can name them. A file tool sets them only
+   * for a whole-file action: `os.fs.write` replacing a file, `os.fs.trash`,
+   * `os.fs.restore` — an edit or a patch changes part of a file and names
+   * none. A shell command names the files its line writes, redirects
+   * into, moves, copies onto or removes (`shellWriteTargets`). Read only
+   * by the gate's same-turn rule (`declinedInTurn`): once the user has
+   * pressed Deny on a whole-file call, a shell command or another call of
+   * the same tool that would change one of its files this turn is the
+   * same action by another route.
+   */
+  targetPaths?: string[];
+}
+
+/**
+ * The scope a caller asks the gate to remember when it approves a
+ * request. Absent means "this call only" (`y`); `category` grants the
+ * whole `ApprovalCategory` for the session (`s`); `shape` grants the
+ * request's `commandShape` binary (`a`, shell only). The gate reads the
+ * category/shape from its own pending request, never from the caller:
+ * the caller names the scope, not the value, so a host cannot grant a
+ * category the prompt was not about.
+ */
+export type ApprovalGrantScope = "category" | "shape";
+
+export interface ApprovalDecision {
+  approvalId: string;
+  approved: boolean;
+  /**
+   * On a denial by a person, their own words if they typed any (a
+   * surface with only a Deny button leaves it unset — a tag such as
+   * "tui-denied" would reach the model as something the user said). On
+   * an `automatic` denial, the system's explanation; with
+   * `declinedEarlier`, what the user declined ("this same call").
+   */
+  reason?: string;
+  /**
+   * True when no person made this decision: a session refuse policy, a
+   * prompt that timed out or could not be delivered, one dropped because
+   * its surface stopped watching the session. The model is told the user
+   * declined only when this is unset (see `describeApprovalDenial`).
+   */
+  automatic?: boolean;
+  /**
+   * Set with `automatic` when the gate refused the call because the user
+   * already declined it, or a call changing the same file, earlier in
+   * this turn (`declinedInTurn`). Nobody decided on this call, but a
+   * user's no stands behind it: callers report it as the user's
+   * decision, not a system refusal (`describeApprovalDenial`).
+   */
+  declinedEarlier?: boolean;
+  /** Session grant to record alongside an approval. Ignored when denied. */
+  grant?: ApprovalGrantScope;
+  /**
+   * Operator-supplied replacement for the request's `redirectablePath`,
+   * approved along with the call. The gate passes it through untouched:
+   * it is the *tool* that resolves it, re-categorises it, and decides
+   * whether the new target needs another prompt — the gate never lets a
+   * decision widen the scope it was asked about. Ignored when denied,
+   * and by every tool that did not set `redirectablePath`.
+   */
+  pathOverride?: string;
+}
+
+export type ApprovalEmitter = (request: ApprovalRequest) => void;
+
+/**
+ * What the gate does for a session's request that would otherwise
+ * prompt. `refuse` resolves it denied with `reason`, emitting nothing:
+ * for a session with nobody at the other end of a prompt (a fusion
+ * worker — the operator's surface is showing the parent session), where
+ * parking the turn on an unanswerable question would hold it until the
+ * process exits. Auto-approval still wins first: a level or a grant that
+ * would run the call without asking still runs it.
+ */
+export interface SessionApprovalPolicy {
+  onPrompt: "refuse";
+  reason: string;
+}
+
+/** A live, in-memory view of a session's point grants. Diagnostic only. */
+export interface SessionGrantsSnapshot {
+  categories: readonly ApprovalCategory[];
+  shapes: readonly string[];
+}
+
+export class ApprovalGateError extends Error {
+  constructor(
+    message: string,
+    public readonly approvalId: string,
+  ) {
+    super(message);
+    this.name = "ApprovalGateError";
+  }
+}
+
+/**
+ * What the user pressed Deny on in a session's current turn. `calls`
+ * holds the `callKey` of every such call; `targets` maps each file a
+ * whole-file call among them would have changed (`targetPaths`) to its
+ * tool.
+ */
+interface DeclinedInTurn {
+  calls: Set<string>;
+  targets: Map<string, string>;
+}
+
+/** The parts of a request the same-turn target rule reads. */
+type TargetQuery = Pick<
+  ApprovalRequest,
+  "sessionId" | "tool" | "category" | "targetPaths"
+>;
+
+interface PendingEntry {
+  resolve: (decision: ApprovalDecision) => void;
+  request: ApprovalRequest;
+  /**
+   * Detaches the caller's abort listener. `{ once: true }` only fires —
+   * and so only self-removes — when the signal actually aborts, which
+   * never happens on the normal approve/deny path. Without this the
+   * listener stays attached to a signal that lives for the whole turn,
+   * so every gated tool call in a turn leaks one listener plus the
+   * closure over its `request` (which carries the command preview).
+   */
+  detach: () => void;
+  /**
+   * The ledger of the tool call that asked (see `approval-ledger.ts`),
+   * captured in the caller's async context when the prompt goes out. The
+   * verdict is written to it on `resolve`, so the transcript can say where
+   * in the turn the operator was asked and what they answered.
+   */
+  ledger: ToolApprovalRecord[] | undefined;
+}
+
+/**
+ * Single-pending-request approval gate. The agent loop calls `request()`
+ * and awaits a decision; the sidecar (or CLI) replies via `resolve()`.
+ * Concurrent approvals per session are out of scope — the agent loop is
+ * strictly sequential.
+ *
+ * On top of the standing approval level, the gate holds in-memory,
+ * per-session grant sets ("point exceptions"): approved categories and
+ * approved shell command shapes, keyed by the id of the session that
+ * granted them. A grant silences its category/shape for the rest of
+ * that session without moving the standing level. Because grants are
+ * keyed by session id, a request from a different session — a background
+ * task turn, a second live session on the same runtime — shares this
+ * gate but never rides another session's grant. Grants never persist and
+ * never bypass the two hard limits: hardline shell-guard rules block
+ * before the gate is ever called, and `trust_config` is never grantable
+ * (see `request` / `resolve`).
+ */
+export class ApprovalGate {
+  private readonly pending = new Map<string, PendingEntry>();
+  private readonly emitter: ApprovalEmitter;
+  private level: ApprovalLevel;
+  /**
+   * Session grants keyed by the id of the session that made them. A grant
+   * is a point exception scoped to *that* session; a request from another
+   * session (a background task turn, a second live session) shares this
+   * gate but never sees it. This keying is what makes "session-scoped" a
+   * structural fact rather than a promise every caller remembers to honour
+   * by calling `clearSessionGrants()`.
+   */
+  private readonly grantsBySession = new Map<
+    string,
+    { categories: Set<ApprovalCategory>; shapes: Set<string> }
+  >();
+  /** Per-session prompt policies, keyed like the grants. See `SessionApprovalPolicy`. */
+  private readonly policiesBySession = new Map<string, SessionApprovalPolicy>();
+  /**
+   * What the user declined in each session's current turn, keyed like
+   * the grants and emptied when the next turn starts — see
+   * `forgetDeclined`. A model told "the user declined" still asked for
+   * the same write three more times and then tried it through the shell
+   * (ATO-225); the human was asked every time. A repeat is now refused
+   * here, without a prompt.
+   */
+  private readonly declinedBySession = new Map<string, DeclinedInTurn>();
+  /**
+   * Fusion worker session → the orchestrator session it works for (see
+   * `followDeclined`): a worker's calls are refused over what the user
+   * declined on the parent's turn too, so re-delegating a declined write
+   * is not the way round it.
+   */
+  private readonly declinedParentBySession = new Map<string, string>();
+
+  /**
+   * Directories a session may write in without asking — see
+   * `fanout-scope.ts`. Lives on the gate because every caller that can
+   * ask for an approval already holds the gate, so nothing new has to be
+   * threaded through the fs tools to reach it.
+   *
+   * Read by `requireFsApproval`, not by `request()`: the scope is about
+   * paths, and paths are known one layer up, where the fs funnel has
+   * already resolved them.
+   */
+  readonly fanoutScopes = new FanoutScopeRegistry();
+
+  /**
+   * Directories a session may read in without asking again — the `y`
+   * of an `fs_read_outside` prompt, remembered per session (see
+   * `read-scope-grants.ts`). A session grant in every sense but its
+   * unit (a path, not a category), so it lives here and is dropped by
+   * `clearSessionGrants` with the rest.
+   */
+  readonly readScopeGrants = new ReadScopeGrants();
+
+  constructor(options: { emit: ApprovalEmitter; level?: ApprovalLevel }) {
+    this.emitter = options.emit;
+    this.level = options.level ?? MIN_APPROVAL_LEVEL;
+  }
+
+  /**
+   * Install a prompt policy for `sessionId`. Applies only to requests
+   * from that session, and only to the ones auto-approval does not
+   * already settle. Replaces any earlier policy for the session.
+   */
+  setSessionPolicy(sessionId: string, policy: SessionApprovalPolicy): void {
+    this.policiesBySession.set(sessionId, policy);
+  }
+
+  /** Remove the session's policy so its requests prompt again. */
+  clearSessionPolicy(sessionId: string): void {
+    this.policiesBySession.delete(sessionId);
+  }
+
+  /**
+   * Move the approval level at runtime, in either direction. Out-of-range
+   * input is clamped to [1, 5]. Level 1 prompts for every request; level
+   * 5 auto-approves everything; levels in between auto-approve by
+   * request category (see `approval-level.ts`). Already-pending requests
+   * are not resolved retroactively — they still wait for their decision.
+   */
+  setLevel(level: number): void {
+    this.level = clampApprovalLevel(level);
+  }
+
+  /** Current approval level (live value, not the constructor arg). */
+  getLevel(): ApprovalLevel {
+    return this.level;
+  }
+
+  /**
+   * Drop session grants. With a `sessionId`, drops only that session's
+   * grants; with no argument, drops all of them (the TUI calls the
+   * no-arg form on a session switch / new session as a belt-and-braces
+   * reset — the per-session keying already isolates other sessions). The
+   * standing level is untouched: it is a durable posture, grants are not.
+   * What the session's user declined this turn (`declinedInTurn`), and a
+   * worker's link to its parent's (`followDeclined`), go with them.
+   */
+  clearSessionGrants(sessionId?: string): void {
+    this.readScopeGrants.clear(sessionId);
+    if (sessionId === undefined) {
+      this.grantsBySession.clear();
+      this.declinedBySession.clear();
+      this.declinedParentBySession.clear();
+      return;
+    }
+    this.grantsBySession.delete(sessionId);
+    this.declinedBySession.delete(sessionId);
+    this.declinedParentBySession.delete(sessionId);
+  }
+
+  /**
+   * Snapshot of live grants. With a `sessionId`, only that session's
+   * grants; with no argument, the union across every session (in a TUI
+   * process only the interactive operator ever records grants, so the
+   * union is exactly their live set). Diagnostic / UI only.
+   */
+  sessionGrants(sessionId?: string): SessionGrantsSnapshot {
+    if (sessionId !== undefined) {
+      const entry = this.grantsBySession.get(sessionId);
+      return {
+        categories: entry ? [...entry.categories] : [],
+        shapes: entry ? [...entry.shapes] : [],
+      };
+    }
+    const categories = new Set<ApprovalCategory>();
+    const shapes = new Set<string>();
+    for (const entry of this.grantsBySession.values()) {
+      for (const category of entry.categories) categories.add(category);
+      for (const shape of entry.shapes) shapes.add(shape);
+    }
+    return { categories: [...categories], shapes: [...shapes] };
+  }
+
+  request(
+    params: Omit<ApprovalRequest, "approvalId"> & { approvalId?: string },
+    { signal }: { signal?: AbortSignal } = {},
+  ): Promise<ApprovalDecision> {
+    const approvalId = params.approvalId ?? randomUUID();
+    const request: ApprovalRequest = { ...params, approvalId };
+    // Before auto-approval: a level or a grant that would run a write
+    // silently must not become the way round the user's own Deny of it
+    // a few steps earlier.
+    const declined = this.declinedInTurn(request);
+    if (declined !== null) {
+      return Promise.resolve({
+        approvalId,
+        approved: false,
+        reason: declined,
+        automatic: true,
+        declinedEarlier: true,
+      });
+    }
+    const auto = this.autoApproval(request);
+    if (auto)
+      return Promise.resolve({ approvalId, approved: true, reason: auto });
+    // Would prompt from here on. A session under a refuse policy gets its
+    // denial now, and no emitter ever sees the request — there is no
+    // surface that could answer it.
+    const policy = this.policiesBySession.get(request.sessionId);
+    if (policy?.onPrompt === "refuse") {
+      return Promise.resolve({
+        approvalId,
+        approved: false,
+        reason: policy.reason,
+        automatic: true,
+      });
+    }
+    return new Promise<ApprovalDecision>((resolve, reject) => {
+      const onAbort = (): void => {
+        this.pending.delete(approvalId);
+        reject(
+          new ApprovalGateError(
+            "approval aborted before a decision was made",
+            approvalId,
+          ),
+        );
+      };
+      const detach = (): void => {
+        signal?.removeEventListener("abort", onAbort);
+      };
+      this.pending.set(approvalId, {
+        resolve,
+        request,
+        detach,
+        ledger: currentApprovalLedger(),
+      });
+      // An already-aborted signal never fires `abort`, so check before
+      // subscribing rather than hanging until the turn is torn down.
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.emitter(request);
+    });
+  }
+
+  /**
+   * Decide whether `request` runs without a prompt, and why. The
+   * standing level wins first; a session grant is the point exception
+   * checked next. `trust_config` is excluded from grants here (it is
+   * pinned at level 5 and is the self-escalation surface), so a grant
+   * can never silence a config/`.env` write. Returns the reason string
+   * on auto-approval, or `null` to prompt.
+   */
+  private autoApproval(request: ApprovalRequest): string | null {
+    if (isAutoApprovedAt(this.level, request.category)) {
+      return `auto-approved (level ${this.level})`;
+    }
+    if (!isGrantableCategory(request.category)) return null;
+    const grants = this.grantsBySession.get(request.sessionId);
+    if (!grants) return null;
+    if (grants.categories.has(request.category)) {
+      return "auto-approved (session grant)";
+    }
+    if (
+      request.category === "shell" &&
+      request.commandShape &&
+      grants.shapes.has(request.commandShape)
+    ) {
+      return `auto-approved (session grant: ${request.commandShape})`;
+    }
+    return null;
+  }
+
+  /**
+   * Whether `request` repeats something the user declined earlier in
+   * this turn, and if so what they declined (the refusal's `reason`).
+   * Only a bare Deny counts (`recordDeclined`), and two matches:
+   *
+   *  - the same call: same tool, category, reason, preview and
+   *    resources (`callKey`);
+   *  - the same file by another route: a shell command, or another call
+   *    of the same tool, that would change a file a whole-file call the
+   *    user declined would have changed — the `printf … > test10.txt`
+   *    after a denied `os.fs.write test10.txt`, or that write again with
+   *    other content. An edit or a patch names no target, so a different
+   *    edit of the file asks again: a no to one hunk is not a no to the
+   *    file. Nor is a denied shell command a no to its targets: its
+   *    redirects are a side of what it was for, and a no to
+   *    `npm test > out.log` is not a no to every later write of out.log.
+   *
+   * Nothing else matches. A call the gate cannot tie to a declined one
+   * (a target it cannot name, a different command) still asks the user:
+   * a false refusal costs more than one more question.
+   */
+  private declinedInTurn(request: ApprovalRequest): string | null {
+    const key = callKey(request);
+    for (const declined of this.declinedRecords(request.sessionId)) {
+      if (declined.calls.has(key)) return "this same call";
+    }
+    return this.declinedTarget(request);
+  }
+
+  /**
+   * The target rule of `declinedInTurn` on its own: what the user
+   * declined that `query` would change by another route, or `null`.
+   */
+  private declinedTarget(query: TargetQuery): string | null {
+    const targets = normaliseTargets(query.targetPaths);
+    if (targets.length === 0) return null;
+    for (const declined of this.declinedRecords(query.sessionId)) {
+      for (const target of targets) {
+        const tool = declined.targets.get(target);
+        if (
+          tool !== undefined &&
+          (query.category === "shell" || tool === query.tool)
+        ) {
+          return `${tool} on ${target} (this call would change that file too)`;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** The session's own record, then the one of the session it works for. */
+  private declinedRecords(sessionId: string): DeclinedInTurn[] {
+    const records: DeclinedInTurn[] = [];
+    const own = this.declinedBySession.get(sessionId);
+    if (own !== undefined) records.push(own);
+    const parent = this.declinedParentBySession.get(sessionId);
+    const inherited =
+      parent === undefined ? undefined : this.declinedBySession.get(parent);
+    if (inherited !== undefined) records.push(inherited);
+    return records;
+  }
+
+  /**
+   * Remember a bare Deny, for `declinedInTurn`. A typed reply is left
+   * out: its words reach the model as a steer the loop only drains at
+   * the next step, and "yes, go ahead" or "put it in ~/Documents" can
+   * make the very next call the thing the user asked for.
+   */
+  private recordDeclined(request: ApprovalRequest, reason?: string): void {
+    if ((reason?.trim() ?? "") !== "") return;
+    let declined = this.declinedBySession.get(request.sessionId);
+    if (declined === undefined) {
+      declined = { calls: new Set(), targets: new Map() };
+      this.declinedBySession.set(request.sessionId, declined);
+    }
+    declined.calls.add(callKey(request));
+    if (request.category === "shell") return;
+    for (const target of normaliseTargets(request.targetPaths)) {
+      declined.targets.set(target, request.tool);
+    }
+  }
+
+  /**
+   * Whether the gate would refuse `query` because the user declined a
+   * file it would change earlier in this turn (`declinedInTurn`'s target
+   * rule). For callers that would otherwise run it without asking — a
+   * fusion worker inside its fan-out's directory — so that the call
+   * reaches the gate, which refuses it.
+   */
+  hasDeclinedTarget(query: TargetQuery): boolean {
+    return this.declinedTarget(query) !== null;
+  }
+
+  /**
+   * Whether the user declined a whole-file call this turn on a file
+   * under one of `dirs`. A fan-out into those directories would let its
+   * workers write the file unasked, so `fusion.delegate` asks again
+   * rather than ride the turn's standing yes.
+   */
+  hasDeclinedUnder(sessionId: string, dirs: readonly string[]): boolean {
+    const declined = this.declinedBySession.get(sessionId);
+    if (declined === undefined) return false;
+    return [...declined.targets.keys()].some((target) =>
+      dirs.some((dir) => isInside(resolvePath(dir), target)),
+    );
+  }
+
+  /**
+   * Forget the files under `dirs` the user declined on `sessionId`:
+   * they have since answered yes to a fan-out writing there, asked
+   * knowing what they had declined, and that is the newer answer.
+   */
+  forgetDeclinedUnder(sessionId: string, dirs: readonly string[]): void {
+    const declined = this.declinedBySession.get(sessionId);
+    if (declined === undefined) return;
+    for (const target of [...declined.targets.keys()]) {
+      if (dirs.some((dir) => isInside(resolvePath(dir), target))) {
+        declined.targets.delete(target);
+      }
+    }
+  }
+
+  /**
+   * Hold `sessionId` (a fusion worker) to what the user declined on
+   * `parentSessionId` (its orchestrator) in the current turn, until
+   * `clearSessionGrants(sessionId)`.
+   */
+  followDeclined(sessionId: string, parentSessionId: string): void {
+    this.declinedParentBySession.set(sessionId, parentSessionId);
+  }
+
+  /**
+   * Whether a request of `category` from `sessionId` would be put to a
+   * person now: neither the level nor a grant settles it, and no refuse
+   * policy answers for the session.
+   */
+  wouldPrompt(sessionId: string, category: ApprovalCategory): boolean {
+    const probe = { approvalId: "", sessionId, tool: "", category, reason: "" };
+    if (this.autoApproval(probe) !== null) return false;
+    return this.policiesBySession.get(sessionId)?.onPrompt !== "refuse";
+  }
+
+  /**
+   * Forget what the user declined on `sessionId`. Called when a turn
+   * starts and when the user steers a running one: what they say next is
+   * a new answer, and the same call may be exactly what they now want.
+   */
+  forgetDeclined(sessionId: string): void {
+    this.declinedBySession.delete(sessionId);
+  }
+
+  resolve(decision: ApprovalDecision): boolean {
+    const entry = this.pending.get(decision.approvalId);
+    if (!entry) return false;
+    this.pending.delete(decision.approvalId);
+    entry.detach();
+    entry.ledger?.push({
+      verdict: decision.approved ? "approved" : "denied",
+      category: entry.request.category,
+      at: Date.now(),
+    });
+    if (decision.approved && decision.grant) {
+      this.recordGrant(entry.request, decision.grant);
+    }
+    // Only a person's no: a timeout or a dropped prompt is nobody's
+    // decision, and must not stop the model asking again.
+    if (!decision.approved && decision.automatic !== true) {
+      this.recordDeclined(entry.request, decision.reason);
+    }
+    entry.resolve(decision);
+    return true;
+  }
+
+  /**
+   * Record a session grant from an approved decision. The scope comes
+   * from the caller but the value comes from the gate's own pending
+   * request. Never grants `trust_config`, the one category that could
+   * silently raise trust for the next boot, regardless of what the
+   * caller asked; a shape grant needs a `commandShape` on a shell
+   * request or it is a no-op.
+   */
+  private recordGrant(
+    request: ApprovalRequest,
+    scope: ApprovalGrantScope,
+  ): void {
+    if (!isGrantableCategory(request.category)) return;
+    const grants = this.grantsForSession(request.sessionId);
+    if (scope === "category") {
+      grants.categories.add(request.category);
+      return;
+    }
+    if (request.category === "shell" && request.commandShape) {
+      grants.shapes.add(request.commandShape);
+    }
+  }
+
+  /** Get (or lazily create) the grant set for a session id. */
+  private grantsForSession(sessionId: string): {
+    categories: Set<ApprovalCategory>;
+    shapes: Set<string>;
+  } {
+    let entry = this.grantsBySession.get(sessionId);
+    if (!entry) {
+      entry = { categories: new Set(), shapes: new Set() };
+      this.grantsBySession.set(sessionId, entry);
+    }
+    return entry;
+  }
+
+  /** A person's denial; `reason` is what they said (see `ApprovalDecision`). */
+  reject(approvalId: string, reason: string): boolean {
+    return this.resolve({ approvalId, approved: false, reason });
+  }
+
+  /**
+   * Deny every request `sessionId` has pending, with `reason` as the
+   * decision reason the blocked tool call reports back to the model.
+   *
+   * For hosts whose approval surface stops watching a session while a
+   * turn keeps running on it — the TUI switching threads mid-turn is the
+   * case in point. An unresolved request would park that turn forever on
+   * `await request()`: nobody is left to answer, and the per-session
+   * FIFO would hold the session busy until process exit. Denying with an
+   * explicit reason is the same shape as the Telegram bridge's auto-deny
+   * timeout: the turn continues, the transcript says why.
+   *
+   * Returns how many requests were denied so the caller can tell the
+   * operator what switching away did.
+   */
+  denyPendingForSession(sessionId: string, reason: string): number {
+    const ids: string[] = [];
+    for (const [approvalId, entry] of this.pending) {
+      if (entry.request.sessionId === sessionId) ids.push(approvalId);
+    }
+    // Nobody answered these, so they are not the user's decision.
+    for (const approvalId of ids) {
+      this.resolve({ approvalId, approved: false, reason, automatic: true });
+    }
+    return ids.length;
+  }
+
+  /**
+   * The request `sessionId` is currently parked on, if any.
+   *
+   * For hosts whose approval surface follows the visible session: a
+   * request raised by an off-screen session is only *pointed at* there
+   * (answering keys must never act across sessions), so when the
+   * operator navigates into the owning session the host needs the
+   * original request back to re-raise the prompt. At most one request
+   * is pending per session by design, so first match is the match.
+   */
+  pendingRequestForSession(sessionId: string): ApprovalRequest | null {
+    for (const entry of this.pending.values()) {
+      if (entry.request.sessionId === sessionId) return entry.request;
+    }
+    return null;
+  }
+
+  /**
+   * The request `approvalId` is parked on, or `null` once it is resolved
+   * or dropped. For a host that must check what a decision may grant
+   * before it sends one: the HTTP route offers "allow in this chat" only
+   * where the request carries a shape (`canGrantShape`).
+   */
+  pendingRequest(approvalId: string): ApprovalRequest | null {
+    return this.pending.get(approvalId)?.request ?? null;
+  }
+
+  /**
+   * Whether `approvalId` still waits for a decision here. False once it
+   * is resolved, or dropped because the turn that asked was aborted. A
+   * session can hold more than one request at a time (calls of different
+   * resource classes in one batch run concurrently), so a host mirroring
+   * requests checks by id, not by `pendingRequestForSession`.
+   */
+  isPending(approvalId: string): boolean {
+    return this.pending.has(approvalId);
+  }
+
+  pendingCount(): number {
+    return this.pending.size;
+  }
+}
+
+/**
+ * Whether the approval prompt may offer `[s]` (grant the whole category
+ * for the session) for this request. Everything is grantable except
+ * `trust_config`. Shared by every surface (TUI modal, TUI keys, CLI
+ * prompt) so the offer set never drifts between them.
+ */
+export function canGrantCategory(request: ApprovalRequest): boolean {
+  return isGrantableCategory(request.category);
+}
+
+/**
+ * Whether the prompt may offer `[a]` (grant this shell command shape).
+ * Only for a shell request that carries a `commandShape`; the shell tool
+ * deliberately withholds the shape for opaque interpreters (`bash -c …`),
+ * so `[a]` is never offered where the binary name hides what runs.
+ */
+export function canGrantShape(request: ApprovalRequest): boolean {
+  return request.category === "shell" && Boolean(request.commandShape);
+}
+
+/**
+ * A call's identity for the same-turn denial rule: what the prompt
+ * showed the user, not its id. Whitespace in the preview is collapsed so a command
+ * re-emitted with different spacing is still the same command; target
+ * paths are normalised, so `./notes.txt` and `notes.txt` are one file.
+ */
+function callKey(request: ApprovalRequest): string {
+  return JSON.stringify([
+    request.tool,
+    request.category,
+    request.reason,
+    (request.preview ?? "").replace(/\s+/g, " ").trim(),
+    [...(request.affectedResources ?? [])].sort(),
+    normaliseTargets(request.targetPaths).sort(),
+  ]);
+}
+
+/** `targetPaths` resolved and de-duplicated (`..`, `.`, trailing `/`). */
+function normaliseTargets(paths: readonly string[] | undefined): string[] {
+  if (paths === undefined) return [];
+  return [...new Set(paths.map((p) => resolvePath(p)))];
+}

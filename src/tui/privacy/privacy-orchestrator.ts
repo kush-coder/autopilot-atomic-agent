@@ -1,0 +1,73 @@
+import type { AnalyticsDisabledVia } from "../../analytics/index.js";
+import { getConfig } from "../../config/index.js";
+import type { AgentRuntime } from "../../runtime/bootstrap.js";
+import type { TuiEventBus } from "../tui-app.js";
+import { persistAnalyticsEnabled } from "../persist-analytics-enabled.js";
+
+/**
+ * Only TUI module that persists `analytics.enabled` and hot-applies it
+ * to the runtime. The reducer/component stay pure; every side effect
+ * (config write, `resetConfigCache`, `runtime.setAnalyticsEnabled`) is
+ * funnelled through here — mirrors the other TUI orchestrators.
+ */
+export class PrivacyOrchestrator {
+  constructor(
+    private readonly runtime: AgentRuntime,
+    private readonly bus: TuiEventBus & { emit(action: unknown): void },
+  ) {}
+
+  /**
+   * Push the current settings snapshot into the UI: the persisted
+   * `analytics.enabled` plus the live session grants. Also mirrors the
+   * LIVE approval-gate level into `state.session` so the diagnostics
+   * line stays truthful (e.g. after a `--no-approval` boot).
+   */
+  refresh(): void {
+    this.bus.emit({
+      type: "privacy_synced",
+      analyticsEnabled: getConfig().analytics.enabled,
+      sessionGrants: this.runtime.approvals.sessionGrants(),
+    });
+    this.bus.emit({
+      type: "approval_level_changed",
+      approvalLevel: this.runtime.getApprovalLevel(),
+    });
+  }
+
+  /** Flip analytics to the opposite of the live config value (settings tab). */
+  async toggleAnalytics(): Promise<void> {
+    await this.setAnalyticsEnabled(!getConfig().analytics.enabled, "settings");
+  }
+
+  /**
+   * Persist `analytics.enabled = enabled`, invalidate the config cache,
+   * then hot-swap the runtime clients. Fire-safe: a failure surfaces as a
+   * sticky error line and the settled action clears `busy`. `via` says
+   * where an opt-out came from, for the `analytics_disabled` event.
+   */
+  async setAnalyticsEnabled(
+    enabled: boolean,
+    via: AnalyticsDisabledVia = "settings",
+  ): Promise<void> {
+    this.bus.emit({ type: "privacy_action_started" });
+    try {
+      persistAnalyticsEnabled(enabled);
+      await this.runtime.setAnalyticsEnabled(enabled, via);
+      this.bus.emit({
+        type: "privacy_action_settled",
+        message: enabled ? "analytics enabled" : "analytics disabled",
+      });
+      this.refresh();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.bus.emit({
+        type: "privacy_action_settled",
+        error: `analytics toggle failed: ${msg}`,
+      });
+      this.bus.emit({
+        type: "runtime_info",
+        line: `privacy: analytics toggle failed: ${msg}`,
+      });
+    }
+  }
+}

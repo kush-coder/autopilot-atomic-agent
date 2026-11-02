@@ -1,0 +1,304 @@
+import { getConfig } from "../../../config/index.js";
+import { LlamaServerClient } from "../../llama-server-client.js";
+import { AimlapiProvider } from "../aimlapi/aimlapi-provider.js";
+import { AIMLAPI_DEFAULT_CHAT_MODEL } from "../aimlapi/aimlapi-models-catalog.js";
+import {
+  GeminiProvider,
+  GEMINI_DEFAULT_CHAT_MODEL,
+} from "../gemini/gemini-provider.js";
+import { LlamaServerProvider } from "../llama-server/llama-server-provider.js";
+import { OpenAiProvider } from "../openai/openai-provider.js";
+import type { ProviderCapabilities } from "../llm-provider.js";
+import { resolveCloudModelVision } from "../model-vision.js";
+import {
+  OpenRouterProvider,
+  OPENROUTER_APP_CATEGORIES,
+  OPENROUTER_APP_REFERER,
+  OPENROUTER_APP_TITLE,
+} from "../openrouter/openrouter-provider.js";
+import { SUBSCRIPTION_CLI_KIND } from "../../../config/provider-auth-mode.js";
+import {
+  registerBuiltInCliAdapters,
+  resolveCliAdapter,
+  SubscriptionCliProvider,
+} from "../subscription-cli/index.js";
+import {
+  registerProviderKind,
+  type LlmProviderConfigEntry,
+} from "./provider-types.js";
+
+let registered = false;
+
+/**
+ * What the entry's `userModels[]` row for the model it serves says about
+ * the wire: a pinned reasoning field (`reasoningFormat`) and per-model
+ * request parameters (`params`). Read here, at construction, because the
+ * provider is rebuilt whenever the entry changes; a row for some other
+ * model on the same entry says nothing about this one. Absent, the
+ * provider keeps its defaults (`auto` reasoning, no extra parameters).
+ */
+function modelWireOptions(
+  entry: LlmProviderConfigEntry,
+  modelId: string,
+): {
+  reasoningFormat?: NonNullable<LlmProviderConfigEntry["userModels"]>[number]["reasoningFormat"];
+  modelParams?: Record<string, unknown>;
+} {
+  const row = entry.userModels?.find((model) => model.id === modelId);
+  return {
+    ...(row?.reasoningFormat ? { reasoningFormat: row.reasoningFormat } : {}),
+    ...(row?.params ? { modelParams: row.params } : {}),
+  };
+}
+
+/**
+ * Whether the model this link serves can read images, per MODEL
+ * (`model-vision.ts`): the entry's `userModels[]` row, the entry's own
+ * `supportsVision`, the catalogue, else `assumed`. Read at construction
+ * for the same reason as `modelWireOptions` — a model switch rebuilds
+ * the provider. `assumed` is left implicit so the provider can learn
+ * from the first image the service rejects.
+ */
+function modelVisionOptions(
+  entry: LlmProviderConfigEntry,
+  modelId: string,
+): { supportsVision?: boolean; visionSource?: ProviderCapabilities["visionSource"] } {
+  const verdict = resolveCloudModelVision(entry, modelId);
+  if (verdict.visionSource === "assumed") return {};
+  return { supportsVision: verdict.vision, visionSource: verdict.visionSource };
+}
+
+
+/**
+ * An entry that never serves chat: either every declared `userModels` row
+ * is an embedding, or it pins `defaultEmbeddingModel` and declares no chat
+ * model. Those may omit `defaultChatModel` (#410).
+ */
+function isEmbeddingOnlyEntry(entry: LlmProviderConfigEntry): boolean {
+  const rows = entry.userModels;
+  if (rows !== undefined && rows.length > 0) {
+    return rows.every((m) => m.kind === "embedding");
+  }
+  return (
+    entry.defaultEmbeddingModel !== undefined &&
+    entry.defaultChatModel === undefined
+  );
+}
+
+export function registerBuiltInProviderKinds(): void {
+  if (registered) return;
+  registered = true;
+
+  registerProviderKind("llama-server", (ctx) => {
+    const client = ctx.llamaClient ?? new LlamaServerClient();
+    const getProfile =
+      ctx.getProfile ??
+      (() => {
+        throw new Error("llama-server provider requires getProfile");
+      });
+    const config = getConfig();
+    return new LlamaServerProvider(client, {
+      id: ctx.entry.id,
+      getProfile,
+      visionEnabledByConfig: config.vision.enabled,
+      visionAutoDetect: config.vision.autoDetect,
+      maxImageBytes: config.vision.maxImageBytes,
+      maxImagesPerCall: config.vision.maxImagesPerCall,
+      baseUrlOverride: ctx.entry.url,
+      // The vision call's whole-request budget. Unforwarded it fell back
+      // to the provider's own hardcoded 120 s, which no knob reached,
+      // while text completions against the same server followed
+      // `localModels.requestTimeoutMs` — the entry's override first, as
+      // the openai-compatible kind does.
+      requestTimeoutMs:
+        ctx.entry.requestTimeoutMs ?? config.localModels.requestTimeoutMs,
+      ...(ctx.getModelId ? { getModelId: ctx.getModelId } : {}),
+      logger: ctx.logger,
+    });
+  });
+
+  registerProviderKind("openai-compatible", (ctx) => {
+    const entry = ctx.entry;
+    const isEmbeddingOnly = isEmbeddingOnlyEntry(entry);
+    if (!entry.baseUrl) {
+      throw new Error(
+        `openai-compatible provider "${entry.id}" requires baseUrl`,
+      );
+    }
+    if (!isEmbeddingOnly && !entry.defaultChatModel) {
+      throw new Error(
+        `openai-compatible provider "${entry.id}" requires defaultChatModel`,
+      );
+    }
+    const chatModel = entry.defaultChatModel ?? "";
+    return new OpenAiProvider({
+      id: entry.id,
+      providerKind: "openai-compatible",
+      baseUrl: entry.baseUrl,
+      apiKey: entry.apiKey ?? "",
+      defaultChatModel: entry.defaultChatModel,
+      headers: entry.headers,
+      apiKeyHeader: entry.apiKeyHeader,
+      ...(chatModel ? modelVisionOptions(entry, chatModel) : {}),
+      supportsParallelTools: entry.supportsTools ?? true,
+      requestTimeoutMs: entry.requestTimeoutMs,
+      extraBody: entry.extraBody,
+      maxOutputTokens: entry.maxOutputTokens,
+      strictTools: entry.strictTools,
+      promptCache: entry.promptCache,
+      messageShape: entry.messageShape,
+      ...(chatModel ? modelWireOptions(entry, chatModel) : {}),
+      logger: ctx.logger,
+    });
+  });
+
+  registerProviderKind("qwen-openai-compatible", (ctx) => {
+    const entry = ctx.entry;
+    const isEmbeddingOnly = isEmbeddingOnlyEntry(entry);
+    if (!entry.baseUrl) {
+      throw new Error(
+        `qwen-openai-compatible provider "${entry.id}" requires baseUrl`,
+      );
+    }
+    if (!isEmbeddingOnly && !entry.defaultChatModel) {
+      throw new Error(
+        `qwen-openai-compatible provider "${entry.id}" requires defaultChatModel`,
+      );
+    }
+    const chatModel = entry.defaultChatModel ?? "";
+    return new OpenAiProvider({
+      id: entry.id,
+      providerKind: "qwen-openai-compatible",
+      baseUrl: entry.baseUrl,
+      apiKey: entry.apiKey ?? "",
+      defaultChatModel: entry.defaultChatModel,
+      headers: entry.headers,
+      apiKeyHeader: entry.apiKeyHeader,
+      ...(chatModel ? modelVisionOptions(entry, chatModel) : {}),
+      supportsParallelTools: entry.supportsTools ?? true,
+      requestTimeoutMs: entry.requestTimeoutMs,
+      taggedToolCompatibility: "qwen",
+      extraBody: entry.extraBody,
+      maxOutputTokens: entry.maxOutputTokens,
+      strictTools: entry.strictTools,
+      promptCache: entry.promptCache,
+      messageShape: entry.messageShape,
+      ...(chatModel ? modelWireOptions(entry, chatModel) : {}),
+      logger: ctx.logger,
+    });
+  });
+
+  registerProviderKind("openrouter", (ctx) => {
+    const entry = ctx.entry;
+    const model = entry.defaultChatModel ?? "openrouter/auto";
+    return new OpenRouterProvider({
+      id: entry.id,
+      providerKind: "openrouter",
+      baseUrl: entry.baseUrl,
+      apiKey: entry.apiKey ?? "",
+      defaultChatModel: model,
+      headers: entry.headers,
+      ...modelVisionOptions(entry, model),
+      supportsParallelTools: entry.supportsTools ?? true,
+      requestTimeoutMs: entry.requestTimeoutMs,
+      extraBody: entry.extraBody,
+      maxOutputTokens: entry.maxOutputTokens,
+      strictTools: entry.strictTools,
+      promptCache: entry.promptCache,
+      messageShape: entry.messageShape,
+      ...modelWireOptions(entry, model),
+      // OpenRouter's own `provider` routing block. Deliberately wired on
+      // this kind alone: it is not part of the OpenAI schema, and no
+      // other kind here documents a field by that name.
+      providerPreferences: entry.providerPreferences,
+      // `llm.openrouter.preferCacheRoutes`, the llm-wide default that
+      // steers a Google model to its cache-capable routes when the entry
+      // pinned none itself. Absent in the file means on.
+      preferCacheRoutes: ctx.config.llm?.openrouter?.preferCacheRoutes ?? true,
+      logger: ctx.logger,
+      httpReferer: OPENROUTER_APP_REFERER,
+      xTitle: OPENROUTER_APP_TITLE,
+      categories: OPENROUTER_APP_CATEGORIES,
+    });
+  });
+
+  registerProviderKind("aimlapi", (ctx) => {
+    const entry = ctx.entry;
+    const model = entry.defaultChatModel ?? AIMLAPI_DEFAULT_CHAT_MODEL;
+    return new AimlapiProvider({
+      id: entry.id,
+      providerKind: "aimlapi",
+      baseUrl: entry.baseUrl,
+      apiKey: entry.apiKey ?? "",
+      defaultChatModel: model,
+      extraBody: entry.extraBody,
+      maxOutputTokens: entry.maxOutputTokens,
+      strictTools: entry.strictTools,
+      promptCache: entry.promptCache,
+      messageShape: entry.messageShape,
+      ...modelWireOptions(entry, model),
+      headers: entry.headers,
+      ...modelVisionOptions(entry, model),
+      supportsParallelTools: entry.supportsTools ?? true,
+      requestTimeoutMs: entry.requestTimeoutMs,
+      logger: ctx.logger,
+    });
+  });
+
+  registerProviderKind("gemini", (ctx) => {
+    const entry = ctx.entry;
+    const model = entry.defaultChatModel ?? GEMINI_DEFAULT_CHAT_MODEL;
+    return new GeminiProvider({
+      id: entry.id,
+      providerKind: "gemini",
+      baseUrl: entry.baseUrl,
+      apiKey: entry.apiKey ?? "",
+      defaultChatModel: model,
+      extraBody: entry.extraBody,
+      maxOutputTokens: entry.maxOutputTokens,
+      strictTools: entry.strictTools,
+      promptCache: entry.promptCache,
+      messageShape: entry.messageShape,
+      ...modelWireOptions(entry, model),
+      headers: entry.headers,
+      ...modelVisionOptions(entry, model),
+      supportsParallelTools: entry.supportsTools ?? true,
+      requestTimeoutMs: entry.requestTimeoutMs,
+      logger: ctx.logger,
+    });
+  });
+
+  registerProviderKind(SUBSCRIPTION_CLI_KIND, (ctx) => {
+    const entry = ctx.entry;
+    const options = entry.subscriptionCli;
+    if (!options) {
+      throw new Error(
+        `${SUBSCRIPTION_CLI_KIND} provider "${entry.id}" requires a subscriptionCli block naming the cli to drive`,
+      );
+    }
+    registerBuiltInCliAdapters();
+    const descriptor = resolveCliAdapter(options.cli);
+    return new SubscriptionCliProvider({
+      id: entry.id,
+      descriptor,
+      // The state dir, not the agent's working directory: with tools
+      // disabled there is nothing to read there anyway, and it keeps a
+      // project-level CLAUDE.md out of the completion.
+      cwd: ctx.config.paths.stateDir,
+      ...(entry.defaultChatModel ? { model: entry.defaultChatModel } : {}),
+      ...(options.binPath ? { binPath: options.binPath } : {}),
+      ...(options.extraArgs ? { extraArgs: options.extraArgs } : {}),
+      ...(options.streaming === undefined
+        ? {}
+        : { streaming: options.streaming }),
+      ...(options.maxBudgetUsd === undefined
+        ? {}
+        : { maxBudgetUsd: options.maxBudgetUsd }),
+      ...(entry.requestTimeoutMs
+        ? { requestTimeoutMs: entry.requestTimeoutMs }
+        : {}),
+      onNotice: (message) =>
+        ctx.logger.warn("llm.subscription_cli", { message }),
+    });
+  });
+}

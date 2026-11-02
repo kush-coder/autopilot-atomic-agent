@@ -1,0 +1,594 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { ApprovalGate } from "../approval/approval-gate.js";
+import { createEmptySessionState } from "../session/session-state.js";
+import { summarizeSessionState } from "../session/session-summary.js";
+import type { AgentRuntime } from "../runtime/bootstrap.js";
+import { ChatOrchestrator } from "./chat-orchestrator.js";
+import { SWITCHED_AWAY_APPROVAL_REASON } from "./detached-turns.js";
+import { makeTuiEventBus } from "./make-event-bus.js";
+import type { LocalTurnGateFacts } from "./local-turn-gate.js";
+import type { TuiAction } from "./tui-action.js";
+
+/** Hermetic gate facts: never read the developer's real config/disk. */
+const cloudGateFacts = (): LocalTurnGateFacts => ({
+  activeProviderIsLocal: false,
+  managedMode: false,
+  modelId: null,
+  modelDownloaded: true,
+  fallbackChainLength: 1,
+});
+
+/**
+ * Detach semantics: creating or switching sessions while a turn is
+ * running must neither refuse (the pre-detach behaviour) nor abort the
+ * turn — it keeps running against its own session, per the concurrency
+ * contract's cross-session parallelism.
+ */
+
+function session(id: string) {
+  return createEmptySessionState({ id, workingDir: "/tmp" });
+}
+
+interface TurnHandle {
+  text: string;
+  sessionId: string;
+  signal: AbortSignal;
+  resolve: (overrides?: {
+    reason?: string;
+    undelivered?: readonly string[];
+  }) => void;
+}
+
+function makeHarness(
+  opts: {
+    busySessions?: readonly string[];
+    maintenanceSessions?: readonly string[];
+    /** Real gate (or richer stub) for approval-lifecycle tests. */
+    approvals?: ApprovalGate;
+  } = {},
+) {
+  const turns: TurnHandle[] = [];
+  const stored = [session("s-a"), session("s-b")];
+  for (const state of stored) {
+    if (opts.busySessions?.includes(state.id) && !opts.maintenanceSessions?.includes(state.id)) state.status = "running";
+  }
+  let created = 0;
+  const denyPendingForSession = vi.fn(() => 0);
+  const clearSessionGrants = vi.fn();
+  const runtime = {
+    createSession: () => {
+      created += 1;
+      const fresh = session(`s-new-${created}`);
+      stored.unshift(fresh);
+      return fresh;
+    },
+    steer: () => false,
+    runTurn: (
+      s: { id: string },
+      text: string,
+      turnOpts: { signal: AbortSignal },
+    ) =>
+      new Promise((res) => {
+        turns.push({
+          text,
+          sessionId: s.id,
+          signal: turnOpts.signal,
+          resolve: (overrides = {}) =>
+            res({
+              session: session(s.id),
+              reason: overrides.reason ?? "reply",
+              stepCount: 1,
+              ...(overrides.undelivered
+                ? { undelivered: overrides.undelivered }
+                : {}),
+            }),
+        });
+      }),
+    sessionStore: {
+      listSummaryPage: ({ limit }: { limit: number }) =>
+        stored.map(summarizeSessionState).slice(0, limit),
+      countUnreadable: () => 0,
+      listRecent: () => stored,
+      load: (id: string) => stored.find((s) => s.id === id) ?? null,
+      delete: () => undefined,
+    },
+    approvals: opts.approvals ?? {
+      clearSessionGrants,
+      denyPendingForSession,
+      pendingRequestForSession: () => null,
+    },
+    turnController: {
+      isBusy: (id: string) => (opts.busySessions ?? []).includes(id),
+    },
+    config: {
+      update: { checkOnStartup: false, repo: "x/y" },
+      tracing: { trace: { dir: "/tmp", enabled: false } },
+    },
+    profileStore: { list: () => [] },
+    skillCatalog: [],
+  } as unknown as AgentRuntime;
+  const bus = makeTuiEventBus();
+  const actions: TuiAction[] = [];
+  bus.subscribe((a) => actions.push(a));
+  const orchestrator = new ChatOrchestrator(runtime, bus, {
+    maxSteps: 5,
+    llamaUrl: "http://127.0.0.1:8080",
+    readGateFacts: cloudGateFacts,
+  });
+  return {
+    orchestrator,
+    actions,
+    turns,
+    bus,
+    denyPendingForSession,
+    clearSessionGrants,
+  };
+}
+
+/** Actions emitted after the most recent `session_switched`. */
+function actionsAfterLastSwitch(actions: readonly TuiAction[]): TuiAction[] {
+  for (let i = actions.length - 1; i >= 0; i -= 1) {
+    if (actions[i]?.type === "session_switched") return actions.slice(i + 1);
+  }
+  return [...actions];
+}
+
+function lastSwitch(actions: readonly TuiAction[]) {
+  for (let i = actions.length - 1; i >= 0; i -= 1) {
+    const action = actions[i];
+    if (action?.type === "session_switched") return action;
+  }
+  return null;
+}
+
+function systemMessages(
+  actions: readonly TuiAction[],
+): Extract<TuiAction, { type: "system_message" }>[] {
+  return actions.filter(
+    (a): a is Extract<TuiAction, { type: "system_message" }> =>
+      a.type === "system_message",
+  );
+}
+
+function warnTexts(actions: readonly TuiAction[]): string[] {
+  return systemMessages(actions).map((a) => a.text);
+}
+
+/** The session a notice offers to open, or undefined when it offers none. */
+function switchTarget(
+  actions: readonly TuiAction[],
+  needle: string,
+): string | undefined {
+  const notice = systemMessages(actions).find((a) => a.text.includes(needle));
+  return notice?.switchToSessionId;
+}
+
+async function settle() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+describe("ChatOrchestrator new/switch session while a turn is running", () => {
+  it("newSession detaches the running turn instead of refusing or aborting it", () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("long running work");
+    expect(turns).toHaveLength(1);
+
+    orchestrator.newSession();
+
+    const switched = lastSwitch(actions);
+    expect(switched?.sessionId).toBe("s-new-2");
+    // The old turn keeps running: not aborted, and announced.
+    expect(turns[0]?.signal.aborted).toBe(false);
+    expect(
+      warnTexts(actions).some((t) => t.includes("continues in the background")),
+    ).toBe(true);
+    // The new thread is immediately usable — a second turn starts in
+    // parallel with the detached one (different sessions, no FIFO tie).
+    orchestrator.sendMessage("fresh thread work");
+    expect(turns).toHaveLength(2);
+    expect(turns[1]?.sessionId).toBe("s-new-2");
+  });
+
+  it("a detached turn's completion neither clobbers the visible session nor drains its queue", async () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("old thread work");
+    orchestrator.newSession();
+    orchestrator.sendMessage("new thread work");
+    orchestrator.sendMessage("parked for the new thread");
+    expect(turns).toHaveLength(2);
+
+    turns[0]?.resolve();
+    await settle();
+
+    // The parked message still waits for the NEW thread's turn.
+    expect(turns).toHaveLength(2);
+    expect(
+      warnTexts(actions).some((t) => t.includes("background turn finished")),
+    ).toBe(true);
+
+    turns[1]?.resolve();
+    await settle();
+    expect(turns).toHaveLength(3);
+    expect(turns[2]?.text).toBe("parked for the new thread");
+    expect(turns[2]?.sessionId).toBe("s-new-2");
+  });
+
+  it("switching back mid-turn re-attaches the abort handle", () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("work on the first thread");
+    const firstThreadId = turns[0]?.sessionId ?? "";
+
+    orchestrator.switchSession("s-b");
+    expect(turns[0]?.signal.aborted).toBe(false);
+
+    orchestrator.switchSession(firstThreadId);
+    const switched = lastSwitch(actions);
+    expect(switched?.sessionId).toBe(firstThreadId);
+    expect(switched?.running).toBe(true);
+
+    // Esc aborts the re-attached turn again.
+    orchestrator.abortCurrentTurn();
+    expect(turns[0]?.signal.aborted).toBe(true);
+  });
+
+  it("drops parked messages with a preview notice when switching away", () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("running");
+    orchestrator.sendMessage("parked message one");
+    orchestrator.sendMessage("parked message two");
+    expect(turns).toHaveLength(1);
+
+    orchestrator.switchSession("s-b");
+
+    const drop = warnTexts(actions).find((t) => t.includes("switched away"));
+    expect(drop).toContain("2 parked messages");
+    expect(drop).toContain("parked message one");
+    expect(drop).toContain("parked message two");
+    const lastQueue = actions
+      .filter(
+        (a): a is Extract<TuiAction, { type: "queue_changed" }> =>
+          a.type === "queue_changed",
+      )
+      .at(-1);
+    expect(lastQueue?.queued).toEqual([]);
+  });
+
+  it("denies the left thread's pending approval at the gate", () => {
+    const { orchestrator, denyPendingForSession, turns } = makeHarness();
+    orchestrator.sendMessage("running");
+    const leftId = turns[0]?.sessionId ?? "";
+    orchestrator.switchSession("s-b");
+    expect(denyPendingForSession).toHaveBeenCalledTimes(1);
+    expect(denyPendingForSession.mock.calls[0]?.[0]).toBe(leftId);
+  });
+
+  it("keeps the running thread's grants until its backgrounded turn ends", async () => {
+    const { orchestrator, clearSessionGrants, turns } = makeHarness();
+    orchestrator.sendMessage("running");
+    const leftId = turns[0]?.sessionId ?? "";
+    orchestrator.switchSession("s-b");
+    // Not cleared at switch time: the turn still runs under them.
+    expect(clearSessionGrants).not.toHaveBeenCalledWith(leftId);
+    turns[0]?.resolve();
+    await settle();
+    expect(clearSessionGrants).toHaveBeenCalledWith(leftId);
+  });
+
+  it("announces (and does not re-queue) a detached turn's undelivered steers", async () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("running");
+    orchestrator.newSession();
+
+    turns[0]?.resolve({ undelivered: ["correction that came too late"] });
+    await settle();
+
+    const notice = warnTexts(actions).find((t) =>
+      t.includes("steering message"),
+    );
+    expect(notice).toContain("correction that came too late");
+    // Nothing started a turn out of it on the new thread.
+    expect(turns).toHaveLength(1);
+  });
+
+  it("switching to the thread already on screen mid-run is a no-op", () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("running");
+    orchestrator.sendMessage("parked");
+    const before = actions.filter((a) => a.type === "session_switched").length;
+
+    orchestrator.switchSession(turns[0]?.sessionId ?? "");
+
+    expect(actions.filter((a) => a.type === "session_switched")).toHaveLength(
+      before,
+    );
+    expect(turns[0]?.signal.aborted).toBe(false);
+    // The parked queue survived — nothing was detached.
+    const lastQueue = actions
+      .filter(
+        (a): a is Extract<TuiAction, { type: "queue_changed" }> =>
+          a.type === "queue_changed",
+      )
+      .at(-1);
+    expect(lastQueue?.queued).toEqual(["parked"]);
+  });
+
+  it("marks a switch into a session busy with a foreign-origin turn as running", () => {
+    const { orchestrator, actions } = makeHarness({ busySessions: ["s-b"] });
+    orchestrator.switchSession("s-b");
+    expect(lastSwitch(actions)?.running).toBe(true);
+  });
+
+  it("does not treat a maintenance-only FIFO lock as an agent turn", () => {
+    const { orchestrator, actions } = makeHarness({ busySessions: ["s-b"], maintenanceSessions: ["s-b"] });
+    orchestrator.switchSession("s-b");
+    expect(lastSwitch(actions)?.running).toBe(false);
+  });
+
+  it("quit aborts detached turns too", () => {
+    const { orchestrator, turns } = makeHarness();
+    orchestrator.sendMessage("running");
+    orchestrator.newSession();
+    expect(turns[0]?.signal.aborted).toBe(false);
+    orchestrator.quit();
+    expect(turns[0]?.signal.aborted).toBe(true);
+  });
+
+  it("leaving a session denies a foreign-origin turn's pending approval too", async () => {
+    // The operator is READING s-a while a scheduler/HTTP-origin turn
+    // runs on it: no TUI controller exists, only the foreign turn's
+    // request parked at the gate. Leaving must still answer it — the
+    // reducer drops the surface either way, and an unanswered request
+    // parks that turn on `await request()` forever.
+    const gate = new ApprovalGate({ emit: () => undefined });
+    const { orchestrator, actions } = makeHarness({
+      approvals: gate,
+      busySessions: ["s-a"],
+    });
+    orchestrator.switchSession("s-a");
+    const request = gate.request({
+      sessionId: "s-a",
+      tool: "os.shell.run",
+      category: "shell",
+      reason: "no guard rule matched",
+    });
+    orchestrator.switchSession("s-b");
+    const decision = await request;
+    expect(decision.approved).toBe(false);
+    expect(decision.reason).toBe(SWITCHED_AWAY_APPROVAL_REASON);
+    // Nothing is left parked: the foreign turn can finish.
+    expect(gate.pendingCount()).toBe(0);
+    expect(
+      warnTexts(actions).some((t) => t.includes("pending approval was denied")),
+    ).toBe(true);
+  });
+
+  it("switching into the session that owns a parked approval re-raises the prompt", () => {
+    const gate = new ApprovalGate({ emit: () => undefined });
+    const { orchestrator, actions } = makeHarness({
+      approvals: gate,
+      busySessions: ["s-b"],
+    });
+    // A foreign-origin turn on the off-screen s-b asked its question;
+    // the reducer showed only a pointer notice. Walking into s-b must
+    // put the actual prompt up, or it could never be answered.
+    void gate.request({
+      sessionId: "s-b",
+      tool: "os.fs.write",
+      category: "fs_write_workspace",
+      reason: "write outside the workspace",
+    });
+    orchestrator.switchSession("s-b");
+    const raised = actionsAfterLastSwitch(actions).find(
+      (a): a is Extract<TuiAction, { type: "approval_requested" }> =>
+        a.type === "approval_requested",
+    );
+    expect(raised?.request.sessionId).toBe("s-b");
+    expect(raised?.request.tool).toBe("os.fs.write");
+  });
+
+  it("switching back into a running thread replays the turn's events so far", () => {
+    // The stored snapshot of a session mid-FIRST-turn is empty (a turn
+    // saves only when it finishes), so without the replay the operator
+    // returns to a spinner over a blank page — their own prompt gone.
+    const h = makeHarness();
+    h.orchestrator.sendMessage("first prompt");
+    const sid = h.turns[0]?.sessionId ?? "";
+    // The runtime streams session-tagged events for the running turn.
+    h.bus.emitAgentEvent({ type: "user_message", text: "first prompt" }, sid);
+    h.bus.emitAgentEvent({ type: "step_started", stepIndex: 0 }, sid);
+
+    h.orchestrator.newSession();
+    h.orchestrator.switchSession(sid);
+
+    const replayed = actionsAfterLastSwitch(h.actions).filter(
+      (a): a is Extract<TuiAction, { type: "agent_event" }> =>
+        a.type === "agent_event" && a.sessionId === sid,
+    );
+    expect(replayed.map((a) => a.event.type)).toEqual([
+      "user_message",
+      "step_started",
+    ]);
+    const userEvent = replayed[0]?.event;
+    expect(userEvent?.type === "user_message" && userEvent.text).toBe(
+      "first prompt",
+    );
+  });
+
+  it("the detach notice carries the thread it names, so the transcript can offer the way back", () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("long running work");
+    const detached = turns[0]?.sessionId;
+
+    orchestrator.newSession();
+
+    expect(switchTarget(actions, "continues in the background")).toBe(detached);
+    // The notices about lost work name a session too, and offer nothing
+    // — going there brings none of it back.
+    expect(switchTarget(actions, "dropped")).toBeUndefined();
+  });
+
+  it("the background-turn-finished notice offers the thread holding the reply", async () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("old thread work");
+    const detached = turns[0]?.sessionId;
+    orchestrator.newSession();
+
+    turns[0]?.resolve();
+    await settle();
+
+    expect(switchTarget(actions, "background turn finished")).toBe(detached);
+  });
+
+  it("a second switch-back replays the turn once, not twice", () => {
+    // The replay is emitted on the same bus the recorder taps; without
+    // the guard each round trip would double the log.
+    const h = makeHarness();
+    h.orchestrator.sendMessage("first prompt");
+    const sid = h.turns[0]?.sessionId ?? "";
+    h.bus.emitAgentEvent({ type: "user_message", text: "first prompt" }, sid);
+
+    h.orchestrator.newSession();
+    h.orchestrator.switchSession(sid);
+    h.orchestrator.newSession();
+    h.orchestrator.switchSession(sid);
+
+    const replayed = actionsAfterLastSwitch(h.actions).filter(
+      (a) => a.type === "agent_event",
+    );
+    expect(replayed).toHaveLength(1);
+  });
+});
+
+/**
+ * ATO-37: switching threads while the agent is answering. The contract:
+ * the switch is allowed, the turn keeps running in the background, and
+ * on return the thread is whole and the stream carries on — and a turn
+ * the operator stopped is not reported as still working.
+ */
+describe("ChatOrchestrator switching while the agent is answering", () => {
+  function switchCount(actions: readonly TuiAction[]): number {
+    return actions.filter((a) => a.type === "session_switched").length;
+  }
+
+  it("brings a long streamed reply back whole, prompt first, with no gap", () => {
+    const h = makeHarness();
+    h.orchestrator.sendMessage("explain the build");
+    const sid = h.turns[0]?.sessionId ?? "";
+    h.bus.emitAgentEvent(
+      { type: "user_message", text: "explain the build" },
+      sid,
+    );
+    h.bus.emitAgentEvent({ type: "step_started", stepIndex: 0 }, sid);
+    // Far more tokens than the replay ring holds events.
+    for (let i = 0; i < 2000; i += 1) {
+      h.bus.emitAgentEvent(
+        { type: "llm_event", event: { type: "assistant_delta", text: "w " } },
+        sid,
+      );
+    }
+
+    h.orchestrator.switchSession("s-b");
+    h.orchestrator.switchSession(sid);
+
+    const after = actionsAfterLastSwitch(h.actions);
+    expect(
+      warnTexts(after).some((t) => t.includes("re-attached mid-turn")),
+    ).toBe(false);
+    const replayed = after.filter(
+      (a): a is Extract<TuiAction, { type: "agent_event" }> =>
+        a.type === "agent_event" && a.sessionId === sid,
+    );
+    expect(replayed.map((a) => a.event)).toEqual([
+      { type: "user_message", text: "explain the build" },
+      { type: "step_started", stepIndex: 0 },
+      {
+        type: "llm_event",
+        event: { type: "assistant_delta", text: "w ".repeat(2000) },
+      },
+    ]);
+  });
+
+  it("does not repaint a re-attached thread when its turn ends, if the replay was whole", async () => {
+    // The repaint resets the feed, the run status and the rail cursor:
+    // the screen jumped under the operator at the end of every turn they
+    // had switched back into.
+    const h = makeHarness();
+    h.orchestrator.sendMessage("work");
+    const sid = h.turns[0]?.sessionId ?? "";
+    h.bus.emitAgentEvent({ type: "user_message", text: "work" }, sid);
+    h.orchestrator.switchSession("s-b");
+    h.orchestrator.switchSession(sid);
+    const before = switchCount(h.actions);
+
+    h.turns[0]?.resolve();
+    await settle();
+
+    expect(switchCount(h.actions)).toBe(before);
+  });
+
+  it("still repaints from the saved session when the replay lost the turn's head", async () => {
+    const h = makeHarness();
+    h.orchestrator.sendMessage("work");
+    const sid = h.turns[0]?.sessionId ?? "";
+    // Distinct structural events, which nothing can join: more of them
+    // than the ring holds.
+    for (let i = 0; i < 600; i += 1) {
+      h.bus.emitAgentEvent({ type: "step_started", stepIndex: i }, sid);
+    }
+    h.orchestrator.switchSession("s-b");
+    h.orchestrator.switchSession(sid);
+    expect(
+      warnTexts(actionsAfterLastSwitch(h.actions)).some((t) =>
+        t.includes("re-attached mid-turn"),
+      ),
+    ).toBe(true);
+    const before = switchCount(h.actions);
+
+    h.turns[0]?.resolve();
+    await settle();
+
+    expect(switchCount(h.actions)).toBe(before + 1);
+    expect(lastSwitch(h.actions)?.sessionId).toBe(sid);
+  });
+
+  it("does not report a turn stopped before the switch as still working, or as finished", async () => {
+    const { orchestrator, actions, turns } = makeHarness();
+    orchestrator.sendMessage("wrong task");
+    orchestrator.abortCurrentTurn();
+    expect(turns[0]?.signal.aborted).toBe(true);
+
+    // Switched away before the cancel came back.
+    orchestrator.switchSession("s-b");
+    expect(
+      warnTexts(actions).some((t) => t.includes("continues in the background")),
+    ).toBe(false);
+
+    turns[0]?.resolve({ reason: "cancelled" });
+    await settle();
+    expect(
+      warnTexts(actions).some((t) => t.includes("background turn finished")),
+    ).toBe(false);
+    // Nothing of the stopped thread drains into the one on screen.
+    expect(turns).toHaveLength(1);
+  });
+
+  it("keeps the per-session FIFO: a re-attached thread drains its own queue after its turn", async () => {
+    const h = makeHarness();
+    h.orchestrator.sendMessage("first");
+    const sid = h.turns[0]?.sessionId ?? "";
+    h.orchestrator.switchSession("s-b");
+    h.orchestrator.switchSession(sid);
+
+    // Back on the thread with its turn still running: Enter parks.
+    h.orchestrator.sendMessage("second");
+    expect(h.turns).toHaveLength(1);
+
+    h.turns[0]?.resolve();
+    await settle();
+    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1]).toMatchObject({ text: "second", sessionId: sid });
+  });
+});

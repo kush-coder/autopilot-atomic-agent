@@ -1,0 +1,267 @@
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { openaiError, type OpenAiErrorPayload } from "./openai-errors.js";
+import type { AgentRuntime } from "../runtime/bootstrap.js";
+import type { ApprovalBus } from "./approval-bus.js";
+import type { CompletionRegistry } from "./completion-registry.js";
+import type { UndeliveredSteerStore } from "./undelivered-steers.js";
+import type { AuthThrottle } from "./auth-throttle.js";
+import { secretEquals } from "./secret-equal.js";
+
+/**
+ * Small, dependency-free helpers that every HTTP route needs. Kept in
+ * one file instead of spreading read/write primitives across routes.
+ */
+
+export const MAX_JSON_BODY_BYTES = 1 * 1024 * 1024;
+
+/**
+ * Per-request context handed to every route handler. Populated by the
+ * router after URL parsing and auth. Handlers should never pull state
+ * off the runtime in ways that bypass the approval/toolRegistry layers.
+ */
+export interface HandlerContext {
+  runtime: AgentRuntime;
+  apiKey: string | null;
+  params: Record<string, string>;
+  approvalBus: ApprovalBus;
+  completionRegistry: CompletionRegistry;
+  /**
+   * Where a steer that the runtime accepted but never delivered ends
+   * up. Written by whichever route ran the turn, read by
+   * `GET /api/sessions/{id}/steer`.
+   */
+  undeliveredSteers: UndeliveredSteerStore;
+}
+
+export type HttpHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: HandlerContext,
+) => Promise<void> | void;
+
+export function getHeader(req: IncomingMessage, name: string): string | null {
+  const value = req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
+/**
+ * Extract the raw bearer token from the `Authorization` header. Returns
+ * `null` if the header is missing or does not start with `Bearer `.
+ */
+export function getBearerToken(req: IncomingMessage): string | null {
+  const header = getHeader(req, "authorization");
+  if (!header) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1] ?? null;
+}
+
+/**
+ * Enforce the optional bearer-token auth. Returns `true` when the
+ * caller may proceed. When auth fails the response is closed with a
+ * 401 and the handler must bail out. When `apiKey` is `null` auth is
+ * disabled entirely — useful for local loopback use and the default
+ * when the operator did not pass `--api-key`.
+ */
+export function enforceAuth(
+  req: IncomingMessage,
+  res: ServerResponse,
+  apiKey: string | null,
+  throttle?: AuthThrottle,
+): boolean {
+  if (apiKey === null) return true;
+  const address = req.socket?.remoteAddress;
+  /* ATO-1126: an address that kept guessing waits, and the comparison is
+     constant-time, so the token cannot be read back from response timing. */
+  const wait = throttle ? throttle.retryAfter(address) : 0;
+  if (wait > 0) {
+    sendJson(
+      res,
+      429,
+      openaiError("Too many wrong API keys from this address; try again later", "invalid_request_error", null, "auth_throttled"),
+      { "retry-after": String(wait) },
+    );
+    return false;
+  }
+  if (secretEquals(getBearerToken(req), apiKey)) {
+    throttle?.succeeded(address);
+    return true;
+  }
+  throttle?.failed(address);
+  sendJson(
+    res,
+    401,
+    openaiError(
+      "Invalid or missing API key",
+      "invalid_request_error",
+      null,
+      "invalid_api_key",
+    ),
+  );
+  return false;
+}
+
+export function sendJson(
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body).toString(),
+    ...extraHeaders,
+  });
+  res.end(body);
+}
+
+export function sendError(
+  res: ServerResponse,
+  status: number,
+  payload: OpenAiErrorPayload,
+): void {
+  sendJson(res, status, payload);
+}
+
+/**
+ * Read the request body up to `MAX_JSON_BODY_BYTES` and parse as JSON.
+ * Throws on oversize or malformed payloads so route handlers can funnel
+ * those into OpenAI-style 400 responses.
+ */
+export async function readJsonBody<T = unknown>(
+  req: IncomingMessage,
+): Promise<T> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    total += buf.length;
+    if (total > MAX_JSON_BODY_BYTES) {
+      throw new BodyTooLargeError(total);
+    }
+    chunks.push(buf);
+  }
+  if (total === 0) return {} as T;
+  const raw = Buffer.concat(chunks).toString("utf8");
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new BodyParseError(`invalid JSON: ${message}`);
+  }
+}
+
+export class BodyTooLargeError extends Error {
+  constructor(public readonly bytes: number) {
+    super(`request body exceeds ${MAX_JSON_BODY_BYTES} bytes (got ${bytes})`);
+    this.name = "BodyTooLargeError";
+  }
+}
+
+export class BodyParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BodyParseError";
+  }
+}
+
+/**
+ * Call `onGone` once if the client drops the connection before the
+ * response has been ended. Listens on `res`, never on `req`: since Node
+ * 16 an `IncomingMessage` destroys itself and emits `close` as soon as
+ * its body has been consumed, so a `req.on("close")` attached after
+ * `readJsonBody` has already missed its only event and never fires on a
+ * later disconnect. A turn wired that way outlived every client that
+ * gave up on it — model still generating, steers still accepted.
+ */
+export function onClientGone(res: ServerResponse, onGone: () => void): void {
+  if (res.writableEnded) return;
+  if (res.destroyed) {
+    onGone();
+    return;
+  }
+  res.once("close", () => {
+    if (!res.writableEnded) onGone();
+  });
+}
+
+export interface SseWriter {
+  /** Write an SSE frame. `event` is the optional `event:` field name. */
+  writeEvent(event: string | null, payload: unknown): boolean;
+  /** Write a raw terminator frame like `data: [DONE]`. */
+  writeRaw(chunk: string): boolean;
+  /** Close the response stream. */
+  close(): void;
+  /** `true` once the underlying response has been closed. */
+  readonly closed: boolean;
+}
+
+/**
+ * How often a long-lived SSE stream writes a comment line (`: keepalive`)
+ * when asked to. A stream can be silent for minutes on end: a turn parked
+ * on an approval nobody has answered yet, the approval events stream
+ * between requests. Node's fetch (undici, the desktop's client) drops a
+ * response body after 300 s without a byte and reports "terminated", which
+ * ended the turn under a card the person had not answered yet. A comment
+ * is no event: SSE parsers, the OpenAI SDKs' included, skip it.
+ */
+export const SSE_HEARTBEAT_MS = 15_000;
+
+/**
+ * Start an SSE response and return a writer. Headers follow the OpenAI
+ * streaming convention; we also disable proxy buffering so tokens are
+ * flushed as they arrive (nginx reads `X-Accel-Buffering: no`).
+ * `heartbeatMs` writes a comment line at that interval until the stream
+ * closes (see `SSE_HEARTBEAT_MS`); without it nothing is written but
+ * what the caller writes.
+ */
+export function beginSse(
+  res: ServerResponse,
+  extraHeaders: Record<string, string> = {},
+  options: { heartbeatMs?: number } = {},
+): SseWriter {
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+    ...extraHeaders,
+  });
+  let closed = false;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
+  if (options.heartbeatMs && options.heartbeatMs > 0) {
+    heartbeat = setInterval(() => {
+      if (!closed && !res.writableEnded) res.write(": keepalive\n\n");
+    }, options.heartbeatMs);
+    heartbeat.unref?.();
+  }
+  const stopHeartbeat = (): void => {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+  };
+  res.on("close", () => {
+    closed = true;
+    stopHeartbeat();
+  });
+  return {
+    writeEvent(event, payload) {
+      if (closed) return false;
+      const prefix = event ? `event: ${event}\n` : "";
+      return res.write(`${prefix}data: ${JSON.stringify(payload)}\n\n`);
+    },
+    writeRaw(chunk) {
+      if (closed) return false;
+      return res.write(chunk);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      stopHeartbeat();
+      res.end();
+    },
+    get closed() {
+      return closed;
+    },
+  };
+}

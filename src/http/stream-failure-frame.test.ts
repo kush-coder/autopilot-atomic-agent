@@ -1,0 +1,535 @@
+import { describe, expect, it } from "vitest";
+
+import { attachFailedAttempts } from "../llm/fallback/failed-attempts.js";
+import {
+  humanizeOpenAiHttpError,
+  OpenAiHttpError,
+} from "../llm/provider/openai/openai-http.js";
+import { parseProviderErrorBody } from "../llm/provider/openai/parse-provider-error-body.js";
+import { classifyFailure } from "../llm/reliability/index.js";
+import { GrammarError, TransportError } from "../llm/reliability/llm-failures.js";
+import { LocalEngineDownError } from "../llm/reliability/local-engine-down.js";
+import { LlamaServerError, readLlamaErrorBody } from "../llm/llama-server-client.js";
+import { buildStreamEventHook } from "./openai-chat-completions.js";
+
+/**
+ * Which failure an HTTP host is told about.
+ *
+ * `runWithFallback` throws the LAST link's error untouched — it decides
+ * classification and the outage wait — and records the links that failed
+ * before it beside it. On the common chain [cloud provider, auto-appended
+ * llama-server] the last link is a daemon that never ran, so a host that
+ * shows one sentence per failed turn (the desktop app) must be given the
+ * provider the operator picked: its refusal, in its own words, and its own
+ * category — not the tail's `fetch failed`, which the desktop renders as
+ * "<provider> is not answering" for a provider that answered.
+ */
+describe("loop_failed over SSE", () => {
+  const makeSse = () => {
+    const written: Array<{ name: string | null; payload: unknown }> = [];
+    return {
+      written,
+      writer: {
+        closed: false,
+        writeEvent(name: string | null, payload: unknown) {
+          written.push({ name, payload });
+        },
+      },
+    };
+  };
+  const env = (extensionsEnabled: boolean) =>
+    ({
+      completionId: "cmpl-1",
+      created: 0,
+      session: { id: "sess-1" },
+      request: { model: "atomic-agent", extensionsEnabled },
+    }) as never;
+
+  const refusal = () =>
+    Object.assign(
+      new Error(
+        "openrouter rejected the request (402): This request requires more credits, or fewer max_tokens.",
+      ),
+      { status: 402 },
+    );
+
+  it("names the provider the operator picked when the chain fell over before failing", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true));
+    const primary = refusal();
+    const tail = new TypeError("fetch failed");
+    attachFailedAttempts(tail, [{ providerId: "openrouter", error: primary }]);
+
+    hook({ type: "loop_failed", error: tail, category: classifyFailure(tail) } as never);
+
+    expect(sse.written).toHaveLength(1);
+    const frame = sse.written[0]!;
+    expect(frame.name).toBe("error");
+    const payload = frame.payload as { error: string; category?: string; fallback_failures?: unknown };
+    expect(payload.error).toBe(primary.message);
+    expect(payload.category).toBe(classifyFailure(primary));
+    expect(payload.category).not.toBe("transport");
+    expect(payload.fallback_failures).toEqual([
+      { providerId: "openrouter", reason: primary.message },
+    ]);
+  });
+
+  it("reports a single-link failure exactly as before", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true));
+    const only = new TypeError("fetch failed");
+
+    hook({ type: "loop_failed", error: only, category: classifyFailure(only) } as never);
+
+    expect(sse.written).toEqual([
+      { name: "error", payload: { error: "fetch failed", category: "transport", failure: { cause: "offline", phrase: "Can't reach the provider. Check your connection.", action: "retry" } } },
+    ]);
+  });
+
+  it("marks a turn that ended because the local model is not running with code local_engine_down (ATO-772)", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true));
+    const down = new LocalEngineDownError("local-llama", new TypeError("fetch failed"));
+
+    hook({ type: "loop_failed", error: down, category: classifyFailure(down) } as never);
+
+    expect(sse.written).toEqual([
+      {
+        name: "error",
+        payload: {
+          error: "The local model isn't running.",
+          category: "transport",
+          code: "local_engine_down",
+          failure: { cause: "local_engine_down", phrase: "The local model isn't running.", action: "none" },
+        },
+      },
+    ]);
+  });
+
+  it("keeps code local_engine_down when links failed before the local one", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true));
+    const tail = new TypeError("fetch failed");
+    attachFailedAttempts(tail, [{ providerId: "openrouter", error: refusal() }]);
+    const down = new LocalEngineDownError("local-llama", tail);
+
+    hook({ type: "loop_failed", error: down, category: classifyFailure(down) } as never);
+
+    expect(sse.written).toHaveLength(1);
+    expect(sse.written[0]!.payload).toMatchObject({
+      code: "local_engine_down",
+      failure: { cause: "local_engine_down", action: "none" },
+    });
+  });
+
+  const llamaAt8080 = () => "http://127.0.0.1:8080";
+  const llamaAt9931 = () => "http://127.0.0.1:9931";
+
+  it("marks a llama.cpp 404 with local_server_not_found and plain advice (ATO-708, ATO-873)", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt8080);
+    const raw = new LlamaServerError("llama-server returned http 404", 404, "http://127.0.0.1:8080/v1/chat/completions");
+    const wrapped = new TransportError(raw.message, 404, raw.url, { cause: raw });
+
+    hook({ type: "loop_failed", error: wrapped, category: classifyFailure(wrapped) } as never);
+
+    expect(sse.written).toHaveLength(1);
+    const payload = sse.written[0]!.payload as { error: string; code?: string; advice?: string };
+    // The raw words stay: the desktop already matches "returned http 404".
+    expect(payload.error).toBe("llama-server returned http 404");
+    expect(payload.code).toBe("local_server_not_found");
+    expect(payload.advice).toContain("This address isn't a model server, or the model isn't loaded there.");
+    expect(payload.advice).toContain("9931");
+  });
+
+  it("marks a llama.cpp context overflow with local_context_exceeded (ATO-737)", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt8080);
+    const body = readLlamaErrorBody(
+      JSON.stringify({ error: { code: 400, message: "request exceeds the available context size", type: "exceed_context_size_error" } }),
+    );
+    const raw = new LlamaServerError(
+      "llama-server returned http 400: request exceeds the available context size",
+      400,
+      "http://127.0.0.1:9931/v1/chat/completions",
+      false,
+      undefined,
+      body !== undefined ? { body } : undefined,
+    );
+    const wrapped = new GrammarError(raw.message, "", { cause: raw });
+
+    hook({ type: "loop_failed", error: wrapped, category: classifyFailure(wrapped) } as never);
+
+    const payload = sse.written[0]!.payload as { code?: string; advice?: string };
+    expect(payload.code).toBe("local_context_exceeded");
+    expect(payload.advice).toContain("context window");
+  });
+
+  it("puts local_server_not_found in the envelope's code for an OpenAI-compatible client", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(false), llamaAt9931);
+    const raw = new LlamaServerError("llama-server returned http 405", 405, "http://127.0.0.1:9931/completion");
+
+    hook({ type: "loop_failed", error: raw, category: classifyFailure(raw) } as never);
+
+    const payload = sse.written[0]!.payload as { error: { code: string | null } };
+    expect(payload.error.code).toBe("local_server_not_found");
+  });
+
+  it("adds no code to a cloud failure", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt8080);
+    const err = new TransportError("openrouter answered 404", 404, "https://openrouter.ai/api/v1/chat/completions");
+
+    hook({ type: "loop_failed", error: err, category: classifyFailure(err) } as never);
+
+    const payload = sse.written[0]!.payload as { code?: string; advice?: string };
+    expect(payload.code).toBeUndefined();
+    expect(payload.advice).toBeUndefined();
+  });
+
+  it("gives the failed step's frame the code too: hosts keep the first error frame (ATO-708)", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt9931);
+    const raw = new LlamaServerError("llama-server returned http 404", 404, "http://127.0.0.1:9931/v1/chat/completions");
+    const failure = new TransportError(raw.message, 404, raw.url, { cause: raw });
+
+    hook({ type: "llm_event", event: { type: "step_error", error: failure, category: "transport" } } as never);
+
+    expect(sse.written).toHaveLength(1);
+    const payload = sse.written[0]!.payload as { error: string; code?: string; advice?: string };
+    expect(payload.error).toBe("llama-server returned http 404");
+    expect(payload.code).toBe("local_server_not_found");
+    expect(payload.advice).toContain("isn't a model server");
+  });
+
+  it("does not promise Reconnect for a llama-server entry at another address", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt9931);
+    const raw = new LlamaServerError("llama-server returned http 404", 404, "http://127.0.0.1:8090/v1/chat/completions");
+
+    hook({ type: "loop_failed", error: raw, category: classifyFailure(raw) } as never);
+
+    const payload = sse.written[0]!.payload as { code?: string; advice?: string };
+    expect(payload.code).toBe("local_provider_not_found");
+    expect(payload.advice).toContain("isn't a model server");
+  });
+
+  it("does not promise Reconnect when the configured address is unknown", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), () => null);
+    const raw = new LlamaServerError("llama-server returned http 404", 404, "http://127.0.0.1:9931/completion");
+
+    hook({ type: "loop_failed", error: raw, category: classifyFailure(raw) } as never);
+
+    expect((sse.written[0]!.payload as { code?: string }).code).toBe("local_provider_not_found");
+  });
+
+  it("on fallover, codes the first link's 404 shown in the frame", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt9931);
+    const primary = new LlamaServerError("llama-server returned http 404", 404, "http://127.0.0.1:9931/completion");
+    const tail = new TypeError("fetch failed");
+    attachFailedAttempts(tail, [{ providerId: "local-llama", error: primary }]);
+
+    hook({ type: "loop_failed", error: tail, category: classifyFailure(tail) } as never);
+
+    const payload = sse.written[0]!.payload as { error: string; code?: string };
+    expect(payload.error).toBe("llama-server returned http 404");
+    expect(payload.code).toBe("local_server_not_found");
+  });
+
+  it("on fallover, a dead managed engine that ended the turn wins over the first link's 404", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(true), llamaAt9931);
+    const primary = new LlamaServerError("llama-server returned http 404", 404, "http://127.0.0.1:9931/completion");
+    const down = new LocalEngineDownError("local-llama");
+    attachFailedAttempts(down, [{ providerId: "openrouter", error: primary }]);
+
+    hook({ type: "loop_failed", error: down, category: classifyFailure(down) } as never);
+
+    const payload = sse.written[0]!.payload as { code?: string; advice?: string };
+    expect(payload.code).toBe("local_engine_down");
+    expect(payload.advice).toBeUndefined();
+  });
+
+  it("puts local_engine_down in the envelope's code for an OpenAI-compatible client", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(false));
+    const down = new LocalEngineDownError("local-llama");
+
+    hook({ type: "loop_failed", error: down, category: classifyFailure(down) } as never);
+
+    expect(sse.written).toEqual([
+      {
+        name: null,
+        payload: {
+          error: {
+            message: "The local model isn't running.",
+            type: "agent.transport",
+            param: null,
+            code: "local_engine_down",
+          },
+        },
+      },
+    ]);
+  });
+
+  it("gives an OpenAI-compatible client the primary's message in the standard envelope", () => {
+    const sse = makeSse();
+    const hook = buildStreamEventHook(sse.writer as never, env(false));
+    const primary = refusal();
+    const tail = new TypeError("fetch failed");
+    attachFailedAttempts(tail, [{ providerId: "openrouter", error: primary }]);
+
+    hook({ type: "loop_failed", error: tail, category: classifyFailure(tail) } as never);
+
+    expect(sse.written).toHaveLength(1);
+    const frame = sse.written[0]!;
+    expect(frame.name).toBeNull();
+    expect(JSON.stringify(frame.payload)).toContain("requires more credits");
+    expect(JSON.stringify(frame.payload)).not.toContain("fallback_failures");
+  });
+});
+
+/**
+ * Item 40: a provider that refused because the account cannot pay. The
+ * frame says so as data (`cause: {kind: "billing", status}`) beside the
+ * agent's sentence, so a host shows that sentence as the failure instead
+ * of "<provider> is not answering". The desktop holds the FIRST error
+ * frame of a turn, which is the failed step's, so that one says it too,
+ * with the links that failed before it.
+ */
+describe("a billing refusal over SSE", () => {
+  const makeSse = () => {
+    const written: Array<{ name: string | null; payload: unknown }> = [];
+    return {
+      written,
+      writer: {
+        closed: false,
+        writeEvent(name: string | null, payload: unknown) {
+          written.push({ name, payload });
+        },
+      },
+    };
+  };
+  const env = {
+    completionId: "cmpl-1",
+    created: 0,
+    session: { id: "sess-1" },
+    request: { model: "atomic-agent", extensionsEnabled: true },
+  } as never;
+
+  const outOfFunds = (): OpenAiHttpError => {
+    const body =
+      '{"title":"Forbidden","status":403,"message":"You\'ve run out of funds. Please top up your balance"}';
+    return new OpenAiHttpError(
+      `openai provider 403: ${body}`,
+      403,
+      "https://api.aimlapi.com/v1/chat/completions",
+      false,
+      null,
+      "aimlapi",
+      undefined,
+      { body: parseProviderErrorBody(body) },
+    );
+  };
+  /** What the step executor hands the loop: the sentence, the provider's error as the cause. */
+  const stepFailure = (http: OpenAiHttpError) =>
+    new TransportError(humanizeOpenAiHttpError(http), http.status, http.url, { cause: http });
+
+  it("marks the turn's failure as billing, with the agent's sentence", () => {
+    const sse = makeSse();
+    const failure = stepFailure(outOfFunds());
+    buildStreamEventHook(sse.writer as never, env)({
+      type: "loop_failed",
+      error: failure,
+      category: "transport",
+    } as never);
+    expect(sse.written).toEqual([
+      {
+        name: "error",
+        payload: {
+          error: failure.message,
+          category: "transport",
+          cause: { kind: "billing", status: 403 },
+          failure: { cause: "out_of_credit", phrase: "Your account with this provider is out of credit.", action: "switch-model" },
+        },
+      },
+    ]);
+    expect(failure.message).toMatch(/^AI\/ML API refused the request: you've run out of funds\./);
+  });
+
+  it("marks the failed step's frame the same way", () => {
+    const sse = makeSse();
+    const failure = stepFailure(outOfFunds());
+    buildStreamEventHook(sse.writer as never, env)({
+      type: "llm_event",
+      event: { type: "step_error", error: failure, category: "transport" },
+    } as never);
+    expect(sse.written[0]).toEqual({
+      name: "error",
+      payload: {
+        error: failure.message,
+        category: "transport",
+        cause: { kind: "billing", status: 403 },
+        failure: { cause: "out_of_credit", phrase: "Your account with this provider is out of credit.", action: "switch-model" },
+      },
+    });
+  });
+
+  it("lists the picked provider's billing refusal on the failed step of a later link", () => {
+    const sse = makeSse();
+    const tail = new TypeError("fetch failed");
+    attachFailedAttempts(tail, [{ providerId: "aimlapi", error: outOfFunds() }]);
+    const failure = new TransportError("fetch failed", null, "", { cause: tail });
+    buildStreamEventHook(sse.writer as never, env)({
+      type: "llm_event",
+      event: { type: "step_error", error: failure, category: "transport" },
+    } as never);
+    const payload = sse.written[0]!.payload as Record<string, unknown>;
+    expect(payload.error).toBe("fetch failed");
+    expect(payload).not.toHaveProperty("cause");
+    expect(payload.fallback_failures).toEqual([
+      {
+        providerId: "aimlapi",
+        reason: expect.stringContaining("run out of funds"),
+        cause: { kind: "billing", status: 403 },
+      },
+    ]);
+  });
+
+  it("tells the turn's failure as the fallback's billing refusal that ended it, the links before it beside it", () => {
+    // runWithFallback's route refusal: the fallback the turn was running on
+    // said the account is empty, after the primary (down) was probed.
+    const sse = makeSse();
+    const fallback = outOfFunds();
+    attachFailedAttempts(fallback, [
+      {
+        providerId: "primary",
+        error: new OpenAiHttpError("openai provider 503: upstream down", 503, "https://primary.example/v1/chat/completions"),
+      },
+    ]);
+    const failure = stepFailure(fallback);
+    buildStreamEventHook(sse.writer as never, env)({
+      type: "loop_failed",
+      error: failure,
+      category: "transport",
+    } as never);
+    expect(sse.written).toEqual([
+      {
+        name: "error",
+        payload: {
+          error: failure.message,
+          category: "transport",
+          cause: { kind: "billing", status: 403 },
+          failure: { cause: "out_of_credit", phrase: "Your account with this provider is out of credit.", action: "switch-model" },
+          fallback_failures: [
+            {
+              providerId: "primary",
+              reason: "openai provider 503: upstream down",
+              cause: { kind: "http", status: 503 },
+            },
+          ],
+        },
+      },
+    ]);
+  });
+
+  it("leaves a failed step with nothing before it and no billing exactly as before", () => {
+    const sse = makeSse();
+    const only = new TypeError("fetch failed");
+    buildStreamEventHook(sse.writer as never, env)({
+      type: "llm_event",
+      event: { type: "step_error", error: only, category: "transport" },
+    } as never);
+    expect(sse.written).toEqual([
+      { name: "error", payload: { error: "fetch failed", category: "transport", failure: { cause: "offline", phrase: "Can't reach the provider. Check your connection.", action: "retry" } } },
+    ]);
+  });
+});
+
+/**
+ * ATO-384: every failure frame carries the shared catalog entry —
+ * `failure: {cause, phrase, action}` — beside the fields it always had,
+ * so a host words the failure and picks its button from one list.
+ */
+describe("the failure catalog entry on error frames", () => {
+  const makeSse = () => {
+    const written: Array<{ name: string | null; payload: unknown }> = [];
+    return {
+      written,
+      writer: {
+        closed: false,
+        writeEvent(name: string | null, payload: unknown) {
+          written.push({ name, payload });
+        },
+      },
+    };
+  };
+  const env = (extensionsEnabled: boolean) =>
+    ({
+      completionId: "cmpl-1",
+      created: 0,
+      session: { id: "sess-1" },
+      request: { model: "atomic-agent", extensionsEnabled },
+    }) as never;
+  const rateLimited = () =>
+    new TransportError(
+      "fake answered 429.",
+      429,
+      "https://api.fake.test/v1/chat/completions",
+      { cause: new OpenAiHttpError("openai provider 429: slow down", 429, "https://api.fake.test/v1/chat/completions") },
+    );
+
+  it("loop_failed passes the loop's own verdict through, existing fields untouched", () => {
+    const sse = makeSse();
+    const error = rateLimited();
+    buildStreamEventHook(sse.writer as never, env(true))({
+      type: "loop_failed",
+      error,
+      category: "transport",
+      failure: { cause: "rate_limited", phrase: "Too many requests right now. Try again in a moment.", action: "retry" },
+    } as never);
+    expect(sse.written).toEqual([
+      {
+        name: "error",
+        payload: {
+          error: "fake answered 429.",
+          category: "transport",
+          failure: { cause: "rate_limited", phrase: "Too many requests right now. Try again in a moment.", action: "retry" },
+        },
+      },
+    ]);
+  });
+
+  it("a failed step's frame is classified on the spot", () => {
+    const sse = makeSse();
+    buildStreamEventHook(sse.writer as never, env(true))({
+      type: "llm_event",
+      event: { type: "step_error", error: rateLimited(), category: "transport" },
+    } as never);
+    expect(sse.written[0]!.payload).toMatchObject({
+      error: "fake answered 429.",
+      category: "transport",
+      failure: { cause: "rate_limited", action: "retry" },
+    });
+  });
+
+  it("an OpenAI-compatible client's envelope stays the standard one", () => {
+    const sse = makeSse();
+    buildStreamEventHook(sse.writer as never, env(false))({
+      type: "loop_failed",
+      error: rateLimited(),
+      category: "transport",
+    } as never);
+    expect(sse.written).toEqual([
+      {
+        name: null,
+        payload: {
+          error: { message: "fake answered 429.", type: "agent.transport", param: null, code: null },
+        },
+      },
+    ]);
+  });
+});

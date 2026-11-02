@@ -1,0 +1,708 @@
+import { describe, expect, it } from "vitest";
+
+import { buildOpenAiChatBody } from "./openai-build-body.js";
+
+describe("buildOpenAiChatBody", () => {
+  it("forwards responseFormat as response_format with type=json_schema and strict=true by default", () => {
+    const body = buildOpenAiChatBody(
+      {
+        prompt: "hi",
+        responseFormat: {
+          name: "link_generator",
+          description: "memory link triples",
+          schema: {
+            type: "object",
+            properties: { kind: { type: "string", enum: ["none"] } },
+            required: ["kind"],
+            additionalProperties: false,
+          },
+        },
+      },
+      "gpt-5-2",
+      false,
+    );
+    expect(body).toMatchObject({
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "link_generator",
+          description: "memory link triples",
+          strict: true,
+          schema: {
+            type: "object",
+            properties: { kind: { type: "string", enum: ["none"] } },
+            required: ["kind"],
+            additionalProperties: false,
+          },
+        },
+      },
+    });
+  });
+
+  it("asks for the usage block on a streamed request, and only there", () => {
+    // A streamed reply cut off by `finish_reason: "length"` arrives with
+    // no token counts unless the request asks; the counts are what tell
+    // a spent reply cap apart from a full context window.
+    const streamed = buildOpenAiChatBody({ prompt: "hi" }, "m", true);
+    expect(streamed.stream_options).toEqual({ include_usage: true });
+    const unary = buildOpenAiChatBody({ prompt: "hi" }, "m", false);
+    expect(unary).not.toHaveProperty("stream_options");
+  });
+
+  it("lets extraBody drop stream_options for a vendor that rejects it", () => {
+    const body = buildOpenAiChatBody({ prompt: "hi" }, "m", true, {
+      stream_options: undefined,
+    });
+    expect(body.stream_options).toBeUndefined();
+    expect(JSON.parse(JSON.stringify(body))).not.toHaveProperty(
+      "stream_options",
+    );
+  });
+
+  it("honours explicit strict=false override", () => {
+    const body = buildOpenAiChatBody(
+      {
+        prompt: "hi",
+        responseFormat: {
+          name: "loose",
+          schema: { type: "object", properties: {} },
+          strict: false,
+        },
+      },
+      "gpt-5-2",
+      false,
+    );
+    expect(body.response_format).toMatchObject({
+      json_schema: { strict: false },
+    });
+  });
+
+  it("does NOT attach response_format when tools is non-empty (vendors reject the combination)", () => {
+    // Mixing native function-calling with Structured Outputs is
+    // unsupported by Azure and silently degraded by OpenRouter — the
+    // function's own `parameters` schema is already the JSON
+    // contract, so the runtime never sends both.
+    const body = buildOpenAiChatBody(
+      {
+        prompt: "hi",
+        tools: [{ type: "function", function: { name: "reply" } }],
+        responseFormat: {
+          name: "ignored",
+          schema: { type: "object" },
+        },
+      },
+      "gpt-5-2",
+      false,
+    );
+    expect(body.response_format).toBeUndefined();
+    expect(body.tools).toBeDefined();
+  });
+
+  it("omits response_format entirely when not provided", () => {
+    const body = buildOpenAiChatBody({ prompt: "hi" }, "gpt-5-2", false);
+    expect(body.response_format).toBeUndefined();
+  });
+
+  it("merges extraBody vendor fields into the request body", () => {
+    const body = buildOpenAiChatBody({ prompt: "hi" }, "qwen3.8-27b", false, {
+      chat_template_kwargs: { enable_thinking: false },
+    });
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(body.model).toBe("qwen3.8-27b");
+  });
+
+  it("keeps the body byte-identical when extraBody is absent", () => {
+    const withoutArg = buildOpenAiChatBody(
+      { prompt: "hi" },
+      "qwen3.8-27b",
+      false,
+    );
+    const withUndefined = buildOpenAiChatBody(
+      { prompt: "hi" },
+      "qwen3.8-27b",
+      false,
+      undefined,
+    );
+    expect(JSON.stringify(withUndefined)).toBe(JSON.stringify(withoutArg));
+  });
+
+  it("sends providerPreferences as the provider routing object", () => {
+    const preferences = { order: ["z-ai"], allow_fallbacks: false };
+    const args = [undefined, undefined, undefined, preferences] as const;
+    const unary = buildOpenAiChatBody({ prompt: "hi" }, "m", false, ...args);
+    const streamed = buildOpenAiChatBody({ prompt: "hi" }, "m", true, ...args);
+    expect(unary.provider).toEqual(preferences);
+    expect(streamed.provider).toEqual(preferences);
+    expect("provider" in buildOpenAiChatBody({ prompt: "hi" }, "m", false)).toBe(
+      false,
+    );
+  });
+
+  it("lets an explicit extraBody.provider win over providerPreferences", () => {
+    // `extraBody.provider` was the only way to route before
+    // `providerPreferences` was wired; merged last, it must keep working
+    // exactly as configured.
+    const override = { only: ["anthropic"] };
+    const body = buildOpenAiChatBody(
+      { prompt: "hi" },
+      "m",
+      false,
+      { provider: override },
+      undefined,
+      undefined,
+      { order: ["z-ai"] },
+    );
+    expect(body.provider).toEqual(override);
+  });
+
+  it("does not let extraBody override reserved keys", () => {
+    const body = buildOpenAiChatBody(
+      {
+        prompt: "hi",
+        tools: [
+          {
+            type: "function",
+            function: { name: "search", parameters: { type: "object" } },
+          },
+        ],
+      },
+      "qwen3.8-27b",
+      true,
+      {
+        model: "attacker-model",
+        messages: [{ role: "user", content: "overwritten" }],
+        stream: false,
+        tools: [],
+      },
+    );
+    expect(body.model).toBe("qwen3.8-27b");
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    expect(body.stream).toBe(true);
+    expect(body.tools).toHaveLength(1);
+  });
+
+  it("drops a reserved key that the builder itself never set", () => {
+    // `tools` is absent when the caller sends no tools; extraBody must not
+    // be able to smuggle a tool contract in through the passthrough.
+    const body = buildOpenAiChatBody({ prompt: "hi" }, "qwen3.8-27b", false, {
+      tools: [
+        {
+          type: "function",
+          function: { name: "shell", parameters: { type: "object" } },
+        },
+      ],
+    });
+    expect(body.tools).toBeUndefined();
+    expect("tools" in body).toBe(false);
+  });
+
+  it("serializes parallel_tool_calls: false when the executor asks for a single call (issue #104)", () => {
+    // `maxParallelToolCalls=1` (or a provider that cannot emit parallel
+    // calls) must reach the wire so the flag acts as a
+    // provider-compatibility control, not just an executor cap.
+    const body = buildOpenAiChatBody(
+      {
+        prompt: "hi",
+        tools: [{ type: "function", function: { name: "read" } }],
+        parallelToolCalls: false,
+      },
+      "gpt-5-2",
+      false,
+    );
+    expect(body.parallel_tool_calls).toBe(false);
+  });
+
+  it("does not attach parallel_tool_calls to a request without tools", () => {
+    const body = buildOpenAiChatBody(
+      { prompt: "hi", parallelToolCalls: false },
+      "gpt-5-2",
+      false,
+    );
+    expect("parallel_tool_calls" in body).toBe(false);
+  });
+});
+
+describe("buildOpenAiChatBody — the output bound", () => {
+  const request = { prompt: "hi", sessionId: "s-1" };
+
+  it("sends no max_tokens when nobody asked for one", () => {
+    const body = buildOpenAiChatBody(request, "gpt-test", false);
+    // The cap used to default to `localModels.completionMaxTokens` (8192),
+    // a llama-server decode budget that has nothing to do with a cloud
+    // model — and it killed any turn whose reply ran long, mid-JSON,
+    // with "model response truncated at 8192 tokens".
+    expect("max_tokens" in body).toBe(false);
+  });
+
+  it("honours a cap the caller set", () => {
+    const body = buildOpenAiChatBody(
+      { ...request, maxTokens: 512 },
+      "gpt-test",
+      false,
+    );
+    expect(body.max_tokens).toBe(512);
+  });
+
+  it("lets a provider entry pin one through extraBody", () => {
+    const body = buildOpenAiChatBody(request, "gpt-test", false, {
+      max_tokens: 64_000,
+    });
+    expect(body.max_tokens).toBe(64_000);
+  });
+
+  it("still lets the caller's cap lose to an explicit passthrough", () => {
+    // `max_tokens` is deliberately not reserved: an operator who pins a
+    // ceiling for a provider that requires one gets the last word.
+    const body = buildOpenAiChatBody(
+      { ...request, maxTokens: 512 },
+      "gpt-test",
+      false,
+      {
+        max_tokens: 4096,
+      },
+    );
+    expect(body.max_tokens).toBe(4096);
+  });
+
+  it("keeps the fields the caller owns unconditionally", () => {
+    const body = buildOpenAiChatBody(request, "gpt-test", true, {
+      model: "hijack",
+    });
+    expect(body.model).toBe("gpt-test");
+    expect(body.stream).toBe(true);
+  });
+});
+
+describe("buildOpenAiChatBody — the provider's own ceiling", () => {
+  const request = { prompt: "hi" };
+
+  it("applies a configured ceiling when the call names none", () => {
+    const body = buildOpenAiChatBody(
+      request,
+      "gpt-test",
+      false,
+      undefined,
+      64_000,
+    );
+    expect(body.max_tokens).toBe(64_000);
+  });
+
+  it("lets the call's own cap win over the provider's", () => {
+    const body = buildOpenAiChatBody(
+      { ...request, maxTokens: 512 },
+      "gpt-test",
+      false,
+      undefined,
+      64_000,
+    );
+    expect(body.max_tokens).toBe(512);
+  });
+
+  it("sends nothing when neither names one", () => {
+    expect(
+      "max_tokens" in buildOpenAiChatBody(request, "gpt-test", false),
+    ).toBe(false);
+  });
+});
+
+describe("buildOpenAiChatBody — strict tools and parallel calls", () => {
+  const strictTool = {
+    type: "function",
+    function: {
+      name: "os__fs__read",
+      description: "read a file",
+      strict: true,
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false,
+      },
+    },
+  };
+  const plainTool = {
+    type: "function",
+    function: {
+      name: "os__fs__list",
+      description: "list a directory",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+      },
+    },
+  };
+
+  it("sends parallel_tool_calls: false when any function is strict", () => {
+    // OpenAI: Structured Outputs is not compatible with parallel
+    // function calls. Marking tools `strict` and leaving this `true`
+    // buys best-effort adherence, i.e. the bug the level exists to fix.
+    const body = buildOpenAiChatBody(
+      { prompt: "hi", tools: [plainTool, strictTool], parallelToolCalls: true },
+      "gpt-test",
+      false,
+    );
+    expect(body.parallel_tool_calls).toBe(false);
+  });
+
+  it("overrides a caller that asked for parallel calls", () => {
+    // The wire floor, not a second opinion: whoever built the request
+    // may not have known about strict tools, and a `true` reaching the
+    // provider alongside `strict: true` is the failure mode.
+    const body = buildOpenAiChatBody(
+      { prompt: "hi", tools: [strictTool], parallelToolCalls: true },
+      "gpt-test",
+      false,
+    );
+    expect(body.parallel_tool_calls).toBe(false);
+  });
+
+  it("leaves a non-strict tools array exactly as it was", () => {
+    // The flag is off for every stock config, and off it must not move
+    // a byte. A tools array with no `strict: true` anywhere is the
+    // definition of that.
+    const body = buildOpenAiChatBody(
+      { prompt: "hi", tools: [plainTool], parallelToolCalls: true },
+      "gpt-test",
+      false,
+    );
+    expect(body.parallel_tool_calls).toBe(true);
+    expect(body.tools).toEqual([plainTool]);
+  });
+
+  it("still honours an explicit single-call request under strict tools", () => {
+    const body = buildOpenAiChatBody(
+      {
+        prompt: "hi",
+        tools: [strictTool],
+        parallelToolCalls: false,
+      },
+      "gpt-test",
+      false,
+    );
+    expect(body.parallel_tool_calls).toBe(false);
+  });
+});
+
+describe("buildOpenAiChatBody — strict function tools", () => {
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "os__fs__read",
+        description: "read a file",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" }, limit: { type: "integer" } },
+          required: ["path"],
+        },
+      },
+    },
+  ];
+  const request = { prompt: "hi", tools };
+
+  it("leaves the body byte-identical when the flag is absent", () => {
+    // The whole safety argument for the feature: an operator who never
+    // sets `strictTools` must get exactly the request they got before
+    // it existed. Compared as JSON so key order counts too.
+    const before = buildOpenAiChatBody(request, "gpt-test", false, {
+      chat_template_kwargs: { enable_thinking: false },
+    });
+    const after = buildOpenAiChatBody(
+      request,
+      "gpt-test",
+      false,
+      { chat_template_kwargs: { enable_thinking: false } },
+      undefined,
+      false,
+    );
+    expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+    expect(after.tools).toEqual(tools);
+  });
+
+  it("rewrites the tools and marks them strict when the flag is on", () => {
+    const body = buildOpenAiChatBody(
+      request,
+      "gpt-test",
+      false,
+      undefined,
+      undefined,
+      true,
+    );
+    expect(body.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "os__fs__read",
+          description: "read a file",
+          strict: true,
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              limit: { type: ["integer", "null"] },
+            },
+            required: ["path", "limit"],
+            additionalProperties: false,
+          },
+        },
+      },
+    ]);
+  });
+
+  it("keeps the strict tools over an extraBody that tries to replace them", () => {
+    // `tools` is a reserved key, restored on top of the merge. The
+    // transform therefore has to run *before* that restore, or the
+    // untransformed array would win. This pins that ordering.
+    const body = buildOpenAiChatBody(
+      request,
+      "gpt-test",
+      false,
+      { tools: [{ type: "function", function: { name: "hijack" } }] },
+      undefined,
+      true,
+    );
+    const emitted = body.tools as ReadonlyArray<Record<string, unknown>>;
+    expect(emitted).toHaveLength(1);
+    expect((emitted[0].function as Record<string, unknown>).strict).toBe(true);
+  });
+
+  it("sends no tools key at all when the request carries none", () => {
+    const body = buildOpenAiChatBody(
+      { prompt: "hi" },
+      "gpt-test",
+      false,
+      undefined,
+      undefined,
+      true,
+    );
+    expect("tools" in body).toBe(false);
+  });
+});
+
+describe("buildOpenAiChatBody — per-model parameters", () => {
+  // OpenAI's reasoning models reject `temperature` and answer
+  // `max_tokens` with "Use 'max_completion_tokens' instead." — the
+  // rejection `request-size-rejection.ts` quotes. Read after any
+  // vendor prefix, so the same model through OpenRouter gets the same
+  // body.
+  it.each(["o3", "o4-mini", "o1-preview", "gpt-5", "gpt-5.2-mini", "openai/o3", "openai/gpt-5-codex"])(
+    "sends no temperature and max_completion_tokens for %s",
+    (model) => {
+      const body = buildOpenAiChatBody(
+        { prompt: "hi", temperature: 0.7, maxTokens: 512 },
+        model,
+        false,
+      );
+      expect(body).not.toHaveProperty("temperature");
+      expect(body).not.toHaveProperty("max_tokens");
+      expect(body.max_completion_tokens).toBe(512);
+    },
+  );
+
+  it.each(["olmo-3", "gpt-4.1", "google/gemini-3.8-flash", "qwen/qwen3.8-27b", "o-mega"])(
+    "keeps the historical body for %s",
+    (model) => {
+      const body = buildOpenAiChatBody({ prompt: "hi", maxTokens: 512 }, model, false);
+      expect(body.temperature).toBe(0.2);
+      expect(body.max_tokens).toBe(512);
+      expect(body).not.toHaveProperty("max_completion_tokens");
+    },
+  );
+
+  it("merges userModels[].params over the body and over extraBody, reserved keys excepted", () => {
+    const body = buildOpenAiChatBody(
+      { prompt: "hi" },
+      "m",
+      false,
+      { top_p: 0.5, chat_template_kwargs: { enable_thinking: false } },
+      undefined,
+      undefined,
+      undefined,
+      {
+        modelParams: {
+          top_p: 0.9,
+          temperature: 1,
+          model: "other",
+          messages: [],
+        },
+      },
+    );
+    expect(body.top_p).toBe(0.9);
+    expect(body.temperature).toBe(1);
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(body.model).toBe("m");
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  it("spells reasoningEffort the way each kind documents it, and omits it elsewhere", () => {
+    const request = { prompt: "hi", reasoningEffort: "low" as const };
+    expect(
+      buildOpenAiChatBody(request, "m", false, undefined, undefined, undefined, undefined, {
+        providerKind: "openrouter",
+      }).reasoning,
+    ).toEqual({ effort: "low" });
+    expect(
+      buildOpenAiChatBody(request, "m", false, undefined, undefined, undefined, undefined, {
+        providerKind: "openai-compatible",
+      }).reasoning_effort,
+    ).toBe("low");
+    for (const providerKind of ["gemini", "aimlapi", undefined]) {
+      const body = buildOpenAiChatBody(
+        request,
+        "m",
+        false,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { ...(providerKind ? { providerKind } : {}) },
+      );
+      expect(body).not.toHaveProperty("reasoning");
+      expect(body).not.toHaveProperty("reasoning_effort");
+    }
+    // Absent, nothing is sent whatever the kind.
+    const plain = buildOpenAiChatBody({ prompt: "hi" }, "m", false, undefined, undefined, undefined, undefined, {
+      providerKind: "openrouter",
+    });
+    expect(plain).not.toHaveProperty("reasoning");
+  });
+});
+
+describe("buildOpenAiChatBody — the native message layout", () => {
+  const tools = [{ type: "function", function: { name: "os__fs__read" } }];
+  const messages = {
+    system: "### system\nprefix",
+    droppedSummary: null,
+    turns: [
+      { kind: "user" as const, text: "read a" },
+      { kind: "assistant_tool_call" as const, tool: "os.fs.read", args: { path: "a" } },
+      { kind: "tool_result" as const, tool: "os.fs.read", status: "ok" as const, body: "A", truncated: false },
+    ],
+    tail: "### respond\nRespond now.\n",
+  };
+
+  it("sends system, history and a final user message when the request is structured", () => {
+    const body = buildOpenAiChatBody({ prompt: "flat", messages, tools }, "m", true);
+    expect(body.messages).toEqual([
+      { role: "system", content: "### system\nprefix" },
+      { role: "user", content: "read a" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_1", type: "function", function: { name: "os__fs__read", arguments: '{"path":"a"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "A" },
+      { role: "user", content: "### respond\nRespond now.\n" },
+    ]);
+    expect(body.tools).toEqual(tools);
+  });
+
+  it("sends the flat prompt when the shape is flat, when there are no tools, or when nothing is structured", () => {
+    const flat = [{ role: "user", content: "flat" }];
+    expect(
+      buildOpenAiChatBody({ prompt: "flat", messages, tools }, "m", true, undefined, undefined, undefined, undefined, {
+        messageShape: "flat",
+      }).messages,
+    ).toEqual(flat);
+    expect(buildOpenAiChatBody({ prompt: "flat", messages }, "m", true).messages).toEqual(flat);
+    expect(buildOpenAiChatBody({ prompt: "flat", tools }, "m", true).messages).toEqual(flat);
+  });
+
+  it("places the Anthropic breakpoints on the native layout", () => {
+    const body = buildOpenAiChatBody(
+      { prompt: "flat", messages, tools },
+      "anthropic/claude-sonnet-4.5",
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { anthropicCacheControl: true },
+    );
+    const sent = body.messages as Array<Record<string, unknown>>;
+    expect(sent[0]?.content).toEqual([
+      { type: "text", text: "### system\nprefix", cache_control: { type: "ephemeral" } },
+    ]);
+    expect(sent[3]?.content).toEqual([
+      { type: "text", text: "A", cache_control: { type: "ephemeral" } },
+    ]);
+    expect(sent[4]).toEqual({ role: "user", content: "### respond\nRespond now.\n" });
+  });
+
+  it("uses the adapter's own name escape when one is given", () => {
+    const body = buildOpenAiChatBody({ prompt: "flat", messages, tools }, "m", true, undefined, undefined, undefined, undefined, {
+      nameEscape: (name) => name.toUpperCase(),
+    });
+    const assistant = (body.messages as Array<Record<string, unknown>>)[2] as {
+      tool_calls: Array<{ function: { name: string } }>;
+    };
+    expect(assistant.tool_calls[0]?.function.name).toBe("OS.FS.READ");
+  });
+});
+
+describe("reasoning effort and the turn's output ceiling (F20)", () => {
+  it("maps reasoningEffort to the field each family reads, and omits it elsewhere", () => {
+    const request = { prompt: "hi", reasoningEffort: "low" as const };
+    const openrouter = buildOpenAiChatBody(request, "m", false, undefined, undefined, undefined, undefined, { providerKind: "openrouter" });
+    expect(openrouter.reasoning).toEqual({ effort: "low" });
+    expect(openrouter).not.toHaveProperty("reasoning_effort");
+    const compatible = buildOpenAiChatBody(request, "m", false, undefined, undefined, undefined, undefined, { providerKind: "openai-compatible" });
+    expect(compatible.reasoning_effort).toBe("low");
+    expect(compatible).not.toHaveProperty("reasoning");
+    for (const kind of [undefined, "aimlapi", "gemini"]) {
+      const body = buildOpenAiChatBody(request, "m", false, undefined, undefined, undefined, undefined, {
+        ...(kind ? { providerKind: kind } : {}),
+      });
+      expect(body).not.toHaveProperty("reasoning");
+      expect(body).not.toHaveProperty("reasoning_effort");
+    }
+    // No effort asked: nothing sent, whatever the family.
+    expect(
+      buildOpenAiChatBody({ prompt: "hi" }, "m", false, undefined, undefined, undefined, undefined, { providerKind: "openrouter" }),
+    ).not.toHaveProperty("reasoning");
+  });
+
+  it("caps max_tokens from the turn's ceiling, under the per-step cap and over the provider's", () => {
+    expect(buildOpenAiChatBody({ prompt: "hi", maxOutputTokens: 12_000 }, "m", false).max_tokens).toBe(12_000);
+    expect(
+      buildOpenAiChatBody({ prompt: "hi", maxOutputTokens: 12_000, maxTokens: 32_000 }, "m", false).max_tokens,
+    ).toBe(32_000);
+    expect(
+      buildOpenAiChatBody({ prompt: "hi", maxOutputTokens: 12_000 }, "m", false, undefined, 4_000).max_tokens,
+    ).toBe(12_000);
+    expect(buildOpenAiChatBody({ prompt: "hi" }, "m", false, undefined, 4_000).max_tokens).toBe(4_000);
+    expect(buildOpenAiChatBody({ prompt: "hi" }, "m", false)).not.toHaveProperty("max_tokens");
+  });
+});
+
+describe("buildOpenAiChatBody: the template's thinking switch", () => {
+  const ask = (request: Parameters<typeof buildOpenAiChatBody>[0], options: Parameters<typeof buildOpenAiChatBody>[7], extraBody?: Record<string, unknown>) =>
+    buildOpenAiChatBody(request, "m", false, extraBody, undefined, undefined, undefined, options);
+
+  it("asks a local server not to think when the request disables thinking", () => {
+    const body = ask({ prompt: "hi", reasoningEffort: "low", disableThinking: true }, { providerKind: "openai-compatible", templateKwargs: true });
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(body.reasoning_effort).toBe("low");
+    expect(body).not.toHaveProperty("disableThinking");
+  });
+
+  it("sends nothing to a server that does not take template arguments", () => {
+    for (const options of [{ providerKind: "openai-compatible" }, { providerKind: "openrouter" }, {}]) {
+      const body = ask({ prompt: "hi", disableThinking: true }, options);
+      expect(body).not.toHaveProperty("chat_template_kwargs");
+      expect(body).not.toHaveProperty("disableThinking");
+    }
+  });
+
+  it("leaves an ordinary request untouched on a local server", () => {
+    expect(ask({ prompt: "hi" }, { providerKind: "openai-compatible", templateKwargs: true })).not.toHaveProperty("chat_template_kwargs");
+  });
+
+  it("lets the entry's own extraBody win", () => {
+    const body = ask({ prompt: "hi", disableThinking: true }, { templateKwargs: true }, { chat_template_kwargs: { enable_thinking: true } });
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: true });
+  });
+});

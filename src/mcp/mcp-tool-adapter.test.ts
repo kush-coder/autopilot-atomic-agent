@@ -1,0 +1,538 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type {
+  ApprovalGate,
+  ApprovalRequest,
+} from "../approval/approval-gate.js";
+import type { DangerousToolOptions } from "../approval/dangerous-tool.js";
+import type { ToolContext } from "../tools/tool-registry.js";
+
+import type { McpClient } from "./mcp-client.js";
+import { McpRequestError } from "./mcp-errors.js";
+import {
+  createMcpToolDefinition,
+  extractStructuredDetails,
+  projectMcpResponseToText,
+} from "./mcp-tool-adapter.js";
+import type { McpToolMeta } from "./mcp-types.js";
+
+function metaOf(
+  server: string,
+  rawName: string,
+  overrides: Partial<McpToolMeta> = {},
+): McpToolMeta {
+  return {
+    server,
+    rawName,
+    qualifiedName: `mcp.${server}.${rawName}`,
+    description: "",
+    inputSchema: { type: "object" },
+    resourceClass: "approval_gated",
+    ...overrides,
+  };
+}
+
+function fakeClient(
+  callTool: (
+    rawName: string,
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) => Promise<unknown>,
+): McpClient {
+  // Duck-typed minimal stub — only callTool is exercised by the adapter.
+  return { callTool } as unknown as McpClient;
+}
+
+const ctx: ToolContext = {
+  workingDir: "/tmp",
+  sessionId: "s-test",
+  stepIndex: 0,
+  signal: new AbortController().signal,
+};
+
+describe("createMcpToolDefinition untrusted output", () => {
+  it("declares its results as outside text from the server", () => {
+    const tool = createMcpToolDefinition(metaOf("docs", "search"), fakeClient(async () => ({ content: [] })));
+    expect(tool.untrustedOutput).toBe("MCP server docs");
+  });
+});
+
+describe("projectMcpResponseToText", () => {
+  it("keeps full cloud text, structured data and embedded resource bodies without an exact mirror", () => {
+    const structuredContent = { hits: 3 };
+    const evidence = "evidence\n".repeat(3000) + "FINAL EVIDENCE";
+    const response = { structuredContent, content: [
+      { type: "text", text: JSON.stringify(structuredContent) },
+      { type: "text", text: evidence },
+      { type: "resource", resource: { uri: "file:///guide", text: "FULL RESOURCE BODY" } },
+    ] };
+    expect(projectMcpResponseToText(response, true)).toBe(`${JSON.stringify(structuredContent, null, 2)}\n${evidence}\n[resource file:///guide]\nFULL RESOURCE BODY`);
+    expect(projectMcpResponseToText(response)).toBe(JSON.stringify(structuredContent, null, 2));
+  });
+
+  it("returns empty string for null / non-object input", () => {
+    expect(projectMcpResponseToText(null)).toBe("");
+    expect(projectMcpResponseToText("hi")).toBe("");
+    expect(projectMcpResponseToText(undefined)).toBe("");
+  });
+
+  it("concatenates text content blocks", () => {
+    const out = projectMcpResponseToText({
+      content: [
+        { type: "text", text: "first" },
+        { type: "text", text: "second" },
+      ],
+    });
+    expect(out).toBe("first\nsecond");
+  });
+
+  it("renders image / audio / resource / resource_link blocks as one-line markers", () => {
+    const out = projectMcpResponseToText({
+      content: [
+        { type: "image", mimeType: "image/png" },
+        { type: "audio", mimeType: "audio/wav" },
+        { type: "resource", resource: { uri: "file:///foo" } },
+        { type: "resource_link", uri: "https://example.com" },
+        { type: "weird", text: "ignored" },
+      ],
+    });
+    expect(out).toBe(
+      "[image image/png]\n[audio audio/wav]\n[resource file:///foo]\n[resource_link https://example.com]\n[weird]",
+    );
+  });
+
+  it("renders legacy `toolResult` shape as pretty-printed JSON", () => {
+    const out = projectMcpResponseToText({
+      toolResult: { ok: true, count: 3 },
+    });
+    expect(out).toBe('{\n  "ok": true,\n  "count": 3\n}');
+  });
+
+  it("prefers structuredContent over content text blocks when both are present", () => {
+    // Per MCP spec, structuredContent matches the tool's declared
+    // outputSchema and is the canonical typed payload. The content
+    // text blocks are typically a human-readable mirror — preferring
+    // the typed form gives the agent line-structured JSON that the
+    // compressor can clip cleanly between records.
+    const out = projectMcpResponseToText({
+      content: [{ type: "text", text: "human-friendly mirror" }],
+      structuredContent: { hits: 3, items: ["a", "b"] },
+    });
+    expect(out).toContain('"hits": 3');
+    expect(out).toContain('"items"');
+    expect(out).not.toContain("human-friendly mirror");
+  });
+
+  it("falls back to content blocks when structuredContent is missing", () => {
+    const out = projectMcpResponseToText({
+      content: [{ type: "text", text: "no structured payload here" }],
+    });
+    expect(out).toBe("no structured payload here");
+  });
+
+  it("falls back to content blocks when structuredContent cannot be serialised", () => {
+    // Cyclic object — JSON.stringify throws; the projector must not
+    // crash and should surface the content text instead.
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const out = projectMcpResponseToText({
+      structuredContent: cyclic,
+      content: [{ type: "text", text: "fallback text" }],
+    });
+    expect(out).toBe("fallback text");
+  });
+
+  it("clips long text with a [truncated] marker", () => {
+    const huge = "x".repeat(20_000);
+    const out = projectMcpResponseToText({
+      content: [{ type: "text", text: huge }],
+    });
+    expect(out.length).toBeLessThan(huge.length);
+    expect(out.endsWith("…[truncated]")).toBe(true);
+  });
+});
+
+describe("extractStructuredDetails", () => {
+  it("forwards structuredContent and _meta verbatim", () => {
+    const details = extractStructuredDetails({
+      structuredContent: { ok: true, items: [1, 2] },
+      _meta: { trace: "abc" },
+    });
+    expect(details.structuredContent).toEqual({ ok: true, items: [1, 2] });
+    expect(details.meta).toEqual({ trace: "abc" });
+  });
+
+  it("returns an empty object for non-object input", () => {
+    expect(extractStructuredDetails(null)).toEqual({});
+    expect(extractStructuredDetails("hi")).toEqual({});
+  });
+
+  it("skips missing structuredContent / _meta gracefully", () => {
+    expect(extractStructuredDetails({ content: [] })).toEqual({});
+  });
+});
+
+describe("createMcpToolDefinition", () => {
+  it("uses the qualified name and synthesises a description when blank", () => {
+    const def = createMcpToolDefinition(
+      metaOf("github", "list_repos"),
+      fakeClient(async () => ({ content: [] })),
+    );
+    expect(def.name).toBe("mcp.github.list_repos");
+    expect(def.description).toBe("MCP tool list_repos on github");
+  });
+
+  it("preserves the meta description when present", () => {
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search", { description: "Search the docs." }),
+      fakeClient(async () => ({ content: [] })),
+    );
+    expect(def.description).toBe("Search the docs.");
+  });
+
+  it("readonly is true when readOnlyHint is true", () => {
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search", { annotations: { readOnlyHint: true } }),
+      fakeClient(async () => ({ content: [] })),
+    );
+    expect(def.readonly).toBe(true);
+  });
+
+  it("readonly is true when destructiveHint is false", () => {
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search", { annotations: { destructiveHint: false } }),
+      fakeClient(async () => ({ content: [] })),
+    );
+    expect(def.readonly).toBe(true);
+  });
+
+  it("readonly defaults to false when no hints are provided", () => {
+    const def = createMcpToolDefinition(
+      metaOf("github", "create_issue"),
+      fakeClient(async () => ({ content: [] })),
+    );
+    expect(def.readonly).toBe(false);
+  });
+
+  it("forwards args verbatim to client.callTool", async () => {
+    let received: { rawName: string; args: Record<string, unknown> } | null =
+      null;
+    const def = createMcpToolDefinition(
+      metaOf("github", "create_issue"),
+      fakeClient(async (rawName, args) => {
+        received = { rawName, args };
+        return { content: [{ type: "text", text: "ok" }] };
+      }),
+    );
+    await def.run({ title: "Bug", body: "broken" }, ctx);
+    expect(received).toEqual({
+      rawName: "create_issue",
+      args: { title: "Bug", body: "broken" },
+    });
+  });
+
+  it("returns a compressed status=ok result on success", async () => {
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search"),
+      fakeClient(async () => ({
+        content: [{ type: "text", text: "result body" }],
+        structuredContent: { hits: 3 },
+      })),
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    // structuredContent wins over content text blocks (see
+    // projectMcpResponseToText invariant).
+    expect(result.summary).toContain('"hits": 3');
+    expect(result.details?.structuredContent).toEqual({ hits: 3 });
+  });
+
+  it("returns a single-text-block result verbatim when no structuredContent", async () => {
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search"),
+      fakeClient(async () => ({
+        content: [{ type: "text", text: "result body" }],
+      })),
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    expect(result.summary).toContain("result body");
+    expect(result.truncated).toBe(false);
+  });
+
+  it("does NOT truncate a ~2K JSON payload at 400 chars (regression for the GitHub-MCP looping bug)", async () => {
+    // Session s-6b8f56ce-10b6-490f-94e0-b7502b384b64 reproduced this:
+    // mcp.github.list_issues returned a single-line JSON array of
+    // ~2-5K chars, the compressor's default 400-char cap clipped after
+    // the first issue, and the model looped 8 times calling the same
+    // tool with different filters trying to "find the rest". With the
+    // MCP-specific cap raised to MAX_PROJECTED_OUTPUT_CHARS (8K) and
+    // line-tail truncation disabled, the full payload reaches the
+    // agent intact.
+    const issues = Array.from({ length: 9 }, (_, i) => ({
+      number: i + 1,
+      title: `Issue #${i + 1}`,
+      body: "x".repeat(150),
+    }));
+    const def = createMcpToolDefinition(
+      metaOf("github", "list_issues"),
+      fakeClient(async () => ({
+        // Single-line JSON in the text channel (what github-mcp emits).
+        content: [{ type: "text", text: JSON.stringify({ issues }) }],
+      })),
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    expect(result.truncated).toBe(false);
+    // All nine issue numbers must be present in the summary.
+    for (let i = 1; i <= 9; i += 1) {
+      expect(result.summary).toContain(`"number":${i}`);
+    }
+    expect(result.summary.length).toBeGreaterThan(400);
+  });
+
+  it("clips MCP output at MAX_PROJECTED_OUTPUT_CHARS (~8K) and sets truncated=true", async () => {
+    // Beyond the 8K projector clip, structuredContent gets a
+    // [truncated] suffix from clipOutput; the compressor then sees
+    // the clipped string as still over its 8K char cap (equal, in
+    // practice) and may or may not flip truncated again. Either way
+    // the summary must stay bounded.
+    const def = createMcpToolDefinition(
+      metaOf("github", "search_code"),
+      fakeClient(async () => ({
+        structuredContent: {
+          items: Array.from({ length: 500 }, (_, i) => ({
+            id: i,
+            body: "y".repeat(40),
+          })),
+        },
+      })),
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    // Hard ceiling: 8K from the projector + at most a few chars from
+    // the compressor's own clip marker.
+    expect(result.summary.length).toBeLessThanOrEqual(8_100);
+    expect(result.summary).toContain("[truncated]");
+  });
+
+  it("folds McpRequestError into a status=error result (never throws)", async () => {
+    const def = createMcpToolDefinition(
+      metaOf("github", "create_issue"),
+      fakeClient(async () => {
+        throw new McpRequestError("github", "tools/call", "rate limited");
+      }),
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("error");
+    expect(result.summary).toContain("rate limited");
+    expect(result.details).toMatchObject({
+      server: "github",
+      rawName: "create_issue",
+    });
+  });
+
+  it("folds arbitrary thrown errors into a status=error result", async () => {
+    const def = createMcpToolDefinition(
+      metaOf("github", "create_issue"),
+      fakeClient(async () => {
+        throw new Error("transport blew up");
+      }),
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("error");
+    expect(result.summary).toContain("transport blew up");
+  });
+});
+
+describe("approval gating", () => {
+  /**
+   * Duck-typed gate harness. `requests` records every ApprovalRequest
+   * (plus the signal it was asked with); `approve` flips the decision.
+   */
+  function fakeDangerous(approve: boolean): {
+    dangerous: DangerousToolOptions;
+    requests: ApprovalRequest[];
+    signals: (AbortSignal | undefined)[];
+  } {
+    const requests: ApprovalRequest[] = [];
+    const signals: (AbortSignal | undefined)[] = [];
+    const approvals = {
+      request: async (
+        req: Omit<ApprovalRequest, "approvalId">,
+        opts?: { signal?: AbortSignal },
+      ) => {
+        requests.push({ ...req, approvalId: "a-test" });
+        signals.push(opts?.signal);
+        return {
+          approvalId: "a-test",
+          approved: approve,
+          ...(approve ? {} : { reason: "operator said no" }),
+        };
+      },
+    } as unknown as ApprovalGate;
+    return {
+      dangerous: { approvals, approvalRequired: true },
+      requests,
+      signals,
+    };
+  }
+
+  it("routes an approval_gated tool through the gate before callTool", async () => {
+    const order: string[] = [];
+    const { dangerous, requests, signals } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("windows", "app_launch"),
+      fakeClient(async () => {
+        order.push("callTool");
+        return { content: [{ type: "text", text: "launched" }] };
+      }),
+      { trust: "approval_gated", dangerous },
+    );
+    const result = await def.run({ name: "calc.exe" }, ctx);
+    expect(result.status).toBe("ok");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      sessionId: "s-test",
+      tool: "mcp.windows.app_launch",
+      category: "other",
+      affectedResources: ["windows"],
+    });
+    expect(requests[0]!.preview).toContain('"calc.exe"');
+    // The gate resolved before the server was contacted.
+    expect(order).toEqual(["callTool"]);
+    // Abort signal propagates into the gate so Esc / turn-cancel can
+    // dismiss a pending prompt.
+    expect(signals[0]).toBe(ctx.signal);
+  });
+
+  it("denial folds into status=error, stamps approvalDenied, and never contacts the server", async () => {
+    const callTool = vi.fn(async () => ({ content: [] }));
+    const { dangerous } = fakeDangerous(false);
+    const def = createMcpToolDefinition(
+      metaOf("windows", "registry_write"),
+      fakeClient(callTool),
+      { trust: "approval_gated", dangerous },
+    );
+    const result = await def.run({ key: "HKLM\\..." }, ctx);
+    expect(result.status).toBe("error");
+    // The model is told the user said no, with their words, and not
+    // to retry: a bare "approval denied" read like a policy block.
+    expect(result.summary).toContain(
+      "The user declined this mcp.windows.registry_write call",
+    );
+    expect(result.summary).toContain("not an error or a policy block");
+    expect(result.summary).toContain("The user said: operator said no");
+    expect(result.details).toMatchObject({
+      server: "windows",
+      rawName: "registry_write",
+      approvalDenied: true,
+      deniedByUser: true,
+    });
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("a repeat of a call the user declined earlier in the turn is stamped as their no", async () => {
+    const callTool = vi.fn(async () => ({ content: [] }));
+    const approvals = {
+      request: async () => ({
+        approvalId: "a-test",
+        approved: false,
+        reason: "this same call",
+        automatic: true,
+        declinedEarlier: true,
+      }),
+    } as unknown as ApprovalGate;
+    const def = createMcpToolDefinition(
+      metaOf("windows", "registry_write"),
+      fakeClient(callTool),
+      { trust: "approval_gated", dangerous: { approvals, approvalRequired: true } },
+    );
+    const result = await def.run({ key: "HKLM\\..." }, ctx);
+    expect(result.status).toBe("error");
+    expect(result.summary).toContain(
+      "the user already declined this same call earlier in this turn",
+    );
+    expect(result.details).toMatchObject({
+      approvalDenied: true,
+      deniedByUser: true,
+    });
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("exempts a discovery-time readOnlyHint === true", async () => {
+    const { dangerous, requests } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search", { annotations: { readOnlyHint: true } }),
+      fakeClient(async () => ({ content: [{ type: "text", text: "hit" }] })),
+      { trust: "approval_gated", dangerous },
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    expect(requests).toHaveLength(0);
+  });
+
+  it('fails closed on a malformed readOnlyHint (string "true")', async () => {
+    const { dangerous, requests } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search", { annotations: { readOnlyHint: "true" } }),
+      fakeClient(async () => ({ content: [] })),
+      { trust: "approval_gated", dangerous },
+    );
+    await def.run({}, ctx);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("fails closed when annotations are missing entirely", async () => {
+    const { dangerous, requests } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("windows", "shell"),
+      fakeClient(async () => ({ content: [] })),
+      { trust: "approval_gated", dangerous },
+    );
+    await def.run({}, ctx);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("gates destructiveHint === false alone — the exemption is narrower than the readonly field", async () => {
+    // `readonly` (descriptor rendering) accepts destructiveHint ===
+    // false as read-ish; skipping consent demands the server's
+    // strongest claim, readOnlyHint === true, and nothing else.
+    const { dangerous, requests } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("docs", "annotate", { annotations: { destructiveHint: false } }),
+      fakeClient(async () => ({ content: [] })),
+      { trust: "approval_gated", dangerous },
+    );
+    expect(def.readonly).toBe(true);
+    await def.run({}, ctx);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("never gates a pure_read server", async () => {
+    const { dangerous, requests } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("docs", "search"),
+      fakeClient(async () => ({ content: [{ type: "text", text: "hit" }] })),
+      { trust: "pure_read", dangerous },
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    expect(requests).toHaveLength(0);
+  });
+
+  it("honours the approvalRequired=false test seam", async () => {
+    const { dangerous, requests } = fakeDangerous(true);
+    const def = createMcpToolDefinition(
+      metaOf("windows", "shell"),
+      fakeClient(async () => ({ content: [] })),
+      {
+        trust: "approval_gated",
+        dangerous: { ...dangerous, approvalRequired: false },
+      },
+    );
+    const result = await def.run({}, ctx);
+    expect(result.status).toBe("ok");
+    expect(requests).toHaveLength(0);
+  });
+});

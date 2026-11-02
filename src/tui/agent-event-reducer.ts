@@ -1,0 +1,1368 @@
+import type { AgentLoopEvent } from "../agent/agent-contract.js";
+import { HISTORY_TRIMMED_NOTICE } from "../agent/history-trim-warning.js";
+import { describeFailedAttempts } from "../llm/fallback/index.js";
+import {
+  LOCAL_SERVER_NOT_FOUND_CODE,
+  classifyLocalServerError,
+  isLocalEngineDown,
+  isLocalOutOfMemory,
+} from "../llm/reliability/index.js";
+import {
+  contextUsageFromPrompt,
+  EMPTY_CONTEXT_USAGE,
+} from "./context-usage-from-prompt.js";
+import {
+  formatBackgroundApprovalNotice,
+  formatBackgroundProviderWaitNotice,
+} from "./detached-turns.js";
+import {
+  formatAgentErrorForChat,
+  formatLocalEngineDownForChat,
+  formatLocalServerErrorForChat,
+} from "./chat/format-agent-error-for-chat.js";
+import { formatProviderFalloverNotice } from "./format-provider-fallover.js";
+import {
+  formatProviderGaveUpLine,
+  formatProviderResumedNotice,
+  formatProviderWaitNotice,
+} from "./format-provider-outage.js";
+import { reduceMemoryHealthWarning } from "./reduce-memory-health-warning.js";
+import { formatFeedLine } from "./format-event.js";
+import {
+  formatFusionWorkerLine,
+  fusionWorkerLineColor,
+} from "./format-fusion-worker-line.js";
+import { reduceFusionLiveWorkers } from "./fusion-live-workers.js";
+import { nextApprovalPreviewPage } from "./approval-preview-pages.js";
+import {
+  appendChatMessage,
+  appendFeed,
+  appendReasoningDelta,
+  appendUserMessage,
+  applyMetric,
+  beginStreamingToolCall,
+  finalizeStreamingToolCall,
+  finishRun,
+  finishRunWithoutHistory,
+  finishTurn,
+  lastTurnRequest,
+  pushRing,
+  startNewRun,
+  upsertReasoning,
+} from "./reducer-helpers.js";
+import {
+  parkProviderOutage,
+  retryProviderOutage,
+} from "./provider-outage-state.js";
+import { reduceUiAction } from "./reduce-ui-actions.js";
+import { reduceComposerSwitchAction } from "./composer-switch/composer-switch-reducer.js";
+import { selectComposerBackend } from "./composer-switch/composer-backend-selectors.js";
+import { reduceLocalModelsAction } from "./local-models/local-models-reducer.js";
+import { reduceTasksAction } from "./tasks/tasks-reducer.js";
+import { reduceSessionRailAction } from "./session-rail/session-rail-reducer.js";
+import { reduceSkillsAction } from "./skills/skills-reducer.js";
+import { reduceMemoryAction } from "./memory/memory-reducer.js";
+import { reduceMcpAction } from "./mcp/mcp-reducer.js";
+import { reduceUninstallAction } from "./uninstall/uninstall-reducer.js";
+import { reduceImportAction } from "./import/import-reducer.js";
+import { reduceOnboardingAction } from "./onboarding/onboarding-reducer.js";
+import { reduceProvidersPanel } from "./providers/providers-reducer.js";
+import { reduceLlmPanelAction } from "./llm-panel/llm-panel-reducer.js";
+import { reduceFallbackPanelAction } from "./llm-panel/fallback/fallback-panel-reducer.js";
+import { reduceTelegramAction } from "./telegram/telegram-panel-reducer.js";
+import { reducePrivacyAction } from "./privacy/privacy-panel-reducer.js";
+import { reduceIntegrationsAction } from "./integrations/integrations-panel-reducer.js";
+import { reduceSwarmAction } from "./swarm/swarm-panel-reducer.js";
+import {
+  ISSUE_REPORT_LEVELS,
+  isIssueReportAction,
+  reduceIssueReport,
+} from "./issue-report/index.js";
+import { withReportHint } from "./chat/format-agent-error-for-chat.js";
+import type { TuiAction } from "./tui-action.js";
+import type { RunOutcome, StreamingToolCall, TuiState } from "./tui-state.js";
+
+export type { TuiAction } from "./tui-action.js";
+
+function clearContextCompaction(state: TuiState, sessionId: string): TuiState {
+  if (!state.contextCompactions[sessionId]) return state;
+  const contextCompactions = { ...state.contextCompactions };
+  delete contextCompactions[sessionId];
+  return { ...state, contextCompactions };
+}
+
+export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
+  // First in the chain, and only ever claims an action while the
+  // first-run flow is open. Several actions belong to two owners then —
+  // a finished model pull, a saved provider — and the flow has to see
+  // them to advance. A handled action never reaches the rest of the
+  // chain, so it delegates the panel half to the owning slice rather
+  // than duplicating it.
+  const onboardingHandled = reduceOnboardingAction(state, action);
+  if (onboardingHandled !== null) return onboardingHandled;
+  const localModelsHandled = reduceLocalModelsAction(state, action);
+  if (localModelsHandled !== null) return localModelsHandled;
+  const tasksHandled = reduceTasksAction(state, action);
+  if (tasksHandled !== null) return tasksHandled;
+  const sessionRailHandled = reduceSessionRailAction(state, action);
+  if (sessionRailHandled !== null) return sessionRailHandled;
+  const skillsHandled = reduceSkillsAction(state, action);
+  if (skillsHandled !== null) return skillsHandled;
+  const memoryHandled = reduceMemoryAction(state, action);
+  if (memoryHandled !== null) return memoryHandled;
+  const uninstallHandled = reduceUninstallAction(state, action);
+  if (uninstallHandled !== null) return uninstallHandled;
+  const mcpHandled = reduceMcpAction(state, action);
+  if (mcpHandled !== null) return mcpHandled;
+  const importHandled = reduceImportAction(state, action);
+  if (importHandled !== null) return importHandled;
+  const providersHandled = reduceProvidersPanel(state, action);
+  if (providersHandled !== null) return providersHandled;
+  const llmPanelHandled = reduceLlmPanelAction(state, action);
+  if (llmPanelHandled !== null) return llmPanelHandled;
+  const fallbackHandled = reduceFallbackPanelAction(state, action);
+  if (fallbackHandled !== null) return fallbackHandled;
+  const telegramHandled = reduceTelegramAction(state, action);
+  if (telegramHandled !== null) return telegramHandled;
+  const privacyHandled = reducePrivacyAction(state, action);
+  if (privacyHandled !== null) return privacyHandled;
+  const integrationsHandled = reduceIntegrationsAction(state, action);
+  if (integrationsHandled !== null) return integrationsHandled;
+  const swarmHandled = reduceSwarmAction(state, action);
+  if (swarmHandled !== null) return swarmHandled;
+  if (isIssueReportAction(action)) {
+    const next = reduceIssueReport(
+      state.issueReport,
+      action,
+      ISSUE_REPORT_LEVELS.length,
+    );
+    return next === state.issueReport ? state : { ...state, issueReport: next };
+  }
+  const composerSwitchHandled = reduceComposerSwitchAction(state, action);
+  if (composerSwitchHandled !== null) return composerSwitchHandled;
+  const uiHandled = reduceUiAction(state, action);
+  if (uiHandled !== null) return uiHandled;
+  switch (action.type) {
+    case "compaction_requested":
+      return state.contextCompactions[action.sessionId] ? state : {
+        ...state,
+        contextCompactions: { ...state.contextCompactions, [action.sessionId]: { phase: "queued", sinceTs: Date.now() } },
+        chatScrollOffset: 0,
+      };
+    case "compaction_request_settled":
+      return action.busy && state.contextCompactions[action.sessionId]?.phase === "running"
+        ? state : clearContextCompaction(state, action.sessionId);
+    case "runtime_info":
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line: action.line,
+        color: "blue",
+      });
+    case "system_message":
+      return appendChatMessage(state, {
+        role: "system",
+        text: action.text,
+        ...(action.variant ? { variant: action.variant } : {}),
+        ...(action.switchToSessionId
+          ? { switchToSessionId: action.switchToSessionId }
+          : {}),
+      });
+    case "session_created":
+      return {
+        ...state,
+        session: { ...state.session, sessionId: action.sessionId },
+        // A different thread has a different window fill. Carrying the
+        // old figure over would read as "this fresh session is already
+        // 40% full" until the first prompt lands.
+        contextUsage: EMPTY_CONTEXT_USAGE,
+      };
+    case "skill_count_changed":
+      return {
+        ...state,
+        session: {
+          ...state.session,
+          skillCount: action.count,
+          skillCountDropped: action.dropped,
+        },
+      };
+    case "approval_level_changed":
+      return {
+        ...state,
+        session: { ...state.session, approvalLevel: action.approvalLevel },
+      };
+    case "agent_event": {
+      // Remember maintenance on background chats without painting their notices
+      // into this transcript. Switching back then restores the live indicator.
+      if (action.event.type === "compaction_started") {
+        state = { ...state, contextCompactions: { ...state.contextCompactions,
+          [action.event.sessionId]: { phase: "running", sinceTs: Date.now(), tokensBefore: action.event.tokensBefore },
+        }, ...(action.event.sessionId === state.session.sessionId ? { chatScrollOffset: 0 } : {}) };
+      } else if (action.event.type === "compaction_progress") {
+        const { sessionId, chunk, chunks, completedChunks, sourceTokens } = action.event;
+        state = { ...state, contextCompactions: { ...state.contextCompactions,
+          [sessionId]: { ...state.contextCompactions[sessionId], phase: "running",
+            sinceTs: state.contextCompactions[sessionId]?.sinceTs ?? Date.now(),
+            progress: { chunk, chunks, completedChunks, sourceTokens } },
+        } };
+      } else if (action.event.type === "compaction_completed" || action.event.type === "compaction_failed") {
+        state = clearContextCompaction(state, action.event.sessionId);
+      }
+      const sessionId = action.sessionId ?? (
+        action.event.type === "compaction_started" || action.event.type === "compaction_progress" || action.event.type === "compaction_completed" || action.event.type === "compaction_failed"
+          ? action.event.sessionId : undefined
+      );
+      // Events from a turn running on a *different* session — one the
+      // operator backgrounded by switching away, or a scheduler /
+      // Telegram / HTTP turn — must not paint into the transcript on
+      // screen (or flip `status`, which is what used to freeze the
+      // composer). An untagged event was emitted outside a turn frame
+      // (global notices) and passes through as before.
+      if (
+        sessionId !== undefined &&
+        sessionId !== state.session.sessionId
+      ) {
+        // …except for a pointer when that turn parks on its provider:
+        // the notice itself lands in its own thread (the switch-back
+        // replays the turn's events), but a thread the operator is not
+        // looking at could otherwise sit paused for minutes unnoticed.
+        if (
+          action.event.type === "provider_waiting" &&
+          action.event.attempt === 1
+        ) {
+          return appendChatMessage(state, {
+            role: "system",
+            variant: "warn",
+            text: formatBackgroundProviderWaitNotice(sessionId),
+          });
+        }
+        return state;
+      }
+      return reduceAgentEvent(state, action.event);
+    }
+    case "session_delete_requested":
+      return {
+        ...state,
+        sessionDelete: {
+          sessionId: action.sessionId,
+          preview: action.preview,
+          // Destructive default: the dialog opens on Cancel.
+          cursor: "cancel",
+        },
+      };
+    case "session_delete_cursor_set":
+      if (!state.sessionDelete) return state;
+      return {
+        ...state,
+        sessionDelete: { ...state.sessionDelete, cursor: action.cursor },
+      };
+    case "session_delete_closed":
+      return { ...state, sessionDelete: null };
+    case "approval_requested":
+      // A request raised by a session that is NOT on screen must never
+      // arm the modal: every approval key (and the prose-deny submit)
+      // answers whatever `pendingApproval` holds, so parking a
+      // background thread's question here would let a reflexive Ctrl+C
+      // deny a tool call the operator cannot even see — and abort the
+      // visible turn in the same press. The request stays pending at
+      // the gate; the transcript gets a pointer naming the owner, and
+      // `switchSession` re-raises the prompt once that owner is
+      // visible.
+      if (action.request.sessionId !== state.session.sessionId) {
+        return appendChatMessage(state, {
+          role: "system",
+          text: formatBackgroundApprovalNotice(action.request),
+          variant: "warn",
+        });
+      }
+      return {
+        ...state,
+        status: "awaiting_approval",
+        pendingApproval: action.request,
+        // A redirect re-prompts for the new target; the previous
+        // prompt's draft must not leak into it.
+        approvalPathDraft: null,
+        approvalPreviewPage: null,
+      };
+    case "approval_resolved":
+      if (state.pendingApproval?.approvalId !== action.approvalId) return state;
+      return {
+        ...state,
+        pendingApproval: null,
+        approvalPathDraft: null,
+        approvalPreviewPage: null,
+        // Resolving the visible turn's request resumes that turn:
+        // `running`. Resolving a background turn's request resumes a
+        // turn this transcript is not showing — the visible status
+        // (idle, or a run of its own) is left alone.
+        status:
+          state.pendingApproval.sessionId === state.session.sessionId
+            ? "running"
+            : state.status,
+      };
+    case "approval_path_edit_opened":
+      if (!state.pendingApproval) return state;
+      return { ...state, approvalPathDraft: action.path };
+    case "approval_path_edit_changed":
+      if (state.approvalPathDraft === null) return state;
+      return { ...state, approvalPathDraft: action.value };
+    case "approval_path_edit_closed":
+      return { ...state, approvalPathDraft: null };
+    case "approval_preview_paged": {
+      const request = state.pendingApproval;
+      if (!request) return state;
+      const current =
+        state.approvalPreviewPage?.approvalId === request.approvalId
+          ? state.approvalPreviewPage.page
+          : null;
+      const next = nextApprovalPreviewPage(request, current);
+      return {
+        ...state,
+        approvalPreviewPage:
+          next === null ? null : { approvalId: request.approvalId, page: next },
+      };
+    }
+      return { ...state, pendingApproval: null, status: "running" };
+    case "composer_notice":
+      if (state.composerNotice === action.text) return state;
+      return { ...state, composerNotice: action.text };
+    case "composer_selection_changed":
+      if (state.composerHasSelection === action.hasSelection) return state;
+      return { ...state, composerHasSelection: action.hasSelection };
+    case "metric":
+      return applyMetric(state, action.sample);
+    case "log":
+      return {
+        ...state,
+        logs: pushRing(state.logs, action.record, state.ringBufferSize),
+      };
+    case "tab_changed":
+      if (action.tab === "models") {
+        return {
+          ...state,
+          activeTab: "llm",
+          llmPanel: { ...state.llmPanel, mode: "local" },
+        };
+      }
+      if (action.tab === "providers") {
+        return {
+          ...state,
+          activeTab: "llm",
+          llmPanel: { ...state.llmPanel, mode: "cloud" },
+        };
+      }
+      return { ...state, activeTab: action.tab };
+    case "abort_requested": {
+      const maintenanceOnly = Boolean(state.contextCompactions[state.session.sessionId ?? ""])
+        && state.status !== "running" && state.status !== "awaiting_approval";
+      return { ...state, aborting: !maintenanceOnly, abortArmed: false };
+    }
+    case "abort_armed":
+      return state.abortArmed ? state : { ...state, abortArmed: true };
+    case "abort_disarmed":
+      return state.abortArmed ? { ...state, abortArmed: false } : state;
+    case "input_changed": {
+      // Moving the caret re-emits the buffer unchanged (the editor owns
+      // the cursor and reports it through `onChange`). That is not an
+      // edit, so it must not knock us out of history recall — otherwise
+      // a single Left/Right after Up dropped the recall position and the
+      // parked draft with it.
+      if (action.value === state.inputValue) return state;
+      return {
+        ...state,
+        inputValue: action.value,
+        inputHistoryCursor: null,
+        inputHistoryDraft: null,
+      };
+    }
+    case "composer_draft_replaced":
+      if (state.inputValue !== action.expected) {
+        return {
+          ...state,
+          composerNotice:
+            state.inputValue.trim().length === 0
+              ? "Enhanced prompt not applied: the draft was sent or cleared while it ran."
+              : "Enhanced prompt not applied: the draft changed while it ran.",
+        };
+      }
+      return {
+        ...state,
+        inputValue: action.value,
+        inputHistoryCursor: null,
+        inputHistoryDraft: null,
+        composerNotice:
+          action.value === action.expected
+            ? "The prompt already reads clearly; nothing changed."
+            : "Enhanced prompt is in the composer. Review it, then press Enter to send.",
+      };
+    case "message_waiting_for_model":
+      if (action.sessionId !== state.session.sessionId) return state;
+      return { ...appendUserMessage(state, action.text), pendingModelMessage: { sessionId: action.sessionId, text: action.text } };
+    case "message_submitted":
+      return startNewRun(state);
+    case "turn_gate_blocked": {
+      state = { ...state, pendingModelMessage: null };
+      const withMessage = appendChatMessage(
+        appendFeed(state, {
+          kind: "runtime_info",
+          stepIndex: null,
+          line: `» blocked: ${action.text.split("\n")[0] ?? action.text}`,
+          color: "yellow",
+        }),
+        { role: "system", text: action.text, variant: "warn" },
+      );
+      // A drained queue message is gated after the previous turn already
+      // returned the app to idle — nothing to finish then. The fresh
+      // submit path arrives here `running` (from `message_submitted`)
+      // with no turn behind it, so the idle reset is what hands the
+      // composer back — WITHOUT a run-history entry: the blocked text
+      // never reached `state.messages`, so an entry would carry the
+      // previous turn's message, and a refused submit is not a run.
+      if (state.status !== "running") return withMessage;
+      return finishRunWithoutHistory(
+        withMessage,
+        "blocked: local model not ready",
+      );
+    }
+    case "quit_requested":
+      return { ...state, status: "quitting", aborting: true };
+    case "loaded_skill": {
+      const others = state.loadedSkills.filter(
+        (s) => s.name !== action.skill.name,
+      );
+      return { ...state, loadedSkills: [...others, action.skill] };
+    }
+    case "world_snapshot":
+      return { ...state, worldSnapshot: action.snapshot };
+    case "latest_result":
+      return { ...state, latestResult: action.result };
+    case "assistant_delta":
+      return {
+        ...state,
+        streamingAssistantText:
+          (state.streamingAssistantText ?? "") + action.text,
+      };
+    case "llm_health_updated":
+      return {
+        ...state,
+        llmHealth: {
+          ...state.llmHealth,
+          status: action.status,
+          lastCheckedAt: action.checkedAt,
+          latencyMs: action.latencyMs,
+          error: action.error,
+          // A server that answers is a server somebody meant to run, even if
+          // config never said so. Latch it on so the indicator appears for
+          // that user and survives the server later going down.
+          localConfigured:
+            state.llmHealth.localConfigured || action.status === "healthy",
+        },
+      };
+    case "llm_model_updated":
+      return {
+        ...state,
+        llmHealth: {
+          ...state.llmHealth,
+          model: action.model,
+          // Only overwrite the context window when the update carries one
+          // (an optimistic catalog-label update omits it — keep the last
+          // known `/props` value instead of blanking the tray).
+          contextWindow:
+            action.contextWindow === undefined
+              ? state.llmHealth.contextWindow
+              : action.contextWindow,
+        },
+      };
+    case "update_available":
+      // Never override an in-flight or finished update with a new offer.
+      if (state.updateStatus !== "idle") return state;
+      return {
+        ...state,
+        updatePrompt: { current: action.current, latest: action.latest },
+        updateBanner: { current: action.current, latest: action.latest },
+      };
+    case "update_dismissed":
+      return { ...state, updatePrompt: null };
+    case "project_trust_asked":
+      return { ...state, projectTrustPrompt: action.prompt };
+    case "project_trust_closed":
+      return { ...state, projectTrustPrompt: null };
+    case "update_started":
+      return appendFeed(
+        { ...state, updatePrompt: null, updateStatus: "running" },
+        {
+          kind: "runtime_info",
+          stepIndex: null,
+          line: "[update] starting…",
+          color: "yellow",
+        },
+      );
+    case "update_finished": {
+      const next: TuiState = {
+        ...state,
+        updateStatus: action.ok ? "done" : "failed",
+      };
+      return appendChatMessage(next, {
+        role: "system",
+        text: action.ok
+          ? `updated to v${action.version ?? "?"} — press any key to restart`
+          : `update failed: ${action.error ?? "unknown error"}`,
+        variant: action.ok ? "normal" : "warn",
+      });
+    }
+    default:
+      return state;
+  }
+}
+
+function reduceAgentEvent(state: TuiState, event: AgentLoopEvent): TuiState {
+  switch (event.type) {
+    case "user_message": {
+      const pending = state.pendingModelMessage;
+      const next = { ...state, pendingModelMessage: null };
+      return pending?.sessionId === state.session.sessionId && pending?.text === event.text
+        ? next : appendUserMessage(next, event.text);
+    }
+    case "steer_applied":
+      // A message the operator sent mid-turn, folded into the prompt of
+      // the step named here. It renders INLINE in the running turn: same
+      // chat bubble as any user message, but none of the per-turn resets
+      // `user_message` implies — no `startNewRun`, no step counter reset.
+      // The feed line is what ties it to the step it actually reached.
+      return appendUserMessage(
+        appendFeed(state, {
+          kind: "runtime_info",
+          stepIndex: event.stepIndex,
+          line: `» steering applied at step ${event.stepIndex}`,
+          color: "yellow",
+        }),
+        event.text,
+        { steered: true },
+      );
+    case "turn_started":
+      return {
+        ...state,
+        status: "running",
+        currentTurnToolSteps: 0,
+        runStartedAt: Date.now(),
+      };
+    case "turn_finished": {
+      // `waiting` and `retrying` are claims about a turn that is still
+      // on the wire, so the end of the turn ends them — whichever way it
+      // ended. It used to clear only on `reply` / `finish`, which left a
+      // live outage standing after the two endings that reach it most
+      // often: Esc during the backoff (the feed line the loop prints
+      // says "· Esc stops") and a turn stopped at its step ceiling. The
+      // row then counted a wait that nothing was waiting for — measured
+      // at 19s and climbing, fourteen seconds after the loop was dead —
+      // and the next turn's first `step_started` read it as the parked
+      // step going back on the wire: a brand-new healthy turn labelled
+      // `retrying provider (attempt 1)`, with that step's streamed reply
+      // wiped at every step boundary for as long as it ran.
+      //
+      // `givenUp` is the one that survives, and survives on purpose: it
+      // is past tense, it is what stops nine identical failures reading
+      // as nine separate surprises, and `loop_failed` has already set it
+      // by the time this event lands. It survives until a turn actually
+      // reaches the model — at which point the link is demonstrably
+      // answering again and the badge would be the lie instead.
+      const reachedTheModel =
+        event.reason === "reply" || event.reason === "finish";
+      const keepBadge =
+        !reachedTheModel && Boolean(state.providerOutage?.givenUp);
+      return finishTurn(
+        keepBadge ? state : { ...state, providerOutage: null },
+        event.reason,
+        event.stepCount,
+      );
+    }
+    case "step_started":
+      // `retryProviderOutage` is a no-op unless an outage is live, so an
+      // ordinary step start goes through here exactly as it always did.
+      return retryProviderOutage(
+        {
+          ...appendFeed(state, {
+            kind: "step_started",
+            stepIndex: event.stepIndex,
+            line: formatFeedLine({
+              type: "step_started",
+              stepIndex: event.stepIndex,
+            }),
+            color: "blue",
+          }),
+          status: "running",
+          currentStep: event.stepIndex,
+          stepStartedAt: Date.now(),
+        },
+        event.stepIndex,
+      );
+    case "step_finished":
+      return {
+        ...appendFeed(state, {
+          kind: "step_finished",
+          stepIndex: event.stepIndex,
+          line: formatFeedLine({
+            type: "step_finished",
+            stepIndex: event.stepIndex,
+            summary: event.summary,
+            durationMs: event.durationMs,
+            ...(event.reviewStall !== undefined
+              ? { reviewStall: { phase: event.reviewStall.phase } }
+              : {}),
+          }),
+          color: "gray",
+        }),
+        stepStartedAt: null,
+        metrics: { ...state.metrics, stepDurationMsLast: event.durationMs },
+      };
+    case "llm_event":
+      return reduceStepEvent(state, event.event);
+    case "loop_completed": {
+      const outcome: RunOutcome =
+        event.reason === "cancelled"
+          ? "cancelled"
+          : event.reason === "failed"
+            ? "failed"
+            : "completed";
+      const lastRunStatus =
+        outcome === "completed"
+          ? `completed: ${event.reason}`
+          : `${outcome}: ${event.reason}`;
+      const feedColor =
+        event.reason === "cancelled"
+          ? "yellow"
+          : event.reason === "failed"
+            ? "red"
+            : "green";
+      return finishRun(
+        appendFeed(state, {
+          kind: "loop_completed",
+          stepIndex: null,
+          line: `» ${lastRunStatus}`,
+          color: feedColor,
+        }),
+        { outcome, reason: event.reason, lastRunStatus },
+      );
+    }
+    case "provider_switched": {
+      // The one live signal the Fallback pane has: the runtime breaker
+      // instance is not reachable from the TUI, so we mirror the last
+      // announced transition into `fallbackPanel.lastSwitch` (no invented
+      // countdown) and drop a feed line so the switch is visible in the
+      // stream too.
+      const line =
+        event.direction === "away"
+          ? `» failed over ${event.from} -> ${event.to} (${event.reason})`
+          : `» recovered primary ${event.to} (probe ok)`;
+      const prev = state.fallbackPanel.lastSwitch;
+      // Say it in the chat too, once per transition. A fallover changes
+      // which model answers and what it costs, and the feed lives in a
+      // tab the operator is not looking at while they work. Repeats of
+      // the same switch stay in the feed: the chain re-announces on
+      // every probe, and one notice per transition is the signal.
+      const announce =
+        event.direction === "away" &&
+        !(
+          prev?.direction === "away" &&
+          prev.from === event.from &&
+          prev.to === event.to
+        );
+      const withSwitch = {
+        ...state,
+        fallbackPanel: {
+          ...state.fallbackPanel,
+          lastSwitch: {
+            direction: event.direction,
+            from: event.from,
+            to: event.to,
+            reason: event.reason,
+            ...(event.cause !== undefined ? { cause: event.cause } : {}),
+          },
+        },
+      };
+      return appendFeed(
+        announce
+          ? appendChatMessage(withSwitch, {
+              role: "system",
+              variant: "warn",
+              action: "configure-fallback",
+              text: formatProviderFalloverNotice(
+                event.from,
+                event.to,
+                event.reason,
+                event.cause,
+              ),
+            })
+          : withSwitch,
+        {
+          kind: "runtime_info",
+          stepIndex: null,
+          line,
+          color: event.direction === "away" ? "yellow" : "green",
+        },
+      );
+    }
+    case "memory_health_warning":
+      return reduceMemoryHealthWarning(state, event);
+    case "loop_failed": {
+      // A user-initiated abort is not a failure and must not dress like
+      // one: the operator pressed stop (the chip, Esc, Ctrl+C or
+      // `/abort`) and already knows the turn is dead. Instead of the
+      // warn-styled "Turn failed" wall over `Details: This operation
+      // was aborted`, leave a calm system notice that says who stopped
+      // it — and carry the aborted turn's user message as `retryText`,
+      // so a mistaken click is one `[try again]` away from undone.
+      //
+      // `state.aborting` is checked alongside the category because the
+      // abort races the LLM stream: killing a response mid-flight can
+      // surface as `[model] model returned empty content` (or another
+      // category) before the AbortError ever propagates, and an
+      // operator who just pressed stop would read that as a provider
+      // failure they caused. Every abort entry point dispatches
+      // `abort_requested` first, and `finishRun` clears the flag, so
+      // the window is exactly the abort the operator asked for.
+      if (event.category === "cancelled" || state.aborting) {
+        const lastRunStatus = "stopped by user";
+        const prompt = lastTurnRequest(state);
+        return finishRun(
+          appendChatMessage(
+            appendFeed(state, {
+              kind: "loop_failed",
+              stepIndex: null,
+              line: `» ${lastRunStatus}`,
+              color: "yellow",
+            }),
+            {
+              role: "system",
+              text: "Agent stopped by user.",
+              retryText: prompt.length > 0 ? prompt : undefined,
+            },
+          ),
+          { outcome: "cancelled", reason: lastRunStatus, lastRunStatus },
+        );
+      }
+      const lastRunStatus = `failed [${event.category}]: ${event.error.message}`;
+      // ATO-772: the managed local model's process is gone and the turn
+      // ended without the outage wait: say so, and the command that fixes it.
+      const engineDown = isLocalEngineDown(event.error);
+      // ATO-707 / ATO-737: a local server's typed 400 (context full, or a
+      // request it would not take) in plain words. Its 404/405 keeps the
+      // wrong-server hint below, which names the recheck command.
+      const localServer = engineDown ? null : classifyLocalServerError(event.error);
+      const badRequest =
+        localServer !== null && localServer.code !== LOCAL_SERVER_NOT_FOUND_CODE ? localServer : null;
+      // ATO-334: the out-of-memory sentence is already plain and says
+      // what to do; the transport wording around it would not.
+      const chatError = isLocalOutOfMemory(event.error)
+        ? event.error.message
+        : engineDown
+        ? formatLocalEngineDownForChat()
+        : badRequest !== null
+          ? formatLocalServerErrorForChat(badRequest, event.error.message)
+          : formatAgentErrorForChat(
+        event.category,
+        event.error.message,
+        {
+          // The same "is the chat route a llama-server" answer the
+          // composer's backend control renders — KIND-based, so a
+          // llama-server entry under a custom id still earns the hint;
+          // only a `cloud` route must not (the hint names the llama
+          // URL). Rows land at TUI start via the providers refresh.
+          // Fusion's failing call is the cloud orchestrator's, so it is
+          // excluded for the same reason cloud is.
+          activeProviderIsLocal: !["cloud", "fusion"].includes(
+            selectComposerBackend(state),
+          ),
+          llamaUrl: state.session.llamaUrl,
+        },
+        describeFailedAttempts(event.error),
+      );
+      // The turn died parked: the chat said it was waiting, so the
+      // failure says the wait is over before it says why.
+      const diedWaiting =
+        !engineDown &&
+        event.category === "transport" &&
+        state.providerOutage !== null &&
+        !state.providerOutage.givenUp;
+      const failureText = diedWaiting
+        ? `${formatProviderGaveUpLine(state.providerOutage!.maxWaitMs)}\n${chatError}`
+        : chatError;
+      // The wait ran out and the turn died with it. Keep the outage on
+      // screen: the next message the operator sends will fail the same
+      // way, and a state that clears itself between attempts is how
+      // eight identical failures read as eight separate surprises.
+      const outageState: TuiState = state.providerOutage
+        ? {
+            ...state,
+            providerOutage: { ...state.providerOutage, givenUp: true },
+          }
+        : state;
+      // Same `[try again]` the stopped notice carries: a turn that died
+      // on a dropped network or a provider hiccup is the case the button
+      // is for, and retyping the request is the only other way back.
+      const failedPrompt = lastTurnRequest(state);
+      return finishRun(
+        appendChatMessage(
+          appendFeed(outageState, {
+            kind: "loop_failed",
+            stepIndex: null,
+            line: `» ${lastRunStatus}`,
+            color: "red",
+          }),
+          {
+            role: "system",
+            text: withReportHint(failureText),
+            variant: "warn",
+            retryText: failedPrompt.length > 0 ? failedPrompt : undefined,
+          },
+        ),
+        { outcome: "failed", reason: event.error.message, lastRunStatus },
+      );
+    }
+    case "provider_waiting": {
+      const line = `» provider not answering (${event.reason}) — retrying in ${Math.round(
+        event.nextRetryMs / 1000,
+      )}s, waited ${Math.round(event.waitedMs / 1000)}s of ${Math.round(
+        event.maxWaitMs / 1000,
+      )}s · Esc stops`;
+      const next: TuiState = parkProviderOutage(state, {
+        reason: event.reason,
+        ...(event.cause !== undefined ? { cause: event.cause } : {}),
+        waitedMs: event.waitedMs,
+        maxWaitMs: event.maxWaitMs,
+        attempt: event.attempt,
+      });
+      // One feed line and one chat notice per outage, not per retry: the
+      // backoff fires every few seconds at the start and the meta-row
+      // carries the live numbers. A wall of identical lines would bury
+      // the work above it. The chat notice is the one the operator sees:
+      // the feed is in another tab and is wiped at every turn start, and
+      // from the chat a parked turn read as an agent gone silent.
+      if (event.attempt !== 1) return next;
+      const backend = selectComposerBackend(state);
+      return appendChatMessage(
+        appendFeed(next, {
+          kind: "runtime_info",
+          stepIndex: null,
+          line,
+          color: "yellow",
+        }),
+        {
+          role: "system",
+          variant: "warn",
+          text: formatProviderWaitNotice(
+            event.reason,
+            event.maxWaitMs,
+            backend === "local" || backend === "fusion",
+            event.cause,
+          ),
+        },
+      );
+    }
+    case "prompt_repacked":
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line: `» the model rejected the request as too large — window ~${event.contextWindow} tokens (${
+          event.source === "provider" ? "from its reply" : "estimated"
+        }), trimming the conversation to fit and retrying step ${event.stepIndex + 1}`,
+        color: "yellow",
+      });
+    case "credit_exhausted":
+      // The turn is about to close `max_steps` with a synthetic reply
+      // that says the same; this is the one-line version for the feed,
+      // and the line that names the provider.
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line: `» "${event.provider}" is out of credit (${event.code}) — task paused; top up, then say continue`,
+        color: "yellow",
+      });
+    case "local_model_out_of_memory": {
+      // ATO-334. The question itself is the approval prompt; the chat
+      // gets one note, when the model is back with the smaller window.
+      // A stop is told by the turn's failure line that follows.
+      const feed = appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line: `» local model out of memory (${event.phase}): ${event.message}`,
+        color: event.phase === "restarted" ? "green" : "yellow",
+      });
+      return event.phase === "restarted"
+        ? appendChatMessage(feed, { role: "system", text: event.message })
+        : feed;
+    }
+    case "provider_recovered": {
+      // Closes the wait notice `provider_waiting` posted — only when one
+      // was posted, so a recovery the chat never heard about stays in
+      // the feed.
+      const cleared: TuiState = { ...state, providerOutage: null };
+      return appendFeed(
+        state.providerOutage !== null
+          ? appendChatMessage(cleared, {
+              role: "system",
+              text: formatProviderResumedNotice(event.waitedMs),
+            })
+          : cleared,
+        {
+          kind: "runtime_info",
+          stepIndex: null,
+          line: `» provider answered again after ${Math.round(
+            event.waitedMs / 1000,
+          )}s — continuing`,
+          color: "green",
+        },
+      );
+    }
+    case "completion_truncated": {
+      // One line per retry, in the operator's terms: what was cut, and
+      // what the retry changes. The turn fails once the retries are
+      // spent, and that message names the wall and the knob.
+      const cut =
+        event.completionTokens > 0
+          ? `reply cut off at ${event.completionTokens} tokens`
+          : "reply cut off";
+      const cap =
+        event.requestedMaxTokens !== undefined
+          ? `cap ${event.requestedMaxTokens}`
+          : "no cap sent";
+      // A loop the stream watcher cut has no meaningful token count or
+      // cap to report: say what happened instead.
+      const line =
+        event.repetitive === true && event.retry.kind === "same_cap"
+          ? `» The model kept repeating the same text, so its reply was stopped. Retrying step ${event.stepIndex + 1} and asking it not to repeat`
+          : event.retry.kind === "raise_cap"
+          ? `» ${cut} (${cap}) — retrying step ${event.stepIndex + 1} with a ${event.retry.maxTokens}-token cap`
+          : event.retry.kind === "same_cap"
+            ? `» ${cut} (${cap}). Retrying step ${event.stepIndex + 1} with a ${event.retry.maxTokens}-token cap and asking for a shorter reply`
+            : `» ${cut}: the model server ran out of context at ~${event.retry.contextWindow} tokens — trimming the conversation to fit and retrying step ${event.stepIndex + 1}`;
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line,
+        color: "yellow",
+      });
+    }
+    case "task_continued": {
+      // A long task must not go quiet. One line per leg, carrying the
+      // two numbers someone deciding whether to wait actually wants:
+      // how far it has got, and how far it may go.
+      const minutes = Math.max(1, Math.round(event.elapsedMs / 60_000));
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line: `» still working — ${event.stepsTaken} steps, ${minutes} min (ceiling ${event.stepCeiling})`,
+        color: "gray",
+      });
+    }
+    case "tool_progress":
+      // A clip takes minutes with no step of its own to show; the tool
+      // throttles these to one every 20 seconds, so a feed line each is
+      // the "still working" the operator would otherwise not get.
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: null,
+        line: `» ${event.tool}: ${event.label}`,
+        color: "gray",
+      });
+    case "fusion_worker": {
+      // A token count moves the live row and nothing else: one feed
+      // line per completion per worker would bury the lines that say
+      // what happened.
+      if (event.phase === "usage") {
+        return {
+          ...state,
+          fusionLiveWorkers: reduceFusionLiveWorkers(
+            state.fusionLiveWorkers,
+            event,
+          ),
+        };
+      }
+      // A fan-out can hold the orchestrator's turn for minutes with no
+      // steps of its own to show, so each leg gets a start line, its
+      // (bounded) tool lines and an end line — each naming the model
+      // that ran it, because fusion is the one mode where two models
+      // and two bills share a single turn. `stepIndex: null` because
+      // these belong to the parent turn as a whole, not to any one of
+      // its steps — the events are emitted in the parent's frame from
+      // inside a worker session that has no step counter the operator
+      // can see.
+      return appendFeed(
+        {
+          ...state,
+          // The chat surface shows the fan-out while it runs; the feed
+          // keeps the history of it.
+          fusionLiveWorkers: reduceFusionLiveWorkers(
+            state.fusionLiveWorkers,
+            event,
+          ),
+        },
+        {
+          kind: "runtime_info",
+          stepIndex: null,
+          line: formatFusionWorkerLine(event),
+          color: fusionWorkerLineColor(event),
+        },
+      );
+    }
+    case "parse_failure_recovered": {
+      // Rendered, unlike `loop_detected`: this step produced no tool
+      // call and no text, so without a line the feed shows a gap the
+      // operator has no way to read. One line per recovery — there are
+      // at most `budget` of them.
+      const reason =
+        event.reason.length > 120
+          ? `${event.reason.slice(0, 120)}…`
+          : event.reason;
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: `» the model's output could not be read as a tool call (${reason}) — trying again (${event.attempt}/${event.budget})`,
+        color: "yellow",
+      });
+    }
+    case "empty_completion_recovered":
+      // Same reason as above, and more so: an empty completion produces
+      // literally nothing, so without this line the feed shows a step
+      // that never happened.
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: `» the model returned an empty reply — trying again (${event.attempt}/${event.budget})`,
+        color: "yellow",
+      });
+    case "compaction_started":
+      return appendChatMessage(state, { role: "system", text: `Compacting context (active history: ~${event.tokensBefore} tokens)…` });
+    case "compaction_progress":
+      return state;
+    case "compaction_completed":
+      return appendChatMessage({ ...state, ...(event.contextUsage ? { contextUsage: event.contextUsage } : {}) }, {
+        role: "system", text: `Context compacted: ~${event.result.tokensBefore} → ~${event.result.tokensAfter} tokens. Summary usage: ${event.usage.totalTokens} tokens (${event.calls} calls)${event.result.costUsd !== undefined ? `, ~$${event.result.costUsd.toFixed(4)}` : ""}.`,
+      });
+    case "compaction_failed":
+      return appendChatMessage(state, { role: "system", text: event.result.status === "cancelled"
+        ? "Context compaction cancelled."
+        // A planned skip (e.g. a window too small to compact): nothing failed.
+        : event.result.status === "noop"
+        ? `Context compaction skipped: ${event.result.message ?? "no safe, useful reduction is available."}`
+        : `Context compaction failed: ${(event.result.message ?? "unknown error").replace(/[.!?]+$/, "")}. Existing context retained; history trimming remains available.`,
+      });
+    case "history_trimmed":
+      // ATO-295: the packer left older history out of the prompt. The
+      // loop says so once per cut, so this cannot fill the transcript.
+      return appendChatMessage(state, { role: "system", text: HISTORY_TRIMMED_NOTICE });
+    case "profile_clipped": {
+      // Issue #407: the clip used to show only as a `[truncated]` inside
+      // a prompt nobody reads. The loop fires this once per session, and
+      // again only when the pinned count changes, so it cannot fill the
+      // feed.
+      const noun = event.dropped === 1 ? "fact" : "facts";
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: `» profile: ${event.dropped} ${noun} left out of the prompt (${event.pinnedDropped} pinned) — memory.profile.maxTokens ${event.maxTokens} is too small`,
+        color: "yellow",
+      });
+    }
+    case "loop_detected":
+      // Deliberately not rendered: the loop detector's own `### notice`
+      // changes what the model does, and the operator sees the effect
+      // through the tool calls that follow. Listed explicitly so the
+      // exhaustiveness check below stays meaningful.
+      return state;
+    default: {
+      // `steer_applied` shipped with a doc comment promising inline
+      // rendering and no case here, and a bare `default: return state`
+      // meant TypeScript had nothing to say about it. This makes the
+      // next new `AgentLoopEvent` a compile error instead of a silent
+      // no-op — while still returning `state` at runtime, because a UI
+      // reducer must never throw on an event it does not know.
+      const unhandled: never = event;
+      void unhandled;
+      return state;
+    }
+  }
+}
+
+function reduceStepEvent(
+  state: TuiState,
+  event: Extract<AgentLoopEvent, { type: "llm_event" }>["event"],
+): TuiState {
+  switch (event.type) {
+    case "reasoning":
+      return upsertReasoning(state, {
+        stepIndex: event.stepIndex,
+        text: event.text,
+      });
+    case "reasoning_delta":
+      return appendReasoningDelta(state, {
+        stepIndex: event.stepIndex,
+        text: event.text,
+      });
+    case "assistant_delta":
+      return {
+        ...state,
+        streamingAssistantText:
+          (state.streamingAssistantText ?? "") + event.text,
+      };
+    case "prompt_captured": {
+      const withFeed = appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: formatFeedLine({
+          type: "prompt_captured",
+          stepIndex: event.stepIndex,
+          total: event.tokens.total,
+          stablePrefix: event.tokens.stablePrefix,
+          tail: event.tokens.tail,
+          cacheReused: event.cacheReused,
+        }),
+        color: event.cacheReused ? "green" : "yellow",
+      });
+      return {
+        ...withFeed,
+        metrics: {
+          ...withFeed.metrics,
+          promptTokensLast: event.tokens.total,
+          promptStablePrefixTokensLast: event.tokens.stablePrefix,
+          promptTailTokensLast: event.tokens.tail,
+        },
+      };
+    }
+    case "parse_retry": {
+      const withFeed = appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: formatFeedLine({
+          type: "parse_retry",
+          stepIndex: event.stepIndex,
+          attempt: event.attempt,
+          reason: event.reason,
+        }),
+        color: "yellow",
+      });
+      return {
+        ...withFeed,
+        metrics: {
+          ...withFeed.metrics,
+          parseRetries: withFeed.metrics.parseRetries + 1,
+        },
+      };
+    }
+    case "tool_call_parsed": {
+      const call: StreamingToolCall = {
+        id: `tc-${Date.now()}-${state.streamingToolCalls.length}-${state.streamingToolCards.length}`,
+        stepIndex: state.currentStep,
+        tool: event.call.tool,
+        args: event.call.args,
+        startedAt: Date.now(),
+      };
+      return beginStreamingToolCall(
+        appendFeed(state, {
+          kind: "tool_call_parsed",
+          stepIndex: state.currentStep,
+          line: formatFeedLine({
+            type: "tool_call_parsed",
+            tool: event.call.tool,
+            args: event.call.args,
+            batchIndex: event.batchIndex,
+            batchSize: event.batchSize,
+          }),
+          color: "magenta",
+        }),
+        call,
+      );
+    }
+    case "tool_call_executed": {
+      const color = event.result.status === "ok" ? "green" : "red";
+      const toolsOk =
+        state.metrics.toolsOk + (event.result.status === "ok" ? 1 : 0);
+      const toolsError =
+        state.metrics.toolsError + (event.result.status === "error" ? 1 : 0);
+      const isReply = event.result.tool === "reply";
+      const withFeed = appendFeed(state, {
+        kind: "tool_call_executed",
+        stepIndex: state.currentStep,
+        line: formatFeedLine({
+          type: "tool_call_executed",
+          tool: event.result.tool,
+          status: event.result.status,
+          summary: event.result.summary,
+          truncated: event.result.truncated ?? false,
+          batchIndex: event.batchIndex,
+          batchSize: event.batchSize,
+        }),
+        color,
+      });
+      const { state: withCard } = finalizeStreamingToolCall(withFeed, {
+        tool: event.result.tool,
+        status: event.result.status,
+        summary: event.result.summary,
+        truncated: event.result.truncated ?? false,
+        ...(event.result.details !== undefined
+          ? { details: event.result.details }
+          : {}),
+      });
+      return {
+        ...withCard,
+        latestResult: {
+          tool: event.result.tool,
+          status: event.result.status,
+          summary: event.result.summary,
+          ...(event.result.details !== undefined
+            ? { details: event.result.details }
+            : {}),
+        },
+        metrics: { ...withCard.metrics, toolsOk, toolsError },
+        currentTurnToolSteps: isReply
+          ? state.currentTurnToolSteps
+          : state.currentTurnToolSteps + 1,
+      };
+    }
+    case "rare_tool_autoloaded":
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: formatFeedLine({
+          type: "rare_tool_autoloaded",
+          tool: event.tool,
+        }),
+        color: "yellow",
+      });
+    case "assistant_reply": {
+      const reasoningForTurn = state.reasoning.map((r) => r.text);
+      const toolCardsForTurn = state.streamingToolCards;
+      const withMessage = appendChatMessage(state, {
+        role: "assistant",
+        text: event.text,
+        ...(event.progressNote === true ? { progressNote: true } : {}),
+        toolSteps: state.currentTurnToolSteps,
+        ...(toolCardsForTurn.length > 0 ? { toolCards: toolCardsForTurn } : {}),
+        ...(reasoningForTurn.length > 0
+          ? { reasoningBlocks: reasoningForTurn }
+          : {}),
+        ...(event.attachments !== undefined && event.attachments.length > 0
+          ? { attachments: event.attachments }
+          : {}),
+      });
+      // Clear live reasoning along with the other streaming state so the
+      // StreamingTail does not re-expand reasoning the instant the turn
+      // finalises — the reasoning now lives inside the finalised message
+      // and is rendered collapsed next to it.
+      return {
+        ...withMessage,
+        streamingAssistantText: null,
+        streamingToolCalls: [],
+        streamingToolCards: [],
+        reasoning: [],
+      };
+    }
+    case "step_error":
+      return appendFeed(state, {
+        kind: "step_error",
+        stepIndex: state.currentStep,
+        line: `  ! [${event.category}] ${event.error.message}`,
+        color: "red",
+      });
+    case "batch_trimmed":
+      // Surfaced by the exhaustiveness check below: the model asked for
+      // `originalSize` calls and only one ran. That is worth a line —
+      // otherwise the dropped calls reappear one-by-one next step with
+      // no explanation for why the batch shrank.
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line:
+          `  ~ batch trimmed to ${event.kept} (${event.dropped.length} of ${event.originalSize} deferred: ${event.reason}` +
+          `${event.refused && event.refused.length > 0 ? `; ${event.refused.length} refused by the turn policy` : ""})`,
+        color: "yellow",
+      });
+    case "answer_continued":
+      // ATO-1031: the reply hit the length limit and the step asked for
+      // the rest once. Without the line, the second wait looks like a hang.
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line:
+          event.outcome === "completed"
+            ? "» the reply hit the length limit — continued it once"
+            : event.outcome === "cut_again"
+              ? "» the reply hit the length limit twice — showing what arrived"
+              : "» the reply hit the length limit — continuing it failed, retrying the step",
+        color: "yellow",
+      });
+    case "batch_wave_split":
+      // Issue #111: an oversized pure-read batch ran in bounded waves.
+      // Nothing was dropped — every call executed — so the feed line
+      // says so explicitly (otherwise the follow-up step's tool calls
+      // look like a re-run of the same reads).
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: `  ~ ${event.originalSize} reads split into ${event.waveCount} waves of ≤ ${event.cap} (nothing dropped)`,
+        color: "yellow",
+      });
+    case "batch_approval_barriers":
+      // Issue #109: a batch with gated calls ran in order behind its
+      // approvals instead of being trimmed. Worth a line only when part
+      // of it never ran — otherwise every call already has its own row.
+      if (event.invalidated === 0) return state;
+      return appendFeed(state, {
+        kind: "runtime_info",
+        stepIndex: event.stepIndex,
+        line: event.stoppedBy
+          ? `  ~ ${event.invalidated} of ${event.originalSize} calls not run: ${event.stoppedBy.tool} ${event.stoppedBy.cause === "not_approved" ? "was not approved" : "failed"}`
+          : `  ~ ${event.invalidated} of ${event.originalSize} calls not run (cancelled)`,
+        color: "yellow",
+      });
+    case "prompt_built":
+      // The feed still ignores the prompt text itself — it would drown
+      // the log — but the token breakdown that comes with it is the only
+      // authoritative statement of what is in the window right now.
+      return {
+        ...state,
+        contextUsage: contextUsageFromPrompt(event.prompt),
+        // Reality has caught up with the selector: the prompt was built
+        // against the number the operator chose, so the local override
+        // is no longer telling anyone anything the measurement does not.
+        // Cleared only on a match, because a build that predates the
+        // change would otherwise snap the selector back to the old value
+        // in front of them.
+        contextPanelPairsDraft:
+          state.contextPanelPairsDraft === event.prompt.conversationPairsCap
+            ? null
+            : state.contextPanelPairsDraft,
+      };
+    case "llm_completed": {
+      // `prompt_built` carried an estimate (`estimateTokens` over-counts
+      // by design); the provider just reported what its own tokenizer
+      // actually counted — llama.cpp from `prompt_n + tokens_cached`
+      // (the whole prompt, not just the slice evaluated past the KV
+      // cache), an OpenAI-compatible cloud from `usage.prompt_tokens`.
+      // Prefer it, and leave the estimate standing when nothing was
+      // reported.
+      const counted = event.completion.timing?.promptTokens ?? 0;
+      if (counted <= 0) return state;
+      return {
+        ...state,
+        contextUsage: { ...state.contextUsage, tokens: counted },
+      };
+    }
+    case "llm_raw_completion":
+      // Raw plumbing: the whole completion object, the unparsed text.
+      // The trace recorder wants them; the chat feed would drown in
+      // them. Listed so the exhaustiveness check holds.
+      return state;
+    case "first_token":
+    case "prompt_progress":
+      // ATO-1027: the wait before the first token, for an HTTP host's
+      // status line. The TUI's own streaming tail already shows output
+      // the moment it starts. Listed so the exhaustiveness check holds.
+      return state;
+    default: {
+      const unhandled: never = event;
+      void unhandled;
+      return state;
+    }
+  }
+}

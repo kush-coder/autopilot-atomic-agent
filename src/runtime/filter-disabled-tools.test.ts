@@ -1,0 +1,302 @@
+import { describe, expect, it } from "vitest";
+
+import { DEFAULT_TOOL_DESCRIPTORS } from "../prompt/tool-descriptors.js";
+import {
+  GATED_TOOL_NAMES,
+  filterToolDescriptorsByConfig,
+  type ToolGateConfig,
+} from "./filter-disabled-tools.js";
+
+const ALL_OPEN: ToolGateConfig = {
+  browser: { enabled: true },
+  web: { search: { enabled: true } },
+  vision: { enabled: true, providerAvailable: true },
+  memory: {
+    profile: { enabled: true },
+    notes: { enabled: true },
+    lessons: { enabled: true },
+    procedures: { enabled: true },
+  },
+  tasks: { agentToolsEnabled: true },
+  mcp: { enabled: true },
+  github: { connected: true },
+  email: { available: true },
+  fusion: { enabled: true },
+  image: { available: true },
+  video: { available: true },
+  screen: { enabled: true },
+};
+
+function nameSet(
+  result:
+    | readonly { name: string }[]
+    | ReturnType<typeof filterToolDescriptorsByConfig>,
+): Set<string> {
+  return new Set(Array.from(result, (d) => d.name));
+}
+
+describe("filterToolDescriptorsByConfig", () => {
+  it("returns the input unchanged when every gate is open", () => {
+    const filtered = filterToolDescriptorsByConfig(
+      DEFAULT_TOOL_DESCRIPTORS,
+      ALL_OPEN,
+    );
+    expect(filtered).toBe(DEFAULT_TOOL_DESCRIPTORS);
+  });
+
+  it("drops every browser.* descriptor when the browser is disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      browser: { enabled: false },
+    });
+    const names = nameSet(filtered);
+    for (const dropped of GATED_TOOL_NAMES.browser) {
+      expect(names.has(dropped)).toBe(false);
+    }
+    // non-browser web tools survive so the model still has os.web.search/fetch
+    expect(names.has("os.web.search")).toBe(true);
+    expect(names.has("os.web.fetch")).toBe(true);
+  });
+
+  it("drops os.web.search when native web search is disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      web: { search: { enabled: false } },
+    });
+    expect(nameSet(filtered).has("os.web.search")).toBe(false);
+    expect(nameSet(filtered).has("os.web.fetch")).toBe(true);
+  });
+
+  it("drops vision.describe when vision is disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      vision: { enabled: false, providerAvailable: true },
+    });
+    expect(nameSet(filtered).has("vision.describe")).toBe(false);
+  });
+
+  it("drops vision.describe when no provider is available even if enabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      vision: { enabled: true, providerAvailable: false },
+    });
+    expect(nameSet(filtered).has("vision.describe")).toBe(false);
+  });
+
+  it("drops every memory.profile.* descriptor when profile is disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      memory: { ...ALL_OPEN.memory, profile: { enabled: false } },
+    });
+    const names = nameSet(filtered);
+    for (const dropped of GATED_TOOL_NAMES.memoryProfile) {
+      expect(names.has(dropped)).toBe(false);
+    }
+    expect(names.has("memory.notes.store")).toBe(true);
+  });
+
+  it("drops every memory.notes.* descriptor when notes are disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      memory: { ...ALL_OPEN.memory, notes: { enabled: false } },
+    });
+    const names = nameSet(filtered);
+    for (const dropped of GATED_TOOL_NAMES.memoryNotes) {
+      expect(names.has(dropped)).toBe(false);
+    }
+  });
+
+  it("drops memory.lessons.recall when lessons are disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      memory: { ...ALL_OPEN.memory, lessons: { enabled: false } },
+    });
+    expect(nameSet(filtered).has("memory.lessons.recall")).toBe(false);
+  });
+
+  it("drops memory.procedures.recall when procedures are disabled (default)", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      memory: { ...ALL_OPEN.memory, procedures: { enabled: false } },
+    });
+    expect(nameSet(filtered).has("memory.procedures.recall")).toBe(false);
+  });
+
+  it("drops image.generate without an OpenRouter key and keeps it with one", () => {
+    const without = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      image: { available: false },
+    });
+    expect(nameSet(without).has("image.generate")).toBe(false);
+    expect(nameSet(without).has("vision.describe")).toBe(true);
+    expect(nameSet(filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, ALL_OPEN)).has("image.generate")).toBe(true);
+  });
+
+  it("drops video.generate without an OpenRouter key and keeps it with one", () => {
+    const without = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      video: { available: false },
+    });
+    expect(nameSet(without).has("video.generate")).toBe(false);
+    expect(nameSet(without).has("image.generate")).toBe(true);
+    expect(nameSet(filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, ALL_OPEN)).has("video.generate")).toBe(true);
+  });
+
+  it("drops every github.* descriptor when no token is in the hub", () => {
+    // The tools stay registered and would answer "GitHub is not
+    // connected"; a catalog entry for them only invites the model to try.
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      github: { connected: false },
+    });
+    const names = nameSet(filtered);
+    for (const name of GATED_TOOL_NAMES.github) {
+      expect(names.has(name)).toBe(false);
+    }
+    // The git write tools are not GitHub-specific and stay.
+    expect(names.has("os.git.push")).toBe(true);
+    expect(names.has("os.git.commit")).toBe(true);
+  });
+
+  it("drops every tasks.* descriptor when agent tools are disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      tasks: { agentToolsEnabled: false },
+    });
+    const names = nameSet(filtered);
+    for (const dropped of GATED_TOOL_NAMES.tasks) {
+      expect(names.has(dropped)).toBe(false);
+    }
+  });
+
+  it("drops every mcp.* aggregate descriptor when mcp is disabled", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      mcp: { enabled: false },
+      email: { available: false },
+    });
+    const names = nameSet(filtered);
+    for (const dropped of GATED_TOOL_NAMES.mcp) {
+      expect(names.has(dropped)).toBe(false);
+    }
+  });
+
+  it("drops fusion.delegate when fusion is not the effective run mode", () => {
+    // The gate is what keeps a non-fusion install from advertising a
+    // fan-out it cannot perform -- and, because the `### fusion`
+    // guidance block keys off this same descriptor, what keeps its
+    // stable prefix byte-identical to a build without the feature.
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      ...ALL_OPEN,
+      fusion: { enabled: false },
+    });
+    expect(nameSet(filtered).has("fusion.delegate")).toBe(false);
+    expect(
+      nameSet(
+        filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, ALL_OPEN),
+      ).has("fusion.delegate"),
+    ).toBe(true);
+  });
+
+  it("drops everything gated when every switch is off", () => {
+    const filtered = filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+      browser: { enabled: false },
+      web: { search: { enabled: false } },
+      vision: { enabled: false, providerAvailable: false },
+      memory: {
+        profile: { enabled: false },
+        notes: { enabled: false },
+        lessons: { enabled: false },
+        procedures: { enabled: false },
+      },
+      tasks: { agentToolsEnabled: false },
+      mcp: { enabled: false },
+      github: { connected: false },
+      email: { available: false },
+      fusion: { enabled: false },
+      image: { available: false },
+      video: { available: false },
+      screen: { enabled: false },
+    });
+    const names = nameSet(filtered);
+    const allGated = [
+      ...GATED_TOOL_NAMES.browser,
+      ...GATED_TOOL_NAMES.webSearch,
+      ...GATED_TOOL_NAMES.vision,
+      ...GATED_TOOL_NAMES.memoryProfile,
+      ...GATED_TOOL_NAMES.memoryNotes,
+      ...GATED_TOOL_NAMES.memoryLessons,
+      ...GATED_TOOL_NAMES.memoryProcedures,
+      ...GATED_TOOL_NAMES.tasks,
+      ...GATED_TOOL_NAMES.mcp,
+      ...GATED_TOOL_NAMES.fusion,
+      ...GATED_TOOL_NAMES.image,
+      ...GATED_TOOL_NAMES.video,
+      ...GATED_TOOL_NAMES.screen,
+    ];
+    for (const dropped of allGated) {
+      expect(names.has(dropped)).toBe(false);
+    }
+    expect(filtered.length).toBeLessThan(DEFAULT_TOOL_DESCRIPTORS.length);
+    expect(filtered.length).toBeGreaterThan(0);
+  });
+
+  it("every gated tool name exists in DEFAULT_TOOL_DESCRIPTORS", () => {
+    const known = new Set(DEFAULT_TOOL_DESCRIPTORS.map((d) => d.name));
+    const allGated = [
+      ...GATED_TOOL_NAMES.browser,
+      ...GATED_TOOL_NAMES.webSearch,
+      ...GATED_TOOL_NAMES.vision,
+      ...GATED_TOOL_NAMES.memoryProfile,
+      ...GATED_TOOL_NAMES.memoryNotes,
+      ...GATED_TOOL_NAMES.memoryLessons,
+      ...GATED_TOOL_NAMES.memoryProcedures,
+      ...GATED_TOOL_NAMES.tasks,
+      ...GATED_TOOL_NAMES.mcp,
+      ...GATED_TOOL_NAMES.fusion,
+      ...GATED_TOOL_NAMES.image,
+      ...GATED_TOOL_NAMES.video,
+      ...GATED_TOOL_NAMES.screen,
+    ];
+    for (const name of allGated) {
+      expect(known.has(name)).toBe(true);
+    }
+  });
+});
+
+describe("screen gate", () => {
+  it("drops os.screen.* unless screen control is on (opt-in, macOS only)", () => {
+    const on = nameSet(filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, ALL_OPEN));
+    const off = nameSet(
+      filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+        ...ALL_OPEN,
+        screen: { enabled: false },
+      }),
+    );
+    for (const name of GATED_TOOL_NAMES.screen) {
+      expect(on.has(name), name).toBe(true);
+      expect(off.has(name), name).toBe(false);
+    }
+    expect(off.has("os.window.list")).toBe(true);
+  });
+});
+
+describe("e-mail gate", () => {
+  it("drops os.email.* from the prefix when no inbox is registered, keeps them otherwise", () => {
+    const withInbox = nameSet(
+      filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, ALL_OPEN),
+    );
+    expect(withInbox.has("os.email.inbox")).toBe(true);
+    expect(withInbox.has("os.email.send")).toBe(true);
+    const without = nameSet(
+      filterToolDescriptorsByConfig(DEFAULT_TOOL_DESCRIPTORS, {
+        ...ALL_OPEN,
+        email: { available: false },
+      }),
+    );
+    expect(without.has("os.email.inbox")).toBe(false);
+    expect(without.has("os.email.send")).toBe(false);
+    // Nothing else moves with it.
+    expect(without.size).toBe(withInbox.size - 2);
+  });
+});

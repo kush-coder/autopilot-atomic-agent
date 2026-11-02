@@ -1,0 +1,198 @@
+import { modelsEngineCommand, modelsStopEmbedding } from "./models-engine.js";
+import { getConfig } from "../config/index.js";
+import {
+  readCliOption,
+  runLocalModelsDevices,
+  runLocalModelsList,
+  runLocalModelsListEmbeddings,
+  runLocalModelsPull,
+  runLocalModelsPullEmbedding,
+  runLocalModelsRemove,
+  runLocalModelsStart,
+  runLocalModelsStartEmbedding,
+  runLocalModelsStatus,
+  runLocalModelsStop,
+  runLocalModelsUpdate,
+  runLocalModelsUse,
+  runLocalModelsUseDevice,
+  runLocalModelsUseEmbedding,
+} from "./models-handlers.js";
+import {
+  runLocalModelsDownloads,
+  runLocalModelsPullWorker,
+} from "./models-downloads.js";
+import { runModelsSearch } from "./models-search-command.js";
+import { runLocalModelsCheck } from "./models-check.js";
+
+const HELP =
+  [
+    "atomic-agent models — manage the local-LLM runtime (llama.cpp backend + GGUF models)",
+    "",
+    '`start` and `update` refuse unless config.localModels.mode = "managed"; `use` switches',
+    "to managed mode (see `atomic-agent config`).",
+    "",
+    "Subcommands:",
+    "  list                          Show model catalog + disk presence (active marked with *)",
+    "  pull <id> [--background]      Download a GGUF model from Hugging Face (resumes a partial;",
+    "            [--mmproj]          --background keeps going after this terminal closes;",
+    "                                --mmproj also fetches the vision projector)",
+    "  downloads [cancel <id>|clear] List background downloads, stop one (partial kept), or",
+    "                                forget finished records",
+    '  use <id>                      Set active model and switch mode to "managed"',
+    "  status                        Show mode, backend version, active model, daemon/health",
+    "  check [--json]                Ask localModels.url what answers there (llama.cpp, Ollama,",
+    "                                still loading, not a model server); exit 1 unless llama.cpp",
+    "  start                         Spawn detached llama-server daemon (writes .pid)",
+    "                                --grow-context: on a GPU with its own memory, start the",
+    "                                auto window at 32768 and record how far it may grow",
+    "                                (for a client that grows it between turns)",
+    "                                --context-at-least <n>: with --grow-context, after",
+    "                                `models stop`, start the window at least this large",
+    "  stop [--chat-only]            Stop daemon (SIGTERM → SIGKILL after 3s); --chat-only",
+    "                                keeps the embedding model running for memory search",
+    "  engine [status|check|atomic-core|llama-server]  Inspect or choose the local engine",
+    "  stop-embedding                Stop the embedding model through its engine",
+    "  update                        Install the supported engine and inference backend",
+    "                                (stops daemon first; does not auto-restart)",
+    "  remove <id>                   Delete a downloaded model (refuses if active + daemon running)",
+    "",
+    "Cloud subcommands (no local runtime needed):",
+    "  search <query>                Search configured cloud providers' models by id,",
+    "                                vendor and capability (`claude vision`, `free tools`,",
+    "                                `1m cache`). Flags: --provider <id> --limit <n>",
+    "                                --json --refresh (pull live lists first)",
+    "",
+    "GPU subcommands:",
+    "  devices                       List GPU devices (llama-server --list-devices); active marked with *",
+    "  use-device <auto|cpu|Vulkan0> Set the managed daemon's GPU (auto-picks best discrete by default)",
+    "",
+    "Embedding subcommands (memory-v2 phase 1B — second daemon for /embedding):",
+    "  list-embeddings               Show embedding catalog + disk presence + daemon health",
+    "  pull-embedding <id>           Download an embedding GGUF (--background as for pull)",
+    "  use-embedding <id>|--disable  Enable + select an embedding model (or turn off)",
+    "  start-embedding               Start the embedding daemon alone, beside a running chat one",
+    "                                Note: 'start' brings both chat and embedding up;",
+    "                                if the embedding daemon fails the chat one stays up.",
+    "",
+    "Examples:",
+    "  atomic-agent models list",
+    "  atomic-agent models search claude vision",
+    "  atomic-agent models pull qwen-3.5-4b",
+    "  atomic-agent models pull --background qwen-3.5-35b",
+    "  atomic-agent models downloads",
+    "  atomic-agent models use qwen-3.5-4b",
+    "  atomic-agent models pull-embedding nomic-embed-text-v1.5",
+    "  atomic-agent models use-embedding nomic-embed-text-v1.5",
+    "  atomic-agent models update",
+    "  atomic-agent models start [--interactive] [--context-size <tokens>]",
+    "  atomic-agent models status",
+    "  atomic-agent models check",
+  ].join("\n") + "\n";
+
+/**
+ * `models start` window flags: `--grow-context`, and
+ * `--context-at-least <n>` (a positive integer; anything else is ignored).
+ */
+export function parseStartContextFlags(
+  args: readonly string[],
+): { growContext?: true; contextAtLeast?: number } {
+  const raw = readCliOption([...args], "--context-at-least");
+  const n = raw === undefined ? NaN : Number(raw);
+  return {
+    ...(args.includes("--grow-context") ? { growContext: true as const } : {}),
+    ...(Number.isInteger(n) && n > 0 ? { contextAtLeast: n } : {}),
+  };
+}
+
+export async function modelsCommand(args: string[]): Promise<number> {
+  getConfig();
+  const sub = args[0];
+  if (!sub || sub === "-h" || sub === "--help") {
+    process.stdout.write(HELP);
+    return 0;
+  }
+  const cancel = new AbortController();
+  const cancelCore = () => cancel.abort();
+  const handlesCancellation = getConfig().localModels.managed.engine === "atomic-core" && ["start", "start-embedding", "update"].includes(sub);
+  if (handlesCancellation) { process.on("SIGINT", cancelCore); process.on("SIGTERM", cancelCore); }
+  try {
+    switch (sub) {
+      case "engine":
+        return await modelsEngineCommand(args.slice(1));
+      case "stop-embedding":
+        return await modelsStopEmbedding();
+      case "search":
+        return await runModelsSearch(args.slice(1));
+      case "list":
+        return runLocalModelsList();
+      case "pull":
+        return runLocalModelsPull(args.slice(1));
+      case "pull-worker":
+        return runLocalModelsPullWorker(args.slice(1));
+      case "downloads":
+        return runLocalModelsDownloads(args.slice(1));
+      case "use":
+        return runLocalModelsUse(args[1]);
+      case "status":
+        return runLocalModelsStatus();
+      case "check":
+        return await runLocalModelsCheck(args.slice(1));
+      case "start": {
+        // `--context-size N`: this start only, not written to the config —
+        // the desktop's restart after the model ran out of memory (ATO-334).
+        const contextSize = readContextSizeFlag(args);
+        if (contextSize === "invalid") {
+          process.stderr.write("--context-size needs a whole number of tokens above 0\n");
+          return 2;
+        }
+        return await runLocalModelsStart({
+          interactive: args.includes("--interactive"),
+          signal: cancel.signal,
+          ...parseStartContextFlags(args),
+          ...(contextSize !== null ? { contextSize } : {}),
+        });
+      }
+      case "stop":
+        return runLocalModelsStop({ chatOnly: args.includes("--chat-only") });
+      case "update":
+        return await runLocalModelsUpdate(cancel.signal);
+      case "remove":
+        return runLocalModelsRemove(args[1]);
+      case "devices":
+        return runLocalModelsDevices();
+      case "use-device":
+        return runLocalModelsUseDevice(args[1]);
+      case "list-embeddings":
+        return runLocalModelsListEmbeddings();
+      case "pull-embedding":
+        return runLocalModelsPullEmbedding(args.slice(1));
+      case "use-embedding":
+        return runLocalModelsUseEmbedding(args[1]);
+      case "start-embedding":
+        return await runLocalModelsStartEmbedding(cancel.signal);
+      default:
+        process.stderr.write(`unknown subcommand: ${sub}\n`);
+        process.stderr.write(HELP);
+        return 1;
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`models ${sub} failed: ${message}\n`);
+    return 1;
+  } finally {
+    if (handlesCancellation) { process.off("SIGINT", cancelCore); process.off("SIGTERM", cancelCore); }
+  }
+}
+
+/**
+ * The `--context-size <tokens>` of `models start`: `null` when absent,
+ * `"invalid"` when it is not a whole number above 0.
+ */
+export function readContextSizeFlag(args: readonly string[]): number | null | "invalid" {
+  const at = args.indexOf("--context-size");
+  if (at === -1) return null;
+  const raw = args[at + 1]?.trim() ?? "";
+  if (!/^[1-9]\d*$/.test(raw)) return "invalid";
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : "invalid";
+}

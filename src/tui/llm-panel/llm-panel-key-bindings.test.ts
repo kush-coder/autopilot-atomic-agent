@@ -1,0 +1,829 @@
+import type { Key } from "ink";
+import { describe, expect, it, vi } from "vitest";
+import type { LocalModelDef } from "../../local-llm/index.js";
+import type { TuiAction } from "../tui-action.js";
+import type { TuiAppCallbacks } from "../tui-app.js";
+import { createInitialTuiState, type TuiState } from "../tui-state.js";
+import { fakeSession } from "../test-fixtures.js";
+import { handleLlmPanelKey } from "./llm-panel-key-bindings.js";
+import { selectLocalRows } from "./llm-panel-row-builders.js";
+import { reduceProvidersPanel } from "../providers/providers-reducer.js";
+import { hasLlmModal } from "./llm-panel-modals.js";
+
+function emptyKey(overrides: Partial<Key> = {}): Key {
+  return {
+    upArrow: false,
+    downArrow: false,
+    leftArrow: false,
+    rightArrow: false,
+    pageDown: false,
+    pageUp: false,
+    return: false,
+    escape: false,
+    ctrl: false,
+    shift: false,
+    tab: false,
+    backspace: false,
+    delete: false,
+    meta: false,
+    ...overrides,
+  };
+}
+
+function callbacks(overrides: Partial<TuiAppCallbacks> = {}): TuiAppCallbacks {
+  return {
+    onApprovalDecision: vi.fn(),
+    onAbort: vi.fn(),
+    onQuit: vi.fn(),
+    onMessageSubmitted: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe("handleLlmPanelKey", () => {
+  it("moves the cursor inside the active mode", () => {
+    const state = seededState();
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("j", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([{ type: "llm_cursor_set", cursor: 0 }]);
+  });
+
+  it("switches panel modes without changing the active route", () => {
+    const state = seededState();
+    const dispatched: TuiAction[] = [];
+    const onSetActiveText = vi.fn();
+    const onStop = vi.fn();
+    handleLlmPanelKey("]", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({
+        onProvidersSetActiveText: onSetActiveText,
+        onLocalModelsDaemonStopRequested: onStop,
+      }),
+    });
+    expect(dispatched).toEqual([{ type: "llm_mode_set", mode: "cloud" }]);
+    expect(onSetActiveText).not.toHaveBeenCalled();
+    expect(onStop).not.toHaveBeenCalled();
+  });
+
+  it("selects an exact cloud text model", () => {
+    const base = seededState();
+    const state = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const, cloudCursor: 1 },
+    };
+    const dispatched: TuiAction[] = [];
+    const onSelectChatModel = vi.fn();
+    const onStop = vi.fn();
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({
+        onProvidersSelectChatModel: onSelectChatModel,
+        onLocalModelsDaemonStopRequested: onStop,
+      }),
+    });
+    expect(dispatched).toEqual([]);
+    expect(onSelectChatModel).toHaveBeenCalledWith(
+      "openrouter",
+      "openai/gpt-4o-mini",
+    );
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops only the local chat server on a cloud pick, keeping memory search (ATO-376)", () => {
+    const base = seededState();
+    const state = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const, cloudCursor: 1 },
+    };
+    const onStop = vi.fn();
+    const onChatStop = vi.fn();
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: () => {},
+      callbacks: callbacks({
+        onProvidersSelectChatModel: vi.fn(),
+        onLocalModelsDaemonStopRequested: onStop,
+        onLocalModelsChatStopForCloudRequested: onChatStop,
+      }),
+    });
+    expect(onChatStop).toHaveBeenCalledTimes(1);
+    // The full stop also turns memory search off; it stays on `s` / Stop.
+    expect(onStop).not.toHaveBeenCalled();
+  });
+
+  it("selects directly on an openai-compatible model row, no modal detour", () => {
+    // The inline Cloud-pane list renders `/v1/models` entries as
+    // first-class rows, so Enter switches the model through the same
+    // callback as curated kinds; the picker modal stays closed and no
+    // dead reducer action is dispatched.
+    const base = seededState();
+    const state = {
+      ...base,
+      providersPanel: {
+        ...base.providersPanel,
+        rows: base.providersPanel.rows.map((row) =>
+          row.id === "openrouter" ? { ...row, kind: "openai-compatible" } : row,
+        ),
+      },
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const, cloudCursor: 1 },
+    };
+    const dispatched: TuiAction[] = [];
+    const onPickerRequested = vi.fn();
+    const onSelectChatModel = vi.fn();
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({
+        onProvidersChatModelPickerRequested: onPickerRequested,
+        onProvidersSelectChatModel: onSelectChatModel,
+      }),
+    });
+    expect(dispatched).toEqual([]);
+    expect(onSelectChatModel).toHaveBeenCalledWith(
+      "openrouter",
+      "openai/gpt-4o-mini",
+    );
+    expect(onPickerRequested).not.toHaveBeenCalled();
+  });
+
+  it("f focuses the inline model filter and typed letters land in it", () => {
+    const base = seededState();
+    const state = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const },
+    };
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("f", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([
+      { type: "llm_mode_set", mode: "cloud" },
+      { type: "llm_cloud_filter_focus_set", focused: true },
+    ]);
+
+    // With the filter focused, a letter that doubles as a hotkey ("c")
+    // edits the filter instead of opening the provider config.
+    const focused = {
+      ...state,
+      llmPanel: { ...state.llmPanel, cloudModelFilterFocused: true },
+    };
+    const typed: TuiAction[] = [];
+    handleLlmPanelKey("c", emptyKey(), {
+      state: focused,
+      dispatch: (action) => typed.push(action),
+      callbacks: callbacks(),
+    });
+    expect(typed).toEqual([{ type: "llm_cloud_filter_set", value: "c" }]);
+  });
+
+  it("p cycles the price facet on the Cloud pane only, and is text in a focused filter", () => {
+    const base = seededState();
+    // On the Local pane the letter stays unclaimed.
+    const dispatchedLocal: TuiAction[] = [];
+    const handledLocal = handleLlmPanelKey("p", emptyKey(), {
+      state: base,
+      dispatch: (action) => dispatchedLocal.push(action),
+      callbacks: callbacks(),
+    });
+    expect(handledLocal).toBe(false);
+    expect(dispatchedLocal).toEqual([]);
+
+    const cloud = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const },
+    };
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("p", emptyKey(), {
+      state: cloud,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([{ type: "llm_cloud_pricing_cycled" }]);
+
+    // Focused filter: "p" is query text, never the facet key.
+    const focused = {
+      ...cloud,
+      llmPanel: { ...cloud.llmPanel, cloudModelFilterFocused: true },
+    };
+    const typed: TuiAction[] = [];
+    handleLlmPanelKey("p", emptyKey(), {
+      state: focused,
+      dispatch: (action) => typed.push(action),
+      callbacks: callbacks(),
+    });
+    expect(typed).toEqual([{ type: "llm_cloud_filter_set", value: "p" }]);
+  });
+
+  it("selects an exact cloud embedding model", () => {
+    const base = seededState();
+    const state = {
+      ...base,
+      providersPanel: {
+        ...base.providersPanel,
+        rows: base.providersPanel.rows.map((row) =>
+          row.id === "openrouter" ? { ...row, kind: "openai-compatible" } : row,
+        ),
+      },
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const, cloudCursor: 2 },
+    };
+    const dispatched: TuiAction[] = [];
+    const onSelectEmbeddingModel = vi.fn();
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({
+        onProvidersSelectEmbeddingModel: onSelectEmbeddingModel,
+      }),
+    });
+    expect(dispatched).toEqual([]);
+    expect(onSelectEmbeddingModel).toHaveBeenCalledWith(
+      "openrouter",
+      "openai/text-embedding-3-small",
+    );
+  });
+
+  it("answers the stop-daemon prompt by stopping local daemons", () => {
+    const onStop = vi.fn();
+    const base = seededState();
+    const state = {
+      ...base,
+      llmPanel: {
+        ...base.llmPanel,
+        stopLocalDaemonsPrompt: { providerId: "openrouter" },
+      },
+    };
+    const dispatched: TuiAction[] = [];
+    handleLlmPanelKey("y", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({ onLocalModelsDaemonStopRequested: onStop }),
+    });
+    expect(dispatched).toEqual([
+      { type: "llm_stop_local_daemons_prompt_closed" },
+    ]);
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("activates a downloaded local model and switches text route to local-llama", () => {
+    const onSetActive = vi.fn();
+    const onSetActiveText = vi.fn();
+    const seeded = seededState();
+    const base = {
+      ...seeded,
+      providersPanel: {
+        ...seeded.providersPanel,
+        rows: seeded.providersPanel.rows.map((row) => ({
+          ...row,
+          isActiveText: row.id === "openrouter",
+        })),
+      },
+    };
+    const state = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "local" as const, localCursor: 0 },
+    };
+    const dispatched: TuiAction[] = [];
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({
+        onLocalModelsSetActiveRequested: onSetActive,
+        onProvidersSetActiveText: onSetActiveText,
+      }),
+    });
+    expect(onSetActive).toHaveBeenCalledWith("qwen-3.5-4b");
+    expect(onSetActiveText).toHaveBeenCalledWith("local-llama");
+    expect(dispatched).not.toContainEqual({ type: "llm_dashboard_opened" });
+  });
+
+  it("Enter on a downloaded vision row with a missing projector goes live and fetches the projector", () => {
+    const onSetActive = vi.fn();
+    const onSetActiveText = vi.fn();
+    const onPull = vi.fn();
+    const seeded = seededState();
+    const state = {
+      ...seeded,
+      providersPanel: {
+        ...seeded.providersPanel,
+        rows: seeded.providersPanel.rows.map((row) => ({
+          ...row,
+          isActiveText: row.id === "openrouter",
+        })),
+      },
+      localModelsPanel: {
+        ...seeded.localModelsPanel,
+        rows: seeded.localModelsPanel.rows.map((row) => ({
+          ...row,
+          def: { ...row.def, supportsVision: true },
+          mmprojStatus: "missing" as const,
+        })),
+      },
+      llmPanel: { ...seeded.llmPanel, mode: "local" as const, localCursor: 0 },
+    };
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: vi.fn(),
+      callbacks: callbacks({
+        onLocalModelsSetActiveRequested: onSetActive,
+        onProvidersSetActiveText: onSetActiveText,
+        onLocalModelsPullRequested: onPull,
+      }),
+    });
+    // The weights work on their own — the model must not wait on a
+    // projector the repo may have stopped serving.
+    expect(onSetActive).toHaveBeenCalledWith("qwen-3.5-4b");
+    expect(onSetActiveText).toHaveBeenCalledWith("local-llama");
+    expect(onPull).toHaveBeenCalledWith("qwen-3.5-4b", "mmproj-only");
+  });
+
+  it("Enter on the live vision row with a missing projector only retries the projector", () => {
+    const onSetActive = vi.fn();
+    const onStart = vi.fn();
+    const onPull = vi.fn();
+    const seeded = seededState();
+    const state = {
+      ...seeded,
+      localModelsPanel: {
+        ...seeded.localModelsPanel,
+        rows: seeded.localModelsPanel.rows.map((row) => ({
+          ...row,
+          active: true,
+          def: { ...row.def, supportsVision: true },
+          mmprojStatus: "missing" as const,
+        })),
+      },
+      llmPanel: { ...seeded.llmPanel, mode: "local" as const, localCursor: 0 },
+    };
+    handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: vi.fn(),
+      callbacks: callbacks({
+        onLocalModelsSetActiveRequested: onSetActive,
+        onLocalModelsDaemonStartRequested: onStart,
+        onLocalModelsPullRequested: onPull,
+      }),
+    });
+    expect(onSetActive).not.toHaveBeenCalled();
+    expect(onStart).not.toHaveBeenCalled();
+    expect(onPull).toHaveBeenCalledWith("qwen-3.5-4b", "mmproj-only");
+  });
+
+  it("says what Enter does on a vision row whose projector is missing", () => {
+    const seeded = seededState();
+    const withMissing = (active: boolean) => ({
+      ...seeded,
+      localModelsPanel: {
+        ...seeded.localModelsPanel,
+        rows: seeded.localModelsPanel.rows.map((row) => ({
+          ...row,
+          active,
+          def: { ...row.def, supportsVision: true },
+          mmprojStatus: "missing" as const,
+        })),
+      },
+    });
+    const hint = (state: ReturnType<typeof withMissing>) =>
+      selectLocalRows(state).find((row) => row.kind === "localTextModel")
+        ?.enterEffect;
+    expect(hint(withMissing(false))).toBe(
+      "Enter: select model, download projector for qwen-3.5-4b",
+    );
+    expect(hint(withMissing(true))).toBe(
+      "Enter: download projector for qwen-3.5-4b (text chat works without it)",
+    );
+  });
+
+  it("restarts the local model server on `R`, without touching stop/start", () => {
+    const onRestart = vi.fn();
+    const onStop = vi.fn();
+    const onStart = vi.fn();
+    const onRefresh = vi.fn();
+    const state = seededState();
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("R", emptyKey({ shift: true }), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({
+        onLocalModelsDaemonRestartRequested: onRestart,
+        onLocalModelsDaemonStopRequested: onStop,
+        onLocalModelsDaemonStartRequested: onStart,
+        onLocalModelsRefreshRequested: onRefresh,
+      }),
+    });
+    expect(handled).toBe(true);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    // `R` must not degrade into the `s` toggle (which stops the
+    // embedding daemon too) or into `r` (refresh).
+    expect(onStop).not.toHaveBeenCalled();
+    expect(onStart).not.toHaveBeenCalled();
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(dispatched).toEqual([]);
+  });
+
+  it("keeps lowercase `r` on refresh so the restart key cannot be hit by accident", () => {
+    const onRestart = vi.fn();
+    const onRefresh = vi.fn();
+    const state = seededState();
+    handleLlmPanelKey("r", emptyKey(), {
+      state,
+      dispatch: () => {},
+      callbacks: callbacks({
+        onLocalModelsDaemonRestartRequested: onRestart,
+        onLocalModelsRefreshRequested: onRefresh,
+      }),
+    });
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    expect(onRestart).not.toHaveBeenCalled();
+  });
+
+  it("opens the slash-command palette when `/` is pressed", () => {
+    const state = seededState();
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("/", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([
+      { type: "input_changed", value: "/" },
+      { type: "slash_palette_opened", query: "" },
+    ]);
+  });
+
+  it("captures provider wizard keys while the LLM tab is active", () => {
+    const state = {
+      ...seededState(),
+      providersPanel: {
+        ...seededState().providersPanel,
+        wizard: {
+          mode: "add" as const,
+          providerId: null,
+          presetId: null,
+          pricingFilter: "all" as const,
+          kind: null,
+          phase: "pick_kind" as const,
+          cursor: 0,
+          apiKeyBuffer: "",
+          baseUrlLine: "",
+          chatModelLine: "",
+          embeddingModelLine: "",
+          selectedChatModelId: null,
+          selectedEmbeddingChoiceId: null,
+          // Closed, not missing: an absent field reads as an open search
+          // box to `handleWizardSearchKey`, which then eats the `j`.
+          search: null,
+          error: null,
+          submitting: false,
+        },
+      },
+    };
+    const dispatched: TuiAction[] = [];
+    handleLlmPanelKey("j", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(dispatched[0]).toMatchObject({
+      type: "providers_wizard_updated",
+      wizard: { cursor: 1 },
+    });
+  });
+});
+
+describe("handleLlmPanelKey: d removes a cloud provider", () => {
+  function cloudState(
+    overrides: { activeText?: boolean; cloudCursor?: number } = {},
+  ) {
+    const base = seededState();
+    return {
+      ...base,
+      providersPanel: {
+        ...base.providersPanel,
+        rows: base.providersPanel.rows.map((row) =>
+          row.id === "openrouter"
+            ? { ...row, isActiveText: overrides.activeText ?? false }
+            : { ...row, isActiveText: !(overrides.activeText ?? false) },
+        ),
+      },
+      llmPanel: {
+        ...base.llmPanel,
+        mode: "cloud" as const,
+        cloudCursor: overrides.cloudCursor ?? 0,
+      },
+    };
+  }
+
+  it("opens the remove confirm for the provider row under the cursor", () => {
+    const state = cloudState();
+    const dispatched: TuiAction[] = [];
+    const onProvidersRemove = vi.fn();
+    const handled = handleLlmPanelKey("d", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({ onProvidersRemove }),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([
+      { type: "providers_remove_opened", id: "openrouter" },
+    ]);
+    // Nothing is written before the operator confirms.
+    expect(onProvidersRemove).not.toHaveBeenCalled();
+    const next = reduceProvidersPanel(state, dispatched[0]!);
+    expect(next?.providersPanel.removeConfirm).toEqual({ id: "openrouter" });
+    expect(hasLlmModal(next!)).toBe(true);
+  });
+
+  it("y on the confirm removes through onProvidersRemove", () => {
+    const base = cloudState();
+    const state = {
+      ...base,
+      providersPanel: {
+        ...base.providersPanel,
+        removeConfirm: { id: "openrouter" },
+      },
+    };
+    const dispatched: TuiAction[] = [];
+    const onProvidersRemove = vi.fn();
+    handleLlmPanelKey("y", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({ onProvidersRemove }),
+    });
+    expect(dispatched).toEqual([{ type: "providers_remove_confirm_started" }]);
+    expect(onProvidersRemove).toHaveBeenCalledWith("openrouter");
+  });
+
+  it("Enter on the confirm does not remove, like a local model", () => {
+    const base = cloudState();
+    const state = {
+      ...base,
+      providersPanel: {
+        ...base.providersPanel,
+        removeConfirm: { id: "openrouter" },
+      },
+    };
+    const dispatched: TuiAction[] = [];
+    const onProvidersRemove = vi.fn();
+    const handled = handleLlmPanelKey("", emptyKey({ return: true }), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({ onProvidersRemove }),
+    });
+    // The modal still swallows the key, so nothing behind it reacts.
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([]);
+    expect(onProvidersRemove).not.toHaveBeenCalled();
+  });
+
+  it("n and Esc close the confirm without removing", () => {
+    const base = cloudState();
+    const state = {
+      ...base,
+      providersPanel: {
+        ...base.providersPanel,
+        removeConfirm: { id: "openrouter" },
+      },
+    };
+    for (const [input, key] of [
+      ["n", emptyKey()],
+      ["", emptyKey({ escape: true })],
+    ] as const) {
+      const dispatched: TuiAction[] = [];
+      const onProvidersRemove = vi.fn();
+      handleLlmPanelKey(input, key, {
+        state,
+        dispatch: (action) => dispatched.push(action),
+        callbacks: callbacks({ onProvidersRemove }),
+      });
+      expect(dispatched).toEqual([{ type: "providers_remove_closed" }]);
+      expect(onProvidersRemove).not.toHaveBeenCalled();
+    }
+  });
+
+  it("refuses the active provider with a status line, no confirm", () => {
+    const state = cloudState({ activeText: true });
+    const dispatched: TuiAction[] = [];
+    const onProvidersRemove = vi.fn();
+    const handled = handleLlmPanelKey("d", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({ onProvidersRemove }),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({
+      type: "providers_status",
+      source: "cloud",
+    });
+    expect((dispatched[0] as { line: string }).line).toMatch(
+      /openrouter is the active provider; switch/,
+    );
+    expect(onProvidersRemove).not.toHaveBeenCalled();
+  });
+
+  it("is a quiet no-op on a model row", () => {
+    const state = cloudState({ cloudCursor: 1 });
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("d", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(handled).toBe(true);
+    expect(dispatched).toEqual([]);
+  });
+
+  it("does not remove anything from the External pane", () => {
+    const base = cloudState();
+    const state = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "external" as const },
+    };
+    const dispatched: TuiAction[] = [];
+    handleLlmPanelKey("d", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks(),
+    });
+    expect(dispatched.some((a) => a.type === "providers_remove_opened")).toBe(
+      false,
+    );
+  });
+});
+
+function seededState(): TuiState {
+  const base = createInitialTuiState(fakeSession());
+  return {
+    ...base,
+    uiMode: "debug" as const,
+    activeTab: "llm" as const,
+    providersPanel: {
+      ...base.providersPanel,
+      rows: [
+        {
+          id: "openrouter",
+          kind: "openrouter",
+          isActiveText: false,
+          isActiveEmbedding: false,
+          hasApiKey: true,
+          baseUrl: null,
+          subscriptionCli: null,
+          chatModel: "openai/gpt-4o-mini",
+          chatModelOptions: ["openai/gpt-4o-mini"],
+          embeddingModel: "openai/text-embedding-3-small",
+        },
+        {
+          id: "local-llama",
+          kind: "llama-server",
+          isActiveText: true,
+          isActiveEmbedding: false,
+          hasApiKey: false,
+          baseUrl: null,
+          subscriptionCli: null,
+          chatModel: "Qwen",
+          embeddingModel: null,
+        },
+      ],
+    },
+    localModelsPanel: {
+      ...base.localModelsPanel,
+      daemon: {
+        running: true,
+        healthy: true,
+        loading: false,
+        pid: 42,
+        port: 19091,
+      },
+      rows: [
+        {
+          id: "qwen-3.5-4b",
+          def: localDef("qwen-3.5-4b"),
+          downloaded: true,
+          active: false,
+          mmprojStatus: "n/a" as const,
+        },
+      ],
+    },
+  };
+}
+
+function localDef(id: LocalModelDef["id"]): LocalModelDef {
+  return {
+    id,
+    name: id,
+    filename: `${id}.gguf`,
+    huggingFaceUrl: "u",
+    fileSizeGb: 1,
+    sizeLabel: "1 GB",
+    description: "",
+    maxContextLength: 4096,
+    contextLabel: "4k",
+    minRamGb: 1,
+    recommendedRamGb: 2,
+    family: "qwen",
+    supportsVision: false,
+  };
+}
+
+describe("handleLlmPanelKey — tell me when it lands", () => {
+  function llmState() {
+    const initial = createInitialTuiState(fakeSession());
+    return { ...initial, uiMode: "debug" as const, activeTab: "llm" as const };
+  }
+
+  it("N asks to reopen the prompt from the live LLM pane", () => {
+    const onRequest = vi.fn();
+    const handled = handleLlmPanelKey("N", emptyKey({ shift: true }), {
+      state: llmState(),
+      dispatch: vi.fn(),
+      callbacks: callbacks({ onLocalModelsNotifyPromptRequested: onRequest }),
+    });
+    expect(handled).toBe(true);
+    expect(onRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers the open prompt before any pane hotkey — n is 'no', not Add Provider", () => {
+    const onChoice = vi.fn();
+    const dispatch = vi.fn();
+    const base = llmState();
+    const state = {
+      ...base,
+      localModelsPanel: {
+        ...base.localModelsPanel,
+        notifyPrompt: { label: "Qwen", current: null },
+      },
+    };
+    const cb = callbacks({ onLocalModelsNotifyChoice: onChoice });
+    expect(
+      handleLlmPanelKey("n", emptyKey(), { state, dispatch, callbacks: cb }),
+    ).toBe(true);
+    expect(
+      handleLlmPanelKey("t", emptyKey(), { state, dispatch, callbacks: cb }),
+    ).toBe(true);
+    expect(onChoice.mock.calls.map((c) => c[0])).toEqual(["off", "telegram"]);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleLlmPanelKey — Local pane model keys (#546)", () => {
+  it("keeps them off the Cloud pane", () => {
+    const base = seededState();
+    const state = {
+      ...base,
+      llmPanel: { ...base.llmPanel, mode: "cloud" as const },
+    };
+    const onDevice = vi.fn();
+    const onAutoUpdate = vi.fn();
+    const dispatched: TuiAction[] = [];
+    for (const input of ["G", "U", "d", "i"]) {
+      handleLlmPanelKey(input, emptyKey(), {
+        state,
+        dispatch: (action) => dispatched.push(action),
+        callbacks: callbacks({
+          onLocalModelsDeviceCycleRequested: onDevice,
+          onLocalModelsAutoUpdateToggleRequested: onAutoUpdate,
+        }),
+      });
+    }
+    expect(onDevice).not.toHaveBeenCalled();
+    expect(onAutoUpdate).not.toHaveBeenCalled();
+    // `d` on the Cloud pane is "remove this cloud provider" now — it must
+    // still never reach the local-model delete confirm.
+    expect(dispatched).toEqual([
+      { type: "providers_remove_opened", id: "openrouter" },
+    ]);
+    expect(dispatched.some((a) => a.type.startsWith("local_models_"))).toBe(
+      false,
+    );
+  });
+
+  it("lets the open model detail swallow the pane hotkeys", () => {
+    const base = seededState();
+    const state = {
+      ...base,
+      localModelsPanel: { ...base.localModelsPanel, mode: "detail" as const },
+    };
+    const onStop = vi.fn();
+    const dispatched: TuiAction[] = [];
+    const handled = handleLlmPanelKey("s", emptyKey(), {
+      state,
+      dispatch: (action) => dispatched.push(action),
+      callbacks: callbacks({ onLocalModelsDaemonStopRequested: onStop }),
+    });
+    expect(handled).toBe(true);
+    expect(onStop).not.toHaveBeenCalled();
+    expect(dispatched).toEqual([]);
+  });
+});

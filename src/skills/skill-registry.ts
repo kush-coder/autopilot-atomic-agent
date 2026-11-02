@@ -1,0 +1,194 @@
+import { readFile } from "node:fs/promises";
+import { parseSkillFile } from "./skill-manifest.js";
+import type { LoadSkillsResult, SkillRecord } from "./skill-loader.js";
+import { loadSkills, type LoadSkillsOptions } from "./skill-loader.js";
+import type { ProjectItemTrust } from "./project-trust.js";
+
+/**
+ * Builds the per-refresh trust lookup for project skills. Absent, every
+ * project skill is listed (unit tests, tooling that builds a registry on
+ * purpose); the runtime and the CLI always pass one.
+ */
+export type ProjectSkillTrustGate = () => (name: string) => ProjectItemTrust;
+
+export type SkillChangeListener = (registry: SkillRegistry) => void;
+
+/** How many installed names a not-found message lists before truncating. */
+const NOT_FOUND_NAME_LIMIT = 20;
+
+/**
+ * Thrown when a skill is missing from the filtered (enabled) view. When
+ * `installed` is given, the message names the enabled skills so a model
+ * that guessed a wrong name (e.g. `skill.view("hobby_builder")`) can
+ * correct itself instead of retrying the same call. The message always
+ * starts with `skill not installed: <name>`.
+ */
+export class SkillNotFoundError extends Error {
+  constructor(name: string, installed?: readonly string[]) {
+    super(`skill not installed: ${name}${describeInstalled(installed)}`);
+    this.name = "SkillNotFoundError";
+  }
+}
+
+function describeInstalled(installed: readonly string[] | undefined): string {
+  if (installed === undefined) return "";
+  if (installed.length === 0) return ". No skills are installed.";
+  const sorted = [...installed].sort((a, b) => a.localeCompare(b));
+  const shown = sorted.slice(0, NOT_FOUND_NAME_LIMIT).join(", ");
+  const rest = sorted.length - NOT_FOUND_NAME_LIMIT;
+  const more = rest > 0 ? `, ... (+${rest} more)` : "";
+  return `. Installed skills: ${shown}${more}`;
+}
+
+/**
+ * In-memory store of installed skills. The registry is rebuilt on demand
+ * (sidecar startup, CLI install/uninstall) and emits a `change` event so
+ * long-running sessions can refresh their stable prefix exactly once
+ * instead of re-scanning the filesystem on every step.
+ *
+ * The registry maintains two views over the same on-disk scan:
+ *
+ * - `list()` / `get()` / `has()` / `readBody()` — **filtered** view that
+ *   excludes any skill whose name is in the `disabledNames` set. This is
+ *   what the prompt builder, `skill.view`, and the LLM see. Disabled
+ *   skills are invisible to the model.
+ * - `listAll()` — **unfiltered** view including disabled skills, used
+ *   exclusively by CLI / TUI rendering so operators can see what is
+ *   installed-but-off.
+ *
+ * A project skill whose folder the operator has not trusted (see
+ * `project-trust.ts`) is treated like a disabled one: absent from the
+ * filtered view, listed by `listAll()` with `trust` set.
+ *
+ * Editing `disabledNames` (via `setDisabledNames`) invalidates KV-cache
+ * once because the rendered `### skills` block changes; the SkillRegistry
+ * does not own KV management itself, it only emits `change` so callers
+ * know to rebuild their stable prefix.
+ */
+export class SkillRegistry {
+  /** All skills that loaded successfully, keyed by name. Includes disabled. */
+  private allRecords: Map<string, SkillRecord> = new Map();
+  /** Filtered view (excludes `disabledNames`). Rebuilt by `applyFilter`. */
+  private records: Map<string, SkillRecord> = new Map();
+  private loadErrors: Array<{ path: string; error: string }> = [];
+  private listeners: SkillChangeListener[] = [];
+  private disabledNames: ReadonlySet<string>;
+  /** Trust lookup captured at the last refresh; null means no gate. */
+  private projectTrust: ((name: string) => ProjectItemTrust) | null = null;
+
+  constructor(
+    private readonly options: LoadSkillsOptions,
+    disabledNames: Iterable<string> = [],
+    private readonly projectTrustGate?: ProjectSkillTrustGate,
+  ) {
+    this.disabledNames = new Set(disabledNames);
+  }
+
+  async refresh(): Promise<LoadSkillsResult> {
+    const result = await loadSkills(this.options);
+    this.projectTrust = this.projectTrustGate?.() ?? null;
+    this.allRecords = new Map(result.skills.map((s) => [s.manifest.name, s]));
+    this.loadErrors = result.errors;
+    this.applyFilter();
+    this.emit();
+    return { skills: this.list(), errors: this.loadErrors };
+  }
+
+  /**
+   * Replace the disabled-names set and rebuild the filtered view in
+   * place. Does not re-scan disk. Emits `change` so listeners can
+   * rebuild their stable prefix exactly once.
+   */
+  setDisabledNames(names: Iterable<string>): void {
+    const next = new Set(names);
+    if (sameSet(this.disabledNames, next)) return;
+    this.disabledNames = next;
+    this.applyFilter();
+    this.emit();
+  }
+
+  /** Filtered list — what the prompt and `skill.view` see. */
+  list(): SkillRecord[] {
+    return Array.from(this.records.values()).sort((a, b) =>
+      a.manifest.name.localeCompare(b.manifest.name),
+    );
+  }
+
+  /**
+   * Unfiltered list — every successfully-parsed skill on disk including
+   * those flagged `disabled`. Consumed by CLI / TUI rendering only.
+   */
+  listAll(): Array<{ record: SkillRecord; disabled: boolean; trust?: ProjectItemTrust }> {
+    return Array.from(this.allRecords.values())
+      .map((record) => ({
+        record,
+        disabled: this.disabledNames.has(record.manifest.name),
+        ...(record.source === "project" && this.projectTrust ? { trust: this.projectTrust(record.manifest.name) } : {}),
+      }))
+      .sort((a, b) =>
+        a.record.manifest.name.localeCompare(b.record.manifest.name),
+      );
+  }
+
+  errors(): ReadonlyArray<{ path: string; error: string }> {
+    return this.loadErrors;
+  }
+
+  get(name: string): SkillRecord {
+    const record = this.records.get(name);
+    if (!record) {
+      throw new SkillNotFoundError(
+        name,
+        this.list().map((s) => s.manifest.name),
+      );
+    }
+    return record;
+  }
+
+  has(name: string): boolean {
+    return this.records.has(name);
+  }
+
+  /** Whether the name is currently in the disabled set (regardless of install state). */
+  isDisabled(name: string): boolean {
+    return this.disabledNames.has(name);
+  }
+
+  /** Snapshot of the current disabled-names set. */
+  getDisabledNames(): string[] {
+    return Array.from(this.disabledNames).sort();
+  }
+
+  async readBody(name: string): Promise<string> {
+    const record = this.get(name);
+    const content = await readFile(record.manifestPath, "utf8");
+    const parsed = parseSkillFile(content);
+    return parsed.body;
+  }
+
+  onChange(listener: SkillChangeListener): () => void {
+    this.listeners.push(listener);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== listener);
+    };
+  }
+
+  private applyFilter(): void {
+    this.records = new Map();
+    for (const [name, record] of this.allRecords) {
+      if (this.disabledNames.has(name)) continue;
+      if (record.source === "project" && this.projectTrust && this.projectTrust(name) !== "trusted") continue;
+      this.records.set(name, record);
+    }
+  }
+
+  private emit(): void {
+    for (const listener of this.listeners) listener(this);
+  }
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}

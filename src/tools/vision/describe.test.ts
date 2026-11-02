@@ -1,0 +1,392 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { describe, expect, it, vi } from "vitest";
+
+import type {
+  LlmProvider,
+  ProviderCapabilities,
+  VisionRequest,
+  VisionResult,
+} from "../../llm/index.js";
+import { buildVisionDescribeTool } from "./describe.js";
+
+interface FakeProviderOptions {
+  capabilities?: ProviderCapabilities;
+  onCall?: (request: VisionRequest) => Promise<VisionResult>;
+}
+
+function fakeProvider(options: FakeProviderOptions = {}): LlmProvider {
+  return {
+    name: "fake",
+    capabilities: options.capabilities ?? {
+      vision: true,
+      visionSource: "has_multimodal",
+    },
+    describeImage: vi.fn(
+      options.onCall ??
+        (async () => ({
+          text: "a small red square",
+          durationMs: 12,
+        })),
+    ),
+  };
+}
+
+const ctx = (workingDir: string) => ({
+  workingDir,
+  sessionId: "s-test",
+  stepIndex: 1,
+  signal: new AbortController().signal,
+});
+
+describe("buildVisionDescribeTool", () => {
+  it("returns an error when prompt is missing", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ path: "x.png" }, ctx(process.cwd()));
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/prompt/i);
+  });
+
+  it("returns an error when no image path is provided", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ prompt: "describe" }, ctx(process.cwd()));
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/path|paths/i);
+  });
+
+  it("returns an error when provider lacks vision capability", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider({
+        capabilities: { vision: false, visionSource: "config-disabled" },
+      }),
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run(
+      { prompt: "x", path: "x.png" },
+      ctx(process.cwd()),
+    );
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/cannot read images/i);
+    expect(result.details).toMatchObject({
+      retryable: false,
+      reason: "model-cannot-see",
+    });
+  });
+
+  it("names the provider it refused on", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: () =>
+        ({
+          ...fakeProvider({
+            capabilities: { vision: false, visionSource: "absent" },
+          }),
+          id: "aimlapi",
+        }) as LlmProvider,
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run(
+      { prompt: "x", path: "x.png" },
+      ctx(process.cwd()),
+    );
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(
+      /the model on aimlapi cannot read images \(no vision projector/,
+    );
+  });
+
+  it("resolves the provider on every call, with the step's pin", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const path = join(tmp, "image.png");
+    await writeFile(path, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const cloud = fakeProvider();
+    const local = fakeProvider();
+    const worker = fakeProvider();
+    let active = cloud;
+    const pins: (string | undefined)[] = [];
+    const tool = buildVisionDescribeTool({
+      provider: (providerId) => {
+        pins.push(providerId);
+        return providerId === "worker" ? worker : active;
+      },
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    await tool.run({ prompt: "describe", path }, ctx(tmp));
+    active = local; // `/llm provider local-llama`
+    await tool.run({ prompt: "describe", path }, ctx(tmp));
+    await tool.run(
+      { prompt: "describe", path },
+      { ...ctx(tmp), providerId: "worker" },
+    );
+    expect(cloud.describeImage).toHaveBeenCalledTimes(1);
+    expect(local.describeImage).toHaveBeenCalledTimes(1);
+    expect(worker.describeImage).toHaveBeenCalledTimes(1);
+    expect(pins).toEqual([undefined, undefined, "worker"]);
+  });
+
+  it("refuses when nothing serves the step, without calling anyone", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: () => undefined,
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run(
+      { prompt: "x", path: "x.png" },
+      { ...ctx(process.cwd()), providerId: "gone" },
+    );
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/"gone" is not configured/);
+  });
+
+  it("rejects a file that is neither a known extension nor known bytes", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const path = join(tmp, "note.txt");
+    await writeFile(path, "not an image");
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ prompt: "describe", path }, ctx(tmp));
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/unsupported image/i);
+  });
+
+  // A chat client names the file; only the bytes know what it is. A PNG
+  // screenshot that arrives from Telegram as `photo.jpg` must reach the
+  // provider labelled `image/png`, or the request comes back a 400.
+  it("labels an image by its bytes, not by a lying extension", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const path = join(tmp, "photo.jpg");
+    await writeFile(
+      path,
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]),
+    );
+    const provider = fakeProvider();
+    const tool = buildVisionDescribeTool({
+      provider,
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ prompt: "describe", path }, ctx(tmp));
+    expect(result.status).toBe("ok");
+    const call = (provider.describeImage as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0] as VisionRequest;
+    expect(call.images[0]!.mimeType).toBe("image/png");
+  });
+
+  it("forwards loaded image bytes to the provider and returns its text", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const path = join(tmp, "image.png");
+    await writeFile(path, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const provider = fakeProvider();
+    const tool = buildVisionDescribeTool({
+      provider,
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ prompt: "describe", path }, ctx(tmp));
+    expect(result.status).toBe("ok");
+    expect(result.summary).toContain("a small red square");
+    const calls = (provider.describeImage as ReturnType<typeof vi.fn>).mock
+      .calls;
+    expect(calls).toHaveLength(1);
+    const call = calls[0]![0] as VisionRequest;
+    expect(call.prompt).toBe("describe");
+    expect(call.images).toHaveLength(1);
+    expect(call.images[0]!.id).toBe(1);
+    expect(call.images[0]!.mimeType).toBe("image/png");
+  });
+
+  // A VLM answer is prose, routinely several paragraphs. The
+  // compressor defaults kept only the last 12 non-blank lines and
+  // then sliced those to 385 chars, so the opening sentence — the one
+  // that says what the image is — never reached the model, and
+  // recovering it costs another paid, non-deterministic call.
+  it("keeps a long description whole, opening sentence first", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const path = join(tmp, "image.png");
+    await writeFile(path, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const paragraphs = [
+      "The screenshot shows the Atomic Agent settings window.",
+      ...Array.from(
+        { length: 40 },
+        (_, i) => `Row ${i}: a labelled control. ${"z".repeat(40)}`,
+      ),
+      "The Save button at the bottom right is disabled.",
+    ];
+    // Paragraph breaks on purpose: a VLM answer is prose, and the
+    // compressor's `extractTail` drops blank lines unconditionally.
+    const text = paragraphs.join("\n\n");
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider({
+        onCall: async () => ({ text, durationMs: 7 }),
+      }),
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ prompt: "describe", path }, ctx(tmp));
+    expect(result.status).toBe("ok");
+    expect(
+      result.summary.startsWith(
+        "The screenshot shows the Atomic Agent settings window.",
+      ),
+    ).toBe(true);
+    expect(result.summary).toContain("Row 0:");
+    expect(result.summary).toContain("Row 39:");
+    expect(result.summary).toContain("Save button");
+    expect(result.summary).not.toContain("[truncated]");
+    expect(result.summary.length).toBeGreaterThan(400);
+    // Every paragraph survives, in order and complete...
+    expect(result.summary.split("\n")).toEqual(paragraphs);
+    // ...but the blank lines between them are dropped by the
+    // compressor, so the answer is not returned byte-for-byte.
+    expect(result.summary).not.toBe(text);
+  });
+
+  // Issue #185: the per-call image cap was enforced but documented
+  // nowhere the model could read, so it discovered the limit only by
+  // burning a step on a failed 8/12/20-image call. The cap now appears
+  // in the tool description, and the error names the remedy.
+  it("documents the image cap in the tool description", () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 4,
+      maxImageBytes: 1024,
+    });
+    expect(tool.description).toContain("At most 4 images per call");
+    expect(tool.description).toMatch(/split/i);
+  });
+
+  it("reflects a reconfigured cap in the tool description", () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 7,
+      maxImageBytes: 1024,
+    });
+    expect(tool.description).toContain("At most 7 images per call");
+  });
+
+  it("rejects more images than the cap and names the split remedy", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 4,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run(
+      {
+        prompt: "describe",
+        paths: Array.from({ length: 12 }, (_, i) => `img-${i}.png`),
+      },
+      ctx(process.cwd()),
+    );
+    expect(result.status).toBe("error");
+    expect(result.summary).toContain("at most 4 images per call (got 12)");
+    // 12 / 4 = 3 calls. The remedy is the point: the model should not
+    // have to guess how to recover from the cap.
+    expect(result.summary).toContain("split into 3 calls of at most 4");
+  });
+
+  it("rounds the suggested call count up for a partial final batch", async () => {
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 4,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run(
+      {
+        prompt: "describe",
+        paths: Array.from({ length: 13 }, (_, i) => `img-${i}.png`),
+      },
+      ctx(process.cwd()),
+    );
+    expect(result.status).toBe("error");
+    // Math.ceil(13 / 4) === 4, not 3.
+    expect(result.summary).toContain("split into 4 calls of at most 4");
+  });
+
+  it("accepts exactly the cap without erroring", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const paths: string[] = [];
+    for (let i = 0; i < 4; i += 1) {
+      const path = join(tmp, `image-${i}.png`);
+      await writeFile(path, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      paths.push(path);
+    }
+    const provider = fakeProvider();
+    const tool = buildVisionDescribeTool({
+      provider,
+      maxImagesPerCall: 4,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run({ prompt: "describe", paths }, ctx(tmp));
+    expect(result.status).toBe("ok");
+    const call = (provider.describeImage as ReturnType<typeof vi.fn>).mock
+      .calls[0]![0] as VisionRequest;
+    expect(call.images).toHaveLength(4);
+  });
+
+  it("rejects images that exceed maxImageBytes", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const path = join(tmp, "big.png");
+    await writeFile(path, Buffer.alloc(32));
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 2,
+      maxImageBytes: 8,
+    });
+    const result = await tool.run({ prompt: "describe", path }, ctx(tmp));
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/maxImageBytes/);
+  });
+
+  // Typing the file from its bytes means every path the agent names is
+  // opened, so the tool has to hand `loadImageFile` its cap and let the
+  // stat reject an over-size file before the read allocates it.
+  it("passes maxImageBytes down so an over-cap file is never read", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    // `.log` used to be rejected on its extension without ever being
+    // opened; nothing but the size guard stops it being slurped now.
+    const path = join(tmp, "install.log");
+    await writeFile(path, Buffer.alloc(4096, 0x61));
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 2,
+      maxImageBytes: 64,
+    });
+    const result = await tool.run({ prompt: "describe", path }, ctx(tmp));
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/maxImageBytes=64/);
+    expect(result.summary).toMatch(/4096 bytes on disk/);
+    // Not wrapped as `failed to load image: …` — the rejection is ours.
+    expect(result.summary).not.toMatch(/failed to load image/);
+  });
+
+  it("refuses a character device instead of reading it forever", async () => {
+    if (process.platform === "win32") return;
+    const tmp = await mkdtemp(join(tmpdir(), "vision-tool-"));
+    const tool = buildVisionDescribeTool({
+      provider: fakeProvider(),
+      maxImagesPerCall: 2,
+      maxImageBytes: 1024,
+    });
+    const result = await tool.run(
+      { prompt: "describe", path: "/dev/zero" },
+      ctx(tmp),
+    );
+    expect(result.status).toBe("error");
+    expect(result.summary).toMatch(/not a regular file/);
+  }, 2000);
+});

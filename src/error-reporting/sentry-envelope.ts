@@ -1,0 +1,232 @@
+import { randomUUID } from "node:crypto";
+
+import type { ParsedSentryDsn } from "./sentry-config.js";
+import type { ScrubbedErrorEvent, SentryStackFrame } from "./error-scrubber.js";
+
+/** Constant context stamped on every envelope. */
+export interface EnvelopeMeta {
+  /** Anonymous, stable-per-install identifier. */
+  installId: string;
+  /** Application release version. */
+  release: string;
+  /** OS platform tag (`darwin` / `linux` / `win32`). */
+  platform: string;
+  /** Product surface enum (`desktop` / `tui` / `cli`). */
+  surface?: string;
+  /** Install channel enum (`curl_sh` / `dmg` / … / `unknown`). */
+  installChannel?: string;
+  /** Desktop app version, only under the desktop app. */
+  desktopVersion?: string;
+}
+
+/**
+ * Process-wide tags shared with product analytics. Structurally matches
+ * `AnalyticsDimensions` so the runtime can pass the same object to both.
+ */
+export interface ErrorReportDimensions {
+  surface: string;
+  installChannel: string;
+  desktopVersion?: string;
+}
+
+/** A ready-to-send envelope: the POST body plus its event id. */
+export interface BuiltEnvelope {
+  eventId: string;
+  body: string;
+}
+
+/**
+ * Build a Sentry ingest envelope (newline-delimited JSON: envelope
+ * header, item header, event payload) from a scrubbed event. Privacy
+ * hardening baked in here:
+ *   - `user.ip_address` is set to `null` so Sentry Relay does not
+ *     backfill the sender's public IP from the request;
+ *   - the anonymous install id is the only identifier;
+ *   - `exception.value` is the error *type*, never the raw message
+ *     (unless the scrubber allowlisted a static message);
+ *   - only the allowlisted scalar fields from {@link ScrubbedErrorEvent}
+ *     become tags.
+ */
+export function buildEnvelope(
+  dsn: ParsedSentryDsn,
+  ev: ScrubbedErrorEvent,
+  meta: EnvelopeMeta,
+): BuiltEnvelope {
+  const eventId = randomUUID().replace(/-/g, "");
+  const timestamp = Date.now() / 1000;
+
+  const tags: Record<string, string> = {
+    install_id: meta.installId,
+    os: meta.platform,
+    error_type: ev.errorType,
+    source: ev.source,
+  };
+  if (meta.surface) tags.surface = meta.surface;
+  if (meta.installChannel) tags.install_channel = meta.installChannel;
+  if (meta.desktopVersion) tags.desktop_version = meta.desktopVersion;
+  if (ev.causeType) tags.cause_type = ev.causeType;
+  if (ev.category) tags.category = ev.category;
+  if (ev.code) tags.code = ev.code;
+  if (ev.httpStatus !== undefined) tags.http_status = String(ev.httpStatus);
+  if (ev.reason) tags.reason = ev.reason;
+  if (ev.toolTransport) tags.tool_transport = ev.toolTransport;
+  if (ev.failureStage) tags.failure_stage = ev.failureStage;
+  if (ev.answerFailure) tags.answer_failure = ev.answerFailure;
+  if (ev.truncationCause) tags.truncation_cause = ev.truncationCause;
+  if (ev.tool) tags.tool = ev.tool;
+  if (ev.toolErrorKind) tags.tool_error_kind = ev.toolErrorKind;
+  if (ev.toolNameClass) tags.tool_name_class = ev.toolNameClass;
+  if (ev.transportHost) tags.transport_host = ev.transportHost;
+  if (ev.upstreamErrorType) {
+    tags.upstream_error_type = ev.upstreamErrorType;
+  }
+  // Context tags never re-group issues: they stay out of the fingerprint.
+  if (ev.llmFailureTags) Object.assign(tags, ev.llmFailureTags);
+
+  // `frames[0]` is the innermost frame (V8 lists the throw site first),
+  // i.e. where the failure actually originated. `.at(-1)` would instead
+  // pick the outermost caller (e.g. the TUI's turn entry point), which is
+  // shared by unrelated bugs and defeats the fingerprint's purpose.
+  const topFrame = ev.frames[0]?.filename ?? "";
+
+  const event = {
+    event_id: eventId,
+    timestamp,
+    platform: "node",
+    level: "error",
+    release: meta.release,
+    // Anonymous id only; `ip_address: null` opts out of IP collection.
+    user: { id: meta.installId, ip_address: null },
+    tags,
+    // The extra discriminator (causeType / tool / reason / host) splits a
+    // catch-all bucket like "ToolExecutionError: ToolExecutionError" into
+    // one issue per underlying cause class / failing tool / model-failure
+    // reason / transport target, instead of every occurrence landing in a
+    // single undiagnosable issue. `causeType` is checked first because it
+    // is the more specific of the two wherever BOTH are set, and the only
+    // wrapper that sets both is `toLlmFailure`'s catch-all, whose `tool`
+    // is the useless literal `"unknown"`. The order never costs a real
+    // tool name: the `ToolExecutionError`s that carry a genuine one pass
+    // no cause. The unregistered-tool throw is the exception to `tool`:
+    // its name is the model's guess, one new issue per guess, so it
+    // discriminates on a fixed value instead (`discriminatorOf`).
+    //
+    // Do NOT read that order as "`causeType` is rare". `toLlmFailure`
+    // attaches `{ cause }` on every arm it wraps — `CancelledError`,
+    // `TransportError` and `GrammarError` alike — as do the llama-server
+    // and OpenAI clients, so most reported failures discriminate on
+    // `causeType`, with `tool` *undefined* rather than `"unknown"`.
+    //
+    // `upstreamErrorType` is a separate element rather than one more `??`
+    // fallback because on the provider path the discriminator above has
+    // nothing left to separate: every provider failure shares the single
+    // value `OpenAiHttpError`, so a context window that is too small and
+    // a wrong model id land under one shortId with nothing in the event
+    // to tell them apart.
+    //
+    // Spread, not `?? ""`: an event without the field must keep the
+    // fingerprint it has today, element for element, so nothing that is
+    // already live re-groups. Only events that actually carry an upstream
+    // type get the extra element, and no such event exists yet. The same
+    // argument does NOT hold for `httpStatus`, which is already live on
+    // every transport issue — putting it here re-groups all of them, so
+    // it is deliberately left out. See the follow-up note in the PR.
+    fingerprint: [
+      "{{ default }}",
+      ev.errorType,
+      ev.category ?? "",
+      discriminatorOf(ev),
+      ...(ev.upstreamErrorType !== undefined ? [ev.upstreamErrorType] : []),
+      topFrame,
+    ],
+    exception: {
+      values: [
+        {
+          type: ev.errorType,
+          value: ev.message ?? ev.errorType,
+          // `ev.frames` stays innermost-first for the fingerprint above;
+          // the wire format wants the opposite. See `toSentryFrameOrder`.
+          stacktrace: { frames: toSentryFrameOrder(ev.frames) },
+        },
+      ],
+    },
+  };
+
+  const envelopeHeader = JSON.stringify({
+    event_id: eventId,
+    sent_at: new Date().toISOString(),
+    dsn: dsn.dsn,
+  });
+  const itemHeader = JSON.stringify({ type: "event" });
+  const payload = JSON.stringify(event);
+  const body = `${envelopeHeader}\n${itemHeader}\n${payload}\n`;
+  return { eventId, body };
+}
+
+/** Fingerprint element for every unregistered-tool failure. */
+export const UNREGISTERED_TOOL_DISCRIMINATOR = "unregistered_tool";
+
+/**
+ * The fingerprint's extra discriminator (see `buildEnvelope`). A
+ * streak of unregistered tool names is one issue whatever the names
+ * were; every other event keeps the chain it always had.
+ */
+function discriminatorOf(ev: ScrubbedErrorEvent): string {
+  if (ev.toolErrorKind === "unregistered") return UNREGISTERED_TOOL_DISCRIMINATOR;
+  return ev.causeType ?? ev.tool ?? ev.reason ?? ev.transportHost ?? "";
+}
+
+/** A stack frame as Sentry's ingest protocol wants it. */
+interface WireStackFrame {
+  function?: string;
+  filename: string;
+  lineno?: number;
+  colno?: number;
+  in_app: boolean;
+}
+
+/**
+ * Reorder and annotate frames for the wire.
+ *
+ * Two protocol details, both of which we were getting wrong:
+ *
+ *  - **Order.** Sentry lists a stack oldest frame FIRST, so the crash
+ *    site is the LAST entry — the opposite of V8, which puts the throw
+ *    site at index 0. Sending V8 order rendered every stack upside-down
+ *    in the UI and, worse, made Sentry read the culprit off the wrong
+ *    end: that is why the issue list is a wall of `async run`,
+ *    `async executeStep`, `async runOneTurn` — the outermost caller of
+ *    unrelated bugs — instead of the frame that actually threw.
+ *
+ *  - **`in_app`.** Nothing ever set it, so every frame was a system
+ *    frame (`in_app_frame_mix: "system-only"` on all of our issues) and
+ *    Sentry's culprit/grouping heuristics had nothing of ours to
+ *    prefer. Anything that is not a `node:` internal is ours — the
+ *    scrubber has already reduced paths to basenames, and the bundle
+ *    is a single file, so there is no dependency directory left to
+ *    distinguish.
+ *
+ * `ev.frames` is left untouched (a copy is reversed): the fingerprint
+ * reads `frames[0]` as the innermost frame, and flipping that would
+ * re-group every existing issue.
+ */
+function toSentryFrameOrder(frames: SentryStackFrame[]): WireStackFrame[] {
+  return frames
+    .map((frame) => ({
+      ...frame,
+      in_app: !frame.filename.startsWith("node:"),
+    }))
+    .reverse();
+}
+
+/** Build the `X-Sentry-Auth` header value for an envelope POST. */
+export function buildSentryAuthHeader(
+  dsn: ParsedSentryDsn,
+  release: string,
+): string {
+  return [
+    "Sentry sentry_version=7",
+    `sentry_client=atomic-agent/${release}`,
+    `sentry_key=${dsn.publicKey}`,
+  ].join(", ");
+}

@@ -1,0 +1,218 @@
+import { describe, expect, it } from "vitest";
+import {
+  APPROVAL_CATEGORY_LABELS,
+  APPROVAL_LEVEL_NAMES,
+  clampApprovalLevel,
+  formatApprovalCategory,
+  formatApprovalLevel,
+  isAutoApprovedAt,
+  isGrantableCategory,
+  resolveBootApprovalLevel,
+  type ApprovalCategory,
+  type ApprovalLevel,
+} from "./approval-level.js";
+
+const LEVELS: readonly ApprovalLevel[] = [1, 2, 3, 4, 5];
+
+const ALL_CATEGORIES: readonly ApprovalCategory[] = [
+  "fs_write_workspace",
+  "fs_write_home",
+  "fs_trash",
+  "http",
+  "shell",
+  "script",
+  "proc_kill",
+  "publish",
+  "git_remote",
+  "browser_nonweb",
+  "browser_commit",
+  "browser_secret",
+  "browser_offsite",
+  "trust_config",
+  "state_secret",
+  "email",
+  "fs_read_outside",
+  "paid_generation",
+  "screen_control",
+  "screen_capture",
+  "local_model_restart",
+  "other",
+];
+
+describe("session-grant eligibility", () => {
+  it("grants every category except trust_config, state_secret, email, browser_secret and local_model_restart", () => {
+    for (const category of ALL_CATEGORIES) {
+      expect(isGrantableCategory(category)).toBe(
+        category !== "trust_config" &&
+          category !== "state_secret" &&
+          category !== "email" &&
+          category !== "browser_secret" &&
+          category !== "local_model_restart",
+      );
+    }
+  });
+
+  it("state_secret mirrors trust_config: silent only at full trust, never granted (ATO-877)", () => {
+    expect(isGrantableCategory("state_secret")).toBe(false);
+    // Level 4 is where the shell runs unasked; a secret file still asks.
+    expect(isAutoApprovedAt(4, "shell")).toBe(true);
+    expect(isAutoApprovedAt(4, "state_secret")).toBe(false);
+    expect(isAutoApprovedAt(5, "state_secret")).toBe(true);
+  });
+
+  it("trust_config is the one non-grantable category (mirrors its level-5 pin)", () => {
+    expect(isGrantableCategory("trust_config")).toBe(false);
+    // The grant-side half of the trust_config invariant lines up with the
+    // auto-approve side: it is silent only at level 5.
+    expect(isAutoApprovedAt(4, "trust_config")).toBe(false);
+    expect(isAutoApprovedAt(5, "trust_config")).toBe(true);
+  });
+});
+
+describe("approval ladder", () => {
+  it("matches the approved category table exactly, level by level", () => {
+    // One row per category: the first level at which it goes silent.
+    // This is THE product decision — a change here is a behaviour
+    // change, not a refactor.
+    const silentFrom: Record<ApprovalCategory, ApprovalLevel> = {
+      fs_write_workspace: 2,
+      fs_write_home: 3,
+      fs_trash: 3,
+      http: 3,
+      shell: 4,
+      script: 4,
+      proc_kill: 4,
+      publish: 4,
+      git_remote: 4,
+      fusion_fanout: 4,
+      browser_nonweb: 5,
+      // A click that submits / publishes / deletes: the `publish` rung.
+      browser_commit: 4,
+      // Passwords and payments ask until full trust.
+      browser_secret: 5,
+      // Navigation outside a non-empty allow-list: the `http` rung.
+      browser_offsite: 3,
+      trust_config: 5,
+      // The read-side twin of trust_config (ATO-877).
+      state_secret: 5,
+      email: 5,
+      // Reads outside the working directory ask until full trust: a
+      // wandering read is what the read scope exists to stop.
+      fs_read_outside: 5,
+      // Money leaves the operator's cloud account: the lowest two levels ask.
+      paid_generation: 3,
+      // Mouse and keyboard in any app: the same rung as a shell command.
+      screen_control: 4,
+      // A picture of whatever is open: asks on the lowest two levels, like http.
+      screen_capture: 3,
+      local_model_restart: 5,
+      other: 5,
+    };
+    for (const [category, from] of Object.entries(silentFrom) as [
+      ApprovalCategory,
+      ApprovalLevel,
+    ][]) {
+      for (const level of LEVELS) {
+        expect(
+          isAutoApprovedAt(level, category),
+          `${category} at level ${level}`,
+        ).toBe(level >= from);
+      }
+    }
+  });
+
+  it("labels every category and formats a couple of canonical ones", () => {
+    // R5: hosts render `category` next to the prompt. Every category in
+    // the union must have a non-empty label so no prompt shows a blank
+    // kind; the compiler already forces a key here, this guards content.
+    for (const category of Object.keys(
+      APPROVAL_CATEGORY_LABELS,
+    ) as ApprovalCategory[]) {
+      expect(formatApprovalCategory(category).length).toBeGreaterThan(0);
+    }
+    expect(formatApprovalCategory("fs_write_home")).toBe("file write · home");
+    expect(formatApprovalCategory("trust_config")).toBe("agent trust config");
+    expect(formatApprovalCategory("state_secret")).toBe("agent secret file");
+    expect(formatApprovalCategory("shell")).toBe("shell command");
+    expect(formatApprovalCategory("git_remote")).toBe("git · remote");
+    expect(formatApprovalCategory("screen_control")).toBe(
+      "screen · click / type",
+    );
+    expect(formatApprovalCategory("screen_capture")).toBe(
+      "screen · screenshot",
+    );
+    expect(formatApprovalCategory("fs_read_outside")).toBe(
+      "read outside the working directory",
+    );
+    expect(formatApprovalCategory("browser_commit")).toBe(
+      "browser · submit / publish / delete",
+    );
+    expect(formatApprovalCategory("browser_secret")).toBe(
+      "browser · password or payment",
+    );
+  });
+
+  it("level 1 asks for every category and level 5 for none (cumulative ladder)", () => {
+    const categories: ApprovalCategory[] = [
+      "fs_write_workspace",
+      "fs_write_home",
+      "fs_trash",
+      "http",
+      "shell",
+      "script",
+      "proc_kill",
+      "git_remote",
+      "browser_nonweb",
+      "browser_commit",
+      "browser_secret",
+      "browser_offsite",
+      "trust_config",
+      "email",
+      "fs_read_outside",
+      "screen_control",
+      "screen_capture",
+      "other",
+    ];
+    for (const category of categories) {
+      expect(isAutoApprovedAt(1, category)).toBe(false);
+      expect(isAutoApprovedAt(5, category)).toBe(true);
+      // Cumulative: once silent, silent at every higher level.
+      let silent = false;
+      for (const level of LEVELS) {
+        const now = isAutoApprovedAt(level, category);
+        expect(now || !silent).toBe(true);
+        silent = silent || now;
+      }
+    }
+  });
+
+  it("clamps arbitrary numbers into [1, 5] and NaN to the strictest level", () => {
+    expect(clampApprovalLevel(0)).toBe(1);
+    expect(clampApprovalLevel(-7)).toBe(1);
+    expect(clampApprovalLevel(1)).toBe(1);
+    expect(clampApprovalLevel(3)).toBe(3);
+    expect(clampApprovalLevel(3.9)).toBe(3);
+    expect(clampApprovalLevel(5)).toBe(5);
+    expect(clampApprovalLevel(42)).toBe(5);
+    expect(clampApprovalLevel(Number.NaN)).toBe(1);
+    expect(clampApprovalLevel(Number.POSITIVE_INFINITY)).toBe(1);
+  });
+
+  it("names all five levels and formats the canonical label", () => {
+    expect(APPROVAL_LEVEL_NAMES[1]).toBe("paranoid");
+    expect(APPROVAL_LEVEL_NAMES[2]).toBe("workspace");
+    expect(APPROVAL_LEVEL_NAMES[3]).toBe("home");
+    expect(APPROVAL_LEVEL_NAMES[4]).toBe("operator");
+    expect(APPROVAL_LEVEL_NAMES[5]).toBe("full trust");
+    expect(formatApprovalLevel(2)).toBe("2 (workspace)");
+  });
+
+  it("--no-approval forces level 5; otherwise the persisted level (clamped) wins", () => {
+    expect(resolveBootApprovalLevel(true, 1)).toBe(5);
+    expect(resolveBootApprovalLevel(true, 3)).toBe(5);
+    expect(resolveBootApprovalLevel(false, 1)).toBe(1);
+    expect(resolveBootApprovalLevel(false, 4)).toBe(4);
+    expect(resolveBootApprovalLevel(false, 99)).toBe(5);
+    expect(resolveBootApprovalLevel(false, 0)).toBe(1);
+  });
+});

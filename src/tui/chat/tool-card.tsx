@@ -1,0 +1,268 @@
+import { Box, Text } from "ink";
+import type { ReactElement, ReactNode } from "react";
+import { MouseTarget, useMouseCommands } from "../mouse/mouse-context.js";
+import { isPrimaryPress } from "../mouse/mouse-event.js";
+import {
+  formatToolArgsBlock,
+  previewToolArgs,
+} from "../render/tool-args-preview.js";
+import { theme } from "../theme/theme.js";
+import type { StreamingToolCall, ToolCardEntry } from "../tui-state.js";
+import { ToolCardPathChip, toolCardFilePath } from "./tool-card-path-chip.js";
+import {
+  annotationTail,
+  toolCardsAnnotationParts,
+} from "./tool-cards-annotation.js";
+
+interface ToolCardProps {
+  card: ToolCardEntry | StreamingToolCall;
+  expanded: boolean;
+}
+
+/**
+ * Collapsible tool execution card. Collapsed view is one highlighted
+ * header line: name, status glyph, duration, args preview. Expanded view
+ * reveals the full args block and the full summary/details text. Pending
+ * (in-flight) calls render with a spinner-less hourglass glyph and no
+ * duration yet.
+ *
+ * Clicking the header line toggles the card. Until now the per-card
+ * toggle existed in the reducer but had no key binding at all — only
+ * `/expand` and `/collapse`, which act on every card at once — so the
+ * mouse is the first way to open one specific card.
+ */
+export function ToolCard({ card, expanded }: ToolCardProps): ReactElement {
+  const isFinalised = "status" in card;
+  const status = isFinalised ? card.status : "pending";
+  const color = toColor(status);
+  const glyph = toGlyph(status);
+  const argsPreview = previewToolArgs(card.args);
+  const duration =
+    isFinalised && card.finishedAt
+      ? `${card.finishedAt - card.startedAt}ms`
+      : "…";
+  const filePath = isFinalised ? toolCardFilePath(card) : null;
+  const toggle = (
+    <ExpandToggle cardId={card.id}>
+      <Text>
+        <Text color={color}>
+          {theme.glyphs.toolBoxTopLeft}
+          {theme.glyphs.toolBoxHorizontal} {glyph} {card.tool}
+        </Text>
+        <Text color={theme.colors.muted}>
+          {" "}
+          {theme.glyphs.dotSeparator} {duration}
+        </Text>
+        {isFinalised && card.truncated ? (
+          <Text color={theme.colors.warn}>
+            {" "}
+            {theme.glyphs.dotSeparator} truncated
+          </Text>
+        ) : null}
+        {argsPreview ? (
+          <Text color={theme.colors.muted}>
+            {"  "}
+            {argsPreview}
+          </Text>
+        ) : null}
+      </Text>
+    </ExpandToggle>
+  );
+  // A finished read / write / edit card carries `[copy path]` on the
+  // header row, as a sibling of the expand toggle rather than inside its
+  // `Text` (a nested target gets no hit box of its own).
+  const header =
+    filePath === null ? (
+      toggle
+    ) : (
+      <Box flexDirection="row">
+        <Box flexShrink={1} minWidth={0}>
+          {toggle}
+        </Box>
+        <ToolCardPathChip path={filePath} />
+      </Box>
+    );
+  if (!expanded) {
+    return (
+      <Box flexDirection="column" marginBottom={1}>
+        {header}
+        {isFinalised ? (
+          <SummaryLine summary={card.summary} color={color} />
+        ) : null}
+      </Box>
+    );
+  }
+  return (
+    <Box flexDirection="column" marginBottom={1}>
+      {header}
+      <Box flexDirection="column" marginLeft={2}>
+        <Text color={theme.colors.muted}>args</Text>
+        {splitLines(formatToolArgsBlock(card.args)).map((line, idx) => (
+          <Text key={`a-${idx}`}> {line}</Text>
+        ))}
+        {isFinalised ? (
+          <>
+            <Text color={theme.colors.muted}>result</Text>
+            {splitLines(card.summary).map((line, idx) => (
+              <Text key={`s-${idx}`} color={color}>
+                {"  "}
+                {line}
+              </Text>
+            ))}
+          </>
+        ) : (
+          <Text color={theme.colors.muted}>(pending)</Text>
+        )}
+      </Box>
+    </Box>
+  );
+}
+
+/**
+ * The one-line gist under a finished turn's tool cards — "read 3 files,
+ * ran 2 commands · 1 failed". Exactly one row or nothing: the work list
+ * is `wrap="truncate-end"` and the only part that shrinks, so Yoga cuts
+ * it to whatever the chat column has (83 cells in a 120-column terminal,
+ * less beside a wide rail) while the failure / unfinished count beside
+ * it never shrinks and survives a narrow terminal. `estimateMessageHeight`
+ * charges the same row off the same `toolCardsAnnotationParts` answer.
+ */
+export function ToolCardsAnnotationLine({
+  cards,
+}: {
+  cards: readonly ToolCardEntry[];
+}): ReactElement | null {
+  const parts = toolCardsAnnotationParts(cards);
+  if (parts === null) return null;
+  const tail = annotationTail(parts);
+  const lead = theme.glyphs.dotSeparator;
+  return (
+    <Box flexDirection="row" height={1} overflow="hidden">
+      {parts.done.length > 0 ? (
+        <Box flexShrink={1} minWidth={0}>
+          <Text color={theme.colors.muted} dimColor wrap="truncate-end">
+            {lead} {parts.done}
+          </Text>
+        </Box>
+      ) : null}
+      {tail.length > 0 ? (
+        <Box flexShrink={0}>
+          <Text color={theme.colors.muted} dimColor wrap="truncate-end">
+            {parts.done.length > 0 ? ` ${lead} ` : `${lead} `}
+            {tail}
+          </Text>
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
+const PREVIEW_SUMMARY_LIMIT = 160;
+
+/**
+ * The "changed since you last read it" notice os.fs.write / edit / patch
+ * add to a result (ATO-659). On a failed edit it follows the error text,
+ * so a long path would push it past the one-line clip (ATO-914).
+ */
+const STALE_READ_NOTE = /^note: .*changed since you last read/;
+
+/**
+ * Split the stale-read notice off a summary so the collapsed card shows
+ * it on its own row, never clipped. The summary keeps its other lines.
+ */
+export function splitStaleReadNote(summary: string): {
+  rest: string;
+  notes: string[];
+} {
+  const notes: string[] = [];
+  const rest: string[] = [];
+  for (const line of splitLines(summary)) {
+    if (STALE_READ_NOTE.test(line.trim())) notes.push(line.trim());
+    else rest.push(line);
+  }
+  return { rest: rest.join("\n"), notes };
+}
+
+function SummaryLine({
+  summary,
+  color,
+}: {
+  summary: string;
+  color: string;
+}): ReactElement | null {
+  const { rest, notes } = splitStaleReadNote(summary);
+  const oneLine = rest.trim().replace(/\s+/g, " ");
+  if (oneLine.length === 0 && notes.length === 0) return null;
+  const clipped =
+    oneLine.length <= PREVIEW_SUMMARY_LIMIT
+      ? oneLine
+      : `${oneLine.slice(0, PREVIEW_SUMMARY_LIMIT - 1)}…`;
+  return (
+    <>
+      {oneLine.length > 0 ? (
+        <Text color={color}>
+          {theme.glyphs.toolBoxBottomLeft}
+          {theme.glyphs.toolBoxHorizontal} {clipped}
+        </Text>
+      ) : null}
+      {notes.map((note, idx) => (
+        <Text key={`n-${idx}`} color={theme.colors.warn}>
+          {theme.glyphs.toolBoxBottomLeft}
+          {theme.glyphs.toolBoxHorizontal} {note}
+        </Text>
+      ))}
+    </>
+  );
+}
+
+function toColor(status: "pending" | "ok" | "error"): string {
+  switch (status) {
+    case "ok":
+      return theme.colors.toolOk;
+    case "error":
+      return theme.colors.toolError;
+    default:
+      return theme.colors.tool;
+  }
+}
+
+function toGlyph(status: "pending" | "ok" | "error"): string {
+  switch (status) {
+    case "ok":
+      return theme.glyphs.check;
+    case "error":
+      return theme.glyphs.cross;
+    default:
+      return theme.glyphs.chevronRight;
+  }
+}
+
+function splitLines(text: string): string[] {
+  return text.replace(/\r\n/g, "\n").split("\n");
+}
+
+/**
+ * Wraps the card header so a click folds / unfolds that one card.
+ * Transparent when the mouse layer is absent.
+ */
+function ExpandToggle({
+  cardId,
+  children,
+}: {
+  cardId: string;
+  children: ReactNode;
+}): ReactElement {
+  const mouse = useMouseCommands();
+  if (!mouse) return <>{children}</>;
+  return (
+    <MouseTarget
+      onMouse={(hit) => {
+        if (!isPrimaryPress(hit.event)) return false;
+        mouse.dispatch({ type: "tool_expand_toggled", toolCardId: cardId });
+        return true;
+      }}
+    >
+      {children}
+    </MouseTarget>
+  );
+}

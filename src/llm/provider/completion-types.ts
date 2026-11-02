@@ -1,0 +1,344 @@
+/**
+ * Shared completion request/response shapes for every text LLM provider.
+ * `LlamaServerClient` and cloud adapters both speak this surface so the
+ * agent loop stays provider-agnostic above the registry seam.
+ */
+
+export type ToolCallTransport = "grammar" | "native_tools";
+
+/**
+ * How hard a reasoning model may think for one completion. Mapped per
+ * provider family in the body builder (OpenRouter `reasoning.effort`,
+ * OpenAI-compatible `reasoning_effort`); providers without a mapping
+ * ignore it.
+ */
+export type ReasoningEffort = "low" | "medium" | "high";
+
+export interface CompletionUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /**
+   * Prompt tokens the service served from its prompt cache
+   * (`prompt_tokens_details.cached_tokens` on OpenAI, OpenRouter and
+   * Gemini's compatibility layer). A subset of `promptTokens`, priced at
+   * the model's `cacheRead` rate when one is known. Absent — not zero —
+   * when the service did not report it.
+   */
+  cachedTokens?: number;
+}
+
+/**
+ * One turn of the packed conversation, as the prompt builder renders it:
+ * the same rows `### conversation` carries as text, with each
+ * tool-result body already capped exactly as the text form caps it.
+ * Provider-neutral on purpose — a native-tools provider lays these out as
+ * real chat messages, a grammar provider never reads them.
+ */
+export type PromptTurn =
+  | { kind: "user"; text: string }
+  | { kind: "assistant_reply"; text: string }
+  | { kind: "assistant_tool_call"; tool: string; args: Record<string, unknown>; callId?: string }
+  | {
+      kind: "tool_result";
+      tool: string;
+      status: "ok" | "error";
+      body: string;
+      truncated: boolean;
+      callId?: string;
+    };
+
+/**
+ * The prompt as structure instead of as one string: the three zones a
+ * native-message request lays out as `system`, history and a final
+ * `user` message. `prompt` (the flat text) is always present beside it
+ * and is what every other transport sends; the two are built from the
+ * same packed conversation, so they cannot disagree about what the
+ * model sees.
+ */
+export interface PromptMessages {
+  /** Historical checkpoint, outside the stable system instructions. */
+  contextSummary?: string;
+  /** The stable prefix, byte for byte. */
+  system: string;
+  /** The packer's one-line recap of dropped turns, or `null`. */
+  droppedSummary: string | null;
+  /** The visible conversation, oldest first. */
+  turns: ReadonlyArray<PromptTurn>;
+  /** The variable tail without `### conversation`: the final user message. */
+  tail: string;
+}
+
+/**
+ * The prompt as two messages, for a local provider that renders through
+ * the model's own chat template (`/apply-template`): the stable prefix
+ * as the system message, the tail as the user message. `prompt` stays
+ * the raw text for providers and paths that do not render.
+ */
+export interface ChatPromptParts {
+  system: string;
+  user: string;
+  /** Salted hash of `system`; the rendered prefix is cached by it. */
+  prefixHash: string;
+  /** `chat_template_kwargs.enable_thinking`; absent leaves the template's default. */
+  enableThinking?: boolean;
+}
+
+export interface CompletionRequest {
+  /** Full-context capacity check; internal, never serialized as an API field. */
+  contextBudget?: { window: number | null; replyReserve: number };
+  /** Internal policy of the attempted link; never part of the API request body. */
+  modelMode?: import("../model-mode.js").ResolvedModelMode;
+  prompt: string;
+  /**
+   * The same prompt as structure. Set only for main-turn requests built
+   * for a native-tools link; providers that lay history out as real
+   * messages read it, everything else ignores it and sends `prompt`.
+   */
+  messages?: PromptMessages;
+  /** See `ChatPromptParts`. Only grammar (llama-server) links receive it. */
+  chat?: ChatPromptParts;
+  grammar?: string;
+  slotId?: number;
+  cachePrompt?: boolean;
+  stop?: string[];
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  maxTokens?: number;
+  /**
+   * Output ceiling for the turn this request belongs to (a fusion
+   * worker's `workerMaxOutputTokens`). A per-step `maxTokens` — the
+   * truncation retry's raised cap — wins over it; absent both, the
+   * provider's own ceiling applies.
+   */
+  maxOutputTokens?: number;
+  /**
+   * How hard a reasoning model should think on this completion (the
+   * turn's `reasoningEffort`). Spelled per vendor by the body builder
+   * (`reasoning: { effort }` on OpenRouter, `reasoning_effort` on
+   * OpenAI-compatible services) and omitted for kinds that document
+   * neither. Ignored by grammar-only providers. Set by the fusion
+   * fan-out for its workers.
+   */
+  reasoningEffort?: ReasoningEffort;
+  /**
+   * Ask the server to skip the reasoning channel for this request
+   * (`chat_template_kwargs: { enable_thinking: false }`). Sent only to an
+   * OpenAI-compatible server on a local or private-network address, where
+   * the field is the chat template's own; strict cloud APIs reject
+   * unknown fields, so every other provider ignores it. Never serialized
+   * under this name. Context compaction sets it.
+   */
+  disableThinking?: boolean;
+  seed?: number;
+  repeatPenalty?: number;
+  repeatLastN?: number;
+  sessionId?: string;
+  signal?: AbortSignal;
+  /**
+   * This request's own transport deadline, in place of the provider's
+   * configured `requestTimeoutMs`, for a caller that owns a longer
+   * deadline through `signal` (context compaction's per-part limit).
+   * Honoured by llama-server unary completions and OpenAI-compatible
+   * requests; never serialized.
+   */
+  requestTimeoutMs?: number;
+  imageData?: ReadonlyArray<{ id: number; data: string }>;
+  /** OpenAI tools path — ignored by grammar-only providers. */
+  tools?: ReadonlyArray<Record<string, unknown>>;
+  toolChoice?: unknown;
+  parallelToolCalls?: boolean;
+  /**
+   * OpenAI-compatible Structured Outputs envelope. When set, the
+   * provider attaches `response_format: { type: "json_schema", ... }`
+   * to the request so the model is forced to emit valid JSON matching
+   * `schema`. Used by reflection/link-gen/vote/rewriter/distill
+   * sub-runners on cloud providers — GBNF (`grammar`) cannot be
+   * enforced over OpenAI-compatible APIs, so this is the cross-vendor
+   * equivalent. Ignored by grammar-only providers (llama-server) —
+   * they rely on `grammar` instead.
+   */
+  responseFormat?: ResponseFormatJsonSchema;
+  /**
+   * How far the server got through the prompt before the first token
+   * (ATO-1027): on a local model the first message can spend minutes
+   * here with nothing to show. llama-server only — when set, a stream
+   * asks for `return_progress` and calls this for each `prompt_progress`
+   * frame instead of yielding it. Never serialized; every other provider
+   * ignores it.
+   */
+  onPromptProgress?: (progress: PromptProgress) => void;
+}
+
+/**
+ * One llama.cpp `prompt_progress` frame: prompt tokens evaluated so far
+ * (`processed`, the cached ones included) out of `total`, of which
+ * `cached` came from the KV cache, and the evaluation time so far.
+ */
+export interface PromptProgress {
+  processed: number;
+  total: number;
+  cached: number;
+  elapsedMs: number;
+}
+
+/**
+ * OpenAI-compatible Structured Outputs descriptor. Mirrors the
+ * `response_format` payload accepted by chat-completions when
+ * `type === "json_schema"`. `strict: true` is the recommended
+ * default — it makes the provider validate against `schema` server-side
+ * and rejects malformed completions before they hit our parsers.
+ */
+export interface ResponseFormatJsonSchema {
+  /** Short identifier exposed to the provider (must match `^[a-zA-Z0-9_-]+$`). */
+  name: string;
+  /** Human-readable description of what the schema captures. Optional. */
+  description?: string;
+  /** JSON Schema object. Should be self-contained — no $ref. */
+  schema: Record<string, unknown>;
+  /**
+   * When true, the provider enforces strict adherence to `schema`
+   * (every property in `required`, no extra fields beyond what
+   * `additionalProperties: false` allows). Defaults to true at the
+   * provider adapter level.
+   */
+  strict?: boolean;
+}
+
+export interface CompletionTiming {
+  promptMs: number;
+  predictedMs: number;
+  promptTokens: number;
+  predictedTokens: number;
+}
+
+/**
+ * Why the runtime ended a completion itself, before the provider did.
+ *
+ * `fabricated_transcript`: the plain content kept writing atag's own text
+ * transcript (`assistant_tool_call:` / `tool_result[...]:` lines) instead
+ * of calling tools, so the stream was aborted
+ * (`createFabricatedTranscriptWatcher`). `calls` / `results` are the
+ * transcript lines seen when it was cut. Not a truncation and not a
+ * provider failure: the completion is judged like one whose text was
+ * detected as fabricated after it finished.
+ *
+ * `repetition`: a local model's reply fell into a loop, one block of
+ * `periodChars` characters repeated back to back
+ * (`createStreamRepetitionWatcher`), so the llama-server stream was
+ * aborted. The completion is marked `truncated`, and
+ * `detectModelFailure` reports it as a repetitive truncation: the step
+ * is retried without raising the cap.
+ */
+export type CompletionEarlyStop =
+  | {
+      reason: "fabricated_transcript";
+      calls: number;
+      results: number;
+    }
+  | {
+      reason: "repetition";
+      channel: "content" | "reasoning";
+      periodChars: number;
+    };
+
+export interface CompletionResult {
+  servedModelMode?: import("../model-mode.js").ResolvedModelMode;
+  content: string;
+  reasoningContent: string;
+  stop: boolean;
+  truncated: boolean;
+  timing: CompletionTiming;
+  cacheHitTokens: number;
+  slotId: number;
+  modelId: string | null;
+  /** Populated by cloud providers from `usage` blocks. */
+  usage?: CompletionUsage;
+  /** Raw OpenAI tool_calls when transport is native_tools. */
+  toolCalls?: ReadonlyArray<OpenAiToolCall>;
+  finishReason?: string | null;
+  /**
+   * llama-server's own `stop_type` (`eos`, `word`, `limit`, `none`), as
+   * it sent it. Only the llama-server client sets it. `limit` with
+   * `finishReason: "length"` is a reply cut at `n_predict`; `limit` on a
+   * context overflow keeps `finishReason` unset.
+   */
+  stopType?: string;
+  /** Set when the runtime cut the completion short. See `CompletionEarlyStop`. */
+  earlyStop?: CompletionEarlyStop;
+  /**
+   * The output cap the request actually carried on the wire
+   * (`max_tokens`, or `max_completion_tokens` from a passthrough); `null`
+   * when it carried none, so any cut was the provider's own limit.
+   * Absent when the provider does not report it — callers then fall back
+   * to the cap they asked for.
+   */
+  sentMaxTokens?: number | null;
+  /**
+   * Tool-call transport of the provider that actually served this
+   * completion. Providers never set it — it is stamped by the fallback
+   * chain wrapper so the caller parses the response with the transport of
+   * the link that answered, not the primary's. Absent on the direct
+   * (non-wrapped) path, where the caller's own `toolTransport` is
+   * authoritative.
+   */
+  servedTransport?: ToolCallTransport;
+  /**
+   * The provider's generation id (`id` on the response / SSE chunks),
+   * when it sends one. Recorded in the trace so a billed completion
+   * can be looked up at the provider.
+   */
+  generationId?: string;
+}
+
+export interface OpenAiToolCall {
+  id?: string;
+  type?: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+export interface StreamChunk {
+  delta: string;
+  reasoningDelta: string;
+  done: boolean;
+  /**
+   * Tool-call transport of the link that is serving this stream.
+   * Providers never set it — the fallback streamer seam stamps it on
+   * every chunk so live consumers (the step executor's stream parser)
+   * can adapt to a cross-transport fallover BEFORE the final return
+   * value arrives: `CompletionResult.servedTransport` only exists once
+   * the stream finishes, which is too late to classify reasoning deltas
+   * live. Absent on the direct (non-wrapped) path, where the caller's
+   * configured `toolTransport` is authoritative.
+   */
+  servedTransport?: ToolCallTransport;
+}
+
+export interface StreamFinalResult {
+  content: string;
+  reasoningContent: string;
+  toolCalls?: ReadonlyArray<OpenAiToolCall>;
+  finishReason?: string | null;
+  usage?: CompletionUsage;
+  modelId?: string | null;
+  /** See `CompletionResult.generationId`. */
+  generationId?: string;
+  /**
+   * Whether the underlying transport actually delivered a trustworthy
+   * terminal signal — an explicit provider `finish_reason` on any chunk,
+   * or a parser-recognized terminal event (e.g. `[DONE]`) — before the
+   * stream ended. `false` (or absent) means the connection just closed
+   * (bare EOF / read error) without either: not asserted, so callers must
+   * not treat an absent value as confirmation of a clean completion.
+   */
+  terminalObserved?: boolean;
+  /**
+   * Set when the consumer ended the stream itself. The tool calls on the
+   * result are then only those whose arguments had fully arrived.
+   */
+  earlyStop?: CompletionEarlyStop;
+}

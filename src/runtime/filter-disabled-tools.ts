@@ -1,0 +1,222 @@
+import type { ToolDescriptor } from "../prompt/stable-prefix.js";
+
+/**
+ * Config gates that decide which `DEFAULT_TOOL_DESCRIPTORS` entries
+ * are actually backed by a registered tool at runtime.
+ *
+ * Background: each tool family is independently registered in
+ * `bootstrap.ts` (see `registerMemoryTools`, `registerTaskTools`,
+ * `registerVisionTools`) based on its master switch. The
+ * **descriptor catalog** in `src/prompt/default-tool-descriptors-*.ts`
+ * is static, however — it always lists every tool. Without this
+ * filter the stable prefix advertises tools the registry will reject,
+ * and the agent loop fails the turn with
+ * `tool not registered in this agent: <name>` the moment the model
+ * picks one of them (e.g. `memory.procedures.recall` under the
+ * out-of-the-box default `memory.procedures.enabled=false`).
+ *
+ * The vision filter used to live inline in `bootstrap.ts`; this
+ * module generalises it to cover every family with a runtime gate
+ * (memory profile / notes / lessons / procedures, tasks, vision).
+ *
+ * Keep the gate names verbatim from the config schema — they double
+ * as the documented mapping for downstream readers.
+ */
+export interface ToolGateConfig {
+  /**
+   * Browser gate. `enabled=false` drops the entire interactive
+   * `browser.*` surface (navigate / click / type / read_aria / search /
+   * tabs / scroll) from the stable prefix so the model never reaches for
+   * the live browser; web work falls back to `os.web.search` +
+   * `os.web.fetch`. The tools stay registered and grammar-valid.
+   */
+  browser: { enabled: boolean };
+  web: { search: { enabled: boolean } };
+  vision: { enabled: boolean; providerAvailable: boolean };
+  memory: {
+    profile: { enabled: boolean };
+    notes: { enabled: boolean };
+    lessons: { enabled: boolean };
+    procedures: { enabled: boolean };
+  };
+  tasks: { agentToolsEnabled: boolean };
+  /**
+   * The agent's own inbox. Without a registered Atomic Mail inbox the
+   * `os.email.*` tools can only answer "set one up", so they leave the
+   * prefix; the tools stay registered and grammar-valid.
+   */
+  email: { available: boolean };
+  /**
+   * MCP gate. `enabled=false` (or zero configured servers) drops the
+   * aggregate `mcp.resource.*` and `mcp.prompt.*` descriptors from the
+   * stable prefix so the agent does not see tools it cannot exercise.
+   */
+  mcp: { enabled: boolean };
+  /**
+   * GitHub gate. `connected=false` (no `GITHUB_TOKEN` in the hub)
+   * drops the `github.*` descriptors — the tools stay registered and
+   * would answer with "GitHub is not connected", but a catalog entry
+   * for them only invites the model to try.
+   */
+  github: { connected: boolean };
+  /**
+   * Fusion gate. `enabled=false` drops `fusion.delegate` from the stable
+   * prefix — and with it the whole `### fusion` guidance block, which
+   * keys off the descriptor. `true` only when the run-mode resolver says
+   * fusion is effective at boot: a cloud orchestrator with a configured
+   * local worker leg. The tool re-checks the mode live on every call, so
+   * a provider switch mid-session degrades it to a refusal rather than
+   * needing a descriptor rebuild.
+   */
+  fusion: { enabled: boolean };
+  /**
+   * Image generation gate. `available=false` (no OpenRouter key) drops
+   * `image.generate`: until local image models can be installed
+   * (ATO-411) a call without a key could only answer "add a key". Read
+   * at rebuild time, so a key saved mid-session adds it.
+   */
+  image: { available: boolean };
+  /**
+   * Video generation gate. `available=false` (no OpenRouter key) drops
+   * `video.generate`: every clip is made on OpenRouter, so without a key
+   * a call could only answer "add a key". Read at rebuild time, like
+   * the image gate.
+   */
+  video: { available: boolean };
+  /**
+   * Screen control gate (ATO-525). `enabled=false` — the default
+   * `tools.screen.enabled`, or any host that is not macOS — drops the
+   * four `os.screen.*` descriptors. Unlike the availability gates above,
+   * the tools are then not registered either (`registerOsScreenTools`).
+   */
+  screen: { enabled: boolean };
+}
+
+/**
+ * Tool names grouped by the config switch that gates them.
+ * The list mirrors `registerMemoryTools` / `registerTaskTools` /
+ * `registerVisionTools` exactly — if a new tool is added there with
+ * a master switch, add it here too **and** to
+ * `filter-disabled-tools.test.ts`.
+ */
+const GATED_TOOLS = {
+  browser: [
+    "browser.navigate",
+    "browser.click",
+    "browser.type",
+    "browser.read_aria",
+    "browser.search",
+    "browser.tabs",
+    "browser.scroll",
+    "browser.screenshot",
+  ],
+  webSearch: ["os.web.search"],
+  vision: ["vision.describe"],
+  memoryProfile: [
+    "memory.profile.set",
+    "memory.profile.remove",
+    "memory.profile.list",
+    "memory.profile.history",
+  ],
+  memoryNotes: [
+    "memory.notes.store",
+    "memory.notes.recall",
+    "memory.notes.forget",
+  ],
+  memoryLessons: ["memory.lessons.recall"],
+  memoryProcedures: ["memory.procedures.recall"],
+  tasks: [
+    "tasks.schedule",
+    "tasks.cron",
+    "tasks.list",
+    "tasks.cancel",
+    "tasks.show",
+  ],
+  fusion: ["fusion.delegate"],
+  mcp: [
+    "mcp.resource.list",
+    "mcp.resource.read",
+    "mcp.prompt.list",
+    "mcp.prompt.get",
+  ],
+  github: [
+    "github.whoami",
+    "github.pr.list",
+    "github.pr.create",
+    "github.issue.list",
+    "github.issue.create",
+    "github.issue.comment",
+  ],
+  email: ["os.email.inbox", "os.email.send"],
+  image: ["image.generate"],
+  video: ["video.generate"],
+  screen: [
+    "os.screen.capture",
+    "os.screen.click",
+    "os.screen.type",
+    "os.screen.key",
+  ],
+} as const;
+
+/**
+ * Drop descriptors whose backing tool will not be registered at
+ * runtime under the supplied gates. Pure / total / no side effects.
+ */
+export function filterToolDescriptorsByConfig(
+  descriptors: readonly ToolDescriptor[],
+  gates: ToolGateConfig,
+): readonly ToolDescriptor[] {
+  const disabled = new Set<string>();
+
+  if (!gates.browser.enabled) {
+    for (const name of GATED_TOOLS.browser) disabled.add(name);
+  }
+  if (!gates.web.search.enabled) {
+    for (const name of GATED_TOOLS.webSearch) disabled.add(name);
+  }
+  if (!gates.vision.enabled || !gates.vision.providerAvailable) {
+    for (const name of GATED_TOOLS.vision) disabled.add(name);
+  }
+  if (!gates.memory.profile.enabled) {
+    for (const name of GATED_TOOLS.memoryProfile) disabled.add(name);
+  }
+  if (!gates.memory.notes.enabled) {
+    for (const name of GATED_TOOLS.memoryNotes) disabled.add(name);
+  }
+  if (!gates.memory.lessons.enabled) {
+    for (const name of GATED_TOOLS.memoryLessons) disabled.add(name);
+  }
+  if (!gates.memory.procedures.enabled) {
+    for (const name of GATED_TOOLS.memoryProcedures) disabled.add(name);
+  }
+  if (!gates.tasks.agentToolsEnabled) {
+    for (const name of GATED_TOOLS.tasks) disabled.add(name);
+  }
+  if (!gates.mcp.enabled) {
+    for (const name of GATED_TOOLS.mcp) disabled.add(name);
+  }
+  if (!gates.github.connected) {
+    for (const name of GATED_TOOLS.github) disabled.add(name);
+  }
+  if (!gates.email.available) {
+    for (const name of GATED_TOOLS.email) disabled.add(name);
+  }
+  if (!gates.fusion.enabled) {
+    for (const name of GATED_TOOLS.fusion) disabled.add(name);
+  }
+  if (!gates.image.available) {
+    for (const name of GATED_TOOLS.image) disabled.add(name);
+  }
+  if (!gates.video.available) {
+    for (const name of GATED_TOOLS.video) disabled.add(name);
+  }
+  if (!gates.screen.enabled) {
+    for (const name of GATED_TOOLS.screen) disabled.add(name);
+  }
+
+  if (disabled.size === 0) return descriptors;
+  return descriptors.filter((d) => !disabled.has(d.name));
+}
+
+/** Exported for tests — keep in sync with `filterToolDescriptorsByConfig`. */
+export const GATED_TOOL_NAMES = GATED_TOOLS;

@@ -1,0 +1,282 @@
+import type { AgentLoopEvent } from "../agent/agent-contract.js";
+import type { ApprovalRequest } from "../approval/approval-gate.js";
+import type { SessionState } from "../session/session-state.js";
+import { DEFAULT_RING_BUFFER_SIZE } from "./tui-state.js";
+
+/**
+ * Bookkeeping for turns the operator switched away from mid-run.
+ *
+ * The runtime needs none of this: `TurnController` already runs
+ * sessions independently (../runtime/docs/lifecycle.md), so a turn
+ * whose thread is no longer on screen simply keeps executing and saves
+ * its transcript to its own session. What the TUI must track is the
+ * abort handle — Esc in the new thread must abort nothing, switching
+ * back must make Esc work again, and quit must be able to stop every
+ * backgrounded turn.
+ *
+ * Keyed by session id: the per-session FIFO guarantees at most one
+ * orchestrator-started turn per session, so one controller per key is a
+ * structural fact rather than a hope.
+ *
+ * The live `SessionState` is parked next to the controller because the
+ * store may not know the session yet: the TUI mints its sessions
+ * deferred (`persist: false`), and the first turn writes the row only
+ * when it finishes. A thread backgrounded mid-first-turn has no row to
+ * load, so the switch-back falls back to this copy — the only one there
+ * is until the turn saves.
+ */
+export class DetachedTurns {
+  private readonly bySession = new Map<
+    string,
+    { controller: AbortController; session: SessionState }
+  >();
+
+  /** Park the running turn's controller when its thread leaves the screen. */
+  park(session: SessionState, controller: AbortController): void {
+    this.bySession.set(session.id, { controller, session });
+  }
+
+  /**
+   * The session object a backgrounded turn left the screen with, for a
+   * switch-back the store cannot answer yet (no row before the first
+   * turn saves). `null` when no turn of ours is parked on `sessionId`.
+   */
+  sessionFor(sessionId: string): SessionState | null {
+    return this.bySession.get(sessionId)?.session ?? null;
+  }
+
+  /**
+   * Remove and return the controller parked for `sessionId`, if any —
+   * the switch-back re-attach. `null` means no backgrounded turn of
+   * ours runs there (idle, or a turn from another origin).
+   */
+  take(sessionId: string): AbortController | null {
+    const entry = this.bySession.get(sessionId);
+    if (!entry) return null;
+    this.bySession.delete(sessionId);
+    return entry.controller;
+  }
+
+  /** Is one of our backgrounded turns still running on `sessionId`? */
+  has(sessionId: string): boolean {
+    return this.bySession.has(sessionId);
+  }
+
+  /**
+   * Drop the entry for `sessionId` only if it still holds `controller`
+   * — the turn finished while parked. The identity check keeps a
+   * finished turn from releasing a successor parked under the same key.
+   * Returns whether an entry was released, so the caller can run its
+   * end-of-background-turn cleanup exactly once.
+   */
+  release(sessionId: string, controller: AbortController): boolean {
+    if (this.bySession.get(sessionId)?.controller !== controller) return false;
+    this.bySession.delete(sessionId);
+    return true;
+  }
+
+  get size(): number {
+    return this.bySession.size;
+  }
+
+  /** Abort every parked turn — quit / shutdown teardown. */
+  abortAll(): void {
+    for (const { controller } of this.bySession.values()) controller.abort();
+    this.bySession.clear();
+  }
+}
+
+/**
+ * Rolling per-session log of the agent events emitted by a turn this
+ * TUI started, kept so switching back into a detached thread can
+ * repaint what the turn has said so far. `session_switched` rebuilds
+ * the transcript from the STORED session, and a running turn saves only
+ * when it finishes — so a thread backgrounded mid-first-turn would
+ * otherwise reload as an empty page holding nothing but a spinner, the
+ * operator's own prompt included.
+ *
+ * Recording starts when the turn starts, not when it is detached: the
+ * switch-back wipes everything that was painted before the operator
+ * left, so a replay must cover the whole turn, not just the away span.
+ *
+ * Bounded per session at the transcript's own ring size
+ * (`DEFAULT_RING_BUFFER_SIZE`). On overflow the OLDEST events are
+ * dropped and counted; the replay announces the gap instead of passing
+ * the reconstruction off as whole, and the end-of-turn re-emit from the
+ * saved session restores the authoritative transcript regardless.
+ *
+ * The cap counts events, and a streamed reply is one event per token:
+ * left as they arrive, the deltas of an ordinary answer filled the ring
+ * on their own and pushed the operator's prompt and the turn's first
+ * steps out of it, so a switch-back mid-reply came back to a gap notice
+ * over half a sentence. Adjacent deltas of one stream are therefore
+ * stored as one event — replaying the joined text paints exactly what
+ * replaying the pieces did — and the prompt, once it reaches the head
+ * of the log, is the one event an overflow never takes.
+ */
+export class TurnEventBuffer {
+  private readonly bySession = new Map<
+    string,
+    { events: AgentLoopEvent[]; dropped: number }
+  >();
+
+  /** Start (or restart) recording the turn running on `sessionId`. */
+  begin(sessionId: string): void {
+    this.bySession.set(sessionId, { events: [], dropped: 0 });
+  }
+
+  /** Append one event; a no-op for sessions not being recorded. */
+  record(sessionId: string, event: AgentLoopEvent): void {
+    const log = this.bySession.get(sessionId);
+    if (!log) return;
+    const last = log.events.length - 1;
+    const joined = joinStreamDeltas(log.events[last], event);
+    if (joined) {
+      log.events[last] = joined;
+      return;
+    }
+    if (log.events.length >= DEFAULT_RING_BUFFER_SIZE) {
+      log.events.splice(log.events[0]?.type === "user_message" ? 1 : 0, 1);
+      log.dropped += 1;
+    }
+    log.events.push(event);
+  }
+
+  /** Everything recorded so far, or `null` when nothing is recording. */
+  snapshot(
+    sessionId: string,
+  ): { events: readonly AgentLoopEvent[]; dropped: number } | null {
+    const log = this.bySession.get(sessionId);
+    if (!log) return null;
+    return { events: [...log.events], dropped: log.dropped };
+  }
+
+  /** The turn ended — the saved session answers for it from here on. */
+  end(sessionId: string): void {
+    this.bySession.delete(sessionId);
+  }
+}
+
+/**
+ * `next` folded into `last` when both are pieces of the same stream —
+ * the reply text, or one step's reasoning — else `null`. Built fresh:
+ * the recorded events are the ones the reducer was handed.
+ */
+function joinStreamDeltas(
+  last: AgentLoopEvent | undefined,
+  next: AgentLoopEvent,
+): AgentLoopEvent | null {
+  if (last?.type !== "llm_event" || next.type !== "llm_event") return null;
+  const a = last.event;
+  const b = next.event;
+  if (a.type === "assistant_delta" && b.type === "assistant_delta") {
+    return {
+      type: "llm_event",
+      event: { type: "assistant_delta", text: a.text + b.text },
+    };
+  }
+  if (
+    a.type === "reasoning_delta" &&
+    b.type === "reasoning_delta" &&
+    a.stepIndex === b.stepIndex
+  ) {
+    return {
+      type: "llm_event",
+      event: {
+        type: "reasoning_delta",
+        stepIndex: a.stepIndex,
+        text: a.text + b.text,
+      },
+    };
+  }
+  return null;
+}
+
+/** The switch-back replay lost its head to the ring cap. */
+export function formatReplayGapNotice(dropped: number): string {
+  return `re-attached mid-turn — the earliest ${dropped} event${
+    dropped === 1 ? "" : "s"
+  } of this turn no longer fit the replay buffer and were dropped; the full transcript returns when the turn finishes`;
+}
+
+/**
+ * A session that is not on screen is parked on an approval. The request
+ * stays pending at the gate — keys must never answer for an off-screen
+ * thread — so the visible transcript gets this pointer instead, and
+ * switching into the owner re-raises the actual prompt.
+ */
+export function formatBackgroundApprovalNotice(
+  request: ApprovalRequest,
+): string {
+  return `session ${request.sessionId} is waiting for an approval (${request.tool}) — switch to it to answer; its turn is paused until you do`;
+}
+
+/**
+ * A session that is not on screen has parked its turn on a provider that
+ * stopped answering. The full notice waits in that thread (the
+ * switch-back replays it); the visible one gets the pointer.
+ */
+export function formatBackgroundProviderWaitNotice(sessionId: string): string {
+  return `session ${sessionId} is paused: its model is not answering, and the turn retries by itself — switch to it to watch or stop it`;
+}
+
+/**
+ * Decision reason recorded when a switch-away denies a pending
+ * approval. The blocked tool call reports it back to the model, so it
+ * is written for the model to act on, not only for the operator.
+ */
+export const SWITCHED_AWAY_APPROVAL_REASON =
+  "the operator switched to another session before answering — ask again if the action is still needed";
+
+/** One-row preview for a message being dropped: flattened and elided. */
+export function droppedPreview(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= 60 ? flat : `${flat.slice(0, 59)}…`;
+}
+
+/** Announce the detach itself, in the transcript being switched to. */
+export function formatDetachedTurnNotice(sessionId: string): string {
+  return `the running turn continues in the background on session ${sessionId} — switch back to watch or stop it`;
+}
+
+/** A backgrounded turn completed; its reply lives in its own thread. */
+export function formatBackgroundTurnFinished(sessionId: string): string {
+  return `background turn finished on session ${sessionId} — open it from the sidebar to read the reply`;
+}
+
+/** A backgrounded turn failed; name the thread so the error reads right. */
+export function formatBackgroundTurnFailed(
+  sessionId: string,
+  message: string,
+): string {
+  return `background turn on session ${sessionId} failed: ${message}`;
+}
+
+/**
+ * Steers a backgrounded turn accepted but never delivered. They cannot
+ * be re-queued — the visible queue now feeds another thread — so the
+ * drop is announced with previews, the same shape as the abort path.
+ */
+export function formatDroppedSteersNotice(
+  sessionId: string,
+  undelivered: readonly string[],
+): string {
+  return [
+    `background turn on session ${sessionId} ended before reading ${
+      undelivered.length
+    } steering message${undelivered.length === 1 ? "" : "s"} — dropped:`,
+    ...undelivered.map((text, i) => `  ${i + 1}. ${droppedPreview(text)}`),
+  ].join("\n");
+}
+
+/** Parked messages dropped because the operator switched threads. */
+export function formatDroppedQueueOnSwitchNotice(
+  dropped: readonly string[],
+): string {
+  return [
+    `switched away: dropped ${dropped.length} parked message${
+      dropped.length === 1 ? "" : "s"
+    } aimed at the previous session`,
+    ...dropped.map((text, i) => `  ${i + 1}. ${droppedPreview(text)}`),
+  ].join("\n");
+}

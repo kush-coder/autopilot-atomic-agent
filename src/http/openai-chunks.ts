@@ -1,0 +1,157 @@
+import type { RunTurnResult } from "../agent/agent-contract.js";
+import {
+  isFinalReplyTurn,
+  isStoppedTurnMarker,
+} from "../session/conversation-turn.js";
+
+/**
+ * Builders for OpenAI-compatible `chat.completion` / `chat.completion.chunk`
+ * payloads. Shapes mirror hermes-agent `_ConfigRoutes._build_stream_chunk`
+ * and `_build_usage_payload` so any client library that already groks the
+ * hermes gateway will work unchanged against atomic-agent.
+ */
+
+export interface ChatChoiceDelta {
+  role?: "assistant";
+  content?: string;
+  [key: string]: unknown;
+}
+
+export interface UsagePayload {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface StreamChunkInput {
+  completionId: string;
+  created: number;
+  model: string;
+  delta?: ChatChoiceDelta;
+  finishReason?: "stop" | "length" | "cancelled" | null;
+  /**
+   * `null` when the request set `stream_options.include_usage`: OpenAI
+   * then sends `usage: null` on every chunk before the usage chunk.
+   */
+  usage?: UsagePayload | null;
+  extra?: Record<string, unknown>;
+}
+
+export interface StreamChunk {
+  id: string;
+  object: "chat.completion.chunk";
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    delta: ChatChoiceDelta;
+    finish_reason: "stop" | "length" | "cancelled" | null;
+  }>;
+  usage?: UsagePayload | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Build a single OpenAI `chat.completion.chunk` envelope. A non-null
+ * `finishReason` signals the last non-[DONE] chunk; callers are expected
+ * to write `data: [DONE]\n\n` themselves after the final usage/stop
+ * chunk, matching OpenAI's own SSE protocol.
+ */
+export function buildStreamChunk(input: StreamChunkInput): StreamChunk {
+  const chunk: StreamChunk = {
+    id: input.completionId,
+    object: "chat.completion.chunk",
+    created: input.created,
+    model: input.model,
+    choices: [
+      {
+        index: 0,
+        delta: input.delta ?? {},
+        finish_reason: input.finishReason ?? null,
+      },
+    ],
+  };
+  if (input.usage !== undefined) chunk.usage = input.usage;
+  if (input.extra) Object.assign(chunk, input.extra);
+  return chunk;
+}
+
+/**
+ * Derive a usage payload from the final turn outcome: the tokens every
+ * LLM call of the turn reported, summed (`RunTurnResult.usage`, from the
+ * runtime's turn usage meter). A turn whose provider reported no usage
+ * still gets zeros, so the response stays schema-valid.
+ */
+export function buildUsagePayload(result: RunTurnResult): UsagePayload {
+  const prompt = result.usage?.promptTokens ?? 0;
+  const completion = result.usage?.completionTokens ?? 0;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+  };
+}
+
+export interface UsageChunk {
+  id: string;
+  object: "chat.completion.chunk";
+  created: number;
+  model: string;
+  choices: [];
+  usage: UsagePayload;
+}
+
+/**
+ * The extra chunk OpenAI streams when a request sets
+ * `stream_options.include_usage`: sent after the finish chunk and before
+ * `data: [DONE]`, with an empty `choices` array and the whole request's
+ * `usage`.
+ */
+export function buildUsageChunk(input: {
+  completionId: string;
+  created: number;
+  model: string;
+  usage: UsagePayload;
+}): UsageChunk {
+  return {
+    id: input.completionId,
+    object: "chat.completion.chunk",
+    created: input.created,
+    model: input.model,
+    choices: [],
+    usage: input.usage,
+  };
+}
+
+export interface FinalMessagePayload {
+  message: { role: "assistant"; content: string };
+  finish_reason: "stop" | "length" | "cancelled";
+}
+
+/**
+ * Pull the final assistant turn out of a `RunTurnResult` so the
+ * non-streaming handler can return a standard `chat.completion`
+ * response. If the loop ended via `cancelled` / `max_steps` we still
+ * return whatever text the model (or fallback) produced, labelled with
+ * the matching finish_reason. A progress note — a reply the model batched
+ * with work while the turn went on — is not the answer and is skipped.
+ * Nor is the marker a stopped turn ends on: it is the model's note that
+ * the request was stopped, not a message for the client, and the reply
+ * before it answered an earlier request — a stopped turn has no content.
+ */
+export function buildFinalAssistantPayload(
+  result: RunTurnResult,
+): FinalMessagePayload {
+  const lastReply = [...result.session.turns].reverse().find(isFinalReplyTurn);
+  const content =
+    lastReply === undefined || isStoppedTurnMarker(lastReply)
+      ? ""
+      : lastReply.text;
+  let finishReason: FinalMessagePayload["finish_reason"] = "stop";
+  if (result.reason === "cancelled") finishReason = "cancelled";
+  else if (result.reason === "max_steps") finishReason = "length";
+  return {
+    message: { role: "assistant", content },
+    finish_reason: finishReason,
+  };
+}

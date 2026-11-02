@@ -1,0 +1,325 @@
+import { describe, expect, it } from "vitest";
+
+import { ConfigValidationError } from "./config-validation-error.js";
+import {
+  DEFAULT_FUSION_REVIEW_STALL_STEPS,
+  DEFAULT_FUSION_WORKERS,
+  FUSION_REVIEW_STALL_STEPS_MAX,
+  FUSION_WORKERS_MAX,
+  FUSION_WORKERS_MIN,
+  parseLlmRunModeConfig,
+  scrubRunModeProviderPins,
+} from "./llm-run-mode-config.js";
+
+const providers = [
+  { id: "local-llama", kind: "llama-server" },
+  { id: "openrouter", kind: "openrouter" },
+  { id: "claude-cli", kind: "subscription-cli" },
+];
+
+describe("parseLlmRunModeConfig", () => {
+  it("accepts an empty block", () => {
+    expect(parseLlmRunModeConfig({}, providers, "llm.runMode")).toEqual({});
+  });
+
+  it.each(["local", "cloud", "fusion"] as const)("accepts mode %s", (mode) => {
+    expect(parseLlmRunModeConfig({ mode }, providers, "llm.runMode")).toEqual({
+      mode,
+    });
+  });
+
+  it("rejects an unknown mode", () => {
+    expect(() =>
+      parseLlmRunModeConfig({ mode: "hybrid" }, providers, "llm.runMode"),
+    ).toThrow(ConfigValidationError);
+    expect(() =>
+      parseLlmRunModeConfig({ mode: "hybrid" }, providers, "llm.runMode"),
+    ).toThrow(/llm\.runMode\.mode/);
+  });
+
+  it("rejects a non-object block", () => {
+    expect(() =>
+      parseLlmRunModeConfig("fusion", providers, "llm.runMode"),
+    ).toThrow(/expected object/);
+    expect(() => parseLlmRunModeConfig([], providers, "llm.runMode")).toThrow(
+      /expected object/,
+    );
+  });
+
+  it("round-trips a full fusion block", () => {
+    const fusion = {
+      orchestratorProvider: "openrouter",
+      orchestratorModel: "anthropic/claude-sonnet-4.5",
+      workerProvider: "local-llama",
+      workerModel: "qwen-3.5-4b",
+      workers: 4,
+      cloudWorkers: 6,
+      workerMaxSteps: 25,
+      workerTimeoutMs: 120_000,
+    };
+    expect(
+      parseLlmRunModeConfig(
+        { mode: "fusion", fusion },
+        providers,
+        "llm.runMode",
+      ),
+    ).toEqual({
+      mode: "fusion",
+      fusion,
+    });
+  });
+
+  it("omits fusion keys that were not given", () => {
+    const parsed = parseLlmRunModeConfig(
+      { fusion: { workers: 3 } },
+      providers,
+      "llm.runMode",
+    );
+    expect(parsed).toEqual({ fusion: { workers: 3 } });
+    expect("orchestratorProvider" in (parsed.fusion ?? {})).toBe(false);
+  });
+
+  it("accepts a subscription-cli provider as the orchestrator", () => {
+    expect(
+      parseLlmRunModeConfig(
+        { fusion: { orchestratorProvider: "claude-cli" } },
+        providers,
+        "llm.runMode",
+      ),
+    ).toEqual({ fusion: { orchestratorProvider: "claude-cli" } });
+  });
+
+  it("accepts either kind on either leg", () => {
+    // The schema does not refuse a file, it refuses to BOOT on one, so
+    // a pairing it dislikes leaves the operator hand-editing JSON to
+    // start the app. Which model orchestrates and which executes is a
+    // choice; the schema's job is only that both ids exist.
+    const swapped = parseLlmRunModeConfig(
+      {
+        fusion: {
+          orchestratorProvider: "local-llama",
+          workerProvider: "openrouter",
+        },
+      },
+      providers,
+      "llm.runMode",
+    );
+    expect(swapped.fusion).toMatchObject({
+      orchestratorProvider: "local-llama",
+      workerProvider: "openrouter",
+    });
+  });
+
+  it("rejects a pin to a provider that is not configured", () => {
+    expect(() =>
+      parseLlmRunModeConfig(
+        { fusion: { orchestratorProvider: "nope" } },
+        providers,
+        "llm.runMode",
+      ),
+    ).toThrow(/unknown provider id "nope"/);
+    expect(() =>
+      parseLlmRunModeConfig(
+        { fusion: { workerProvider: "" } },
+        providers,
+        "llm.runMode",
+      ),
+    ).toThrow(/expected non-empty string/);
+  });
+
+  it.each([0, 9, 2.5, "3", -1])("rejects workers = %s", (workers) => {
+    expect(() =>
+      parseLlmRunModeConfig({ fusion: { workers } }, providers, "llm.runMode"),
+    ).toThrow(/llm\.runMode\.fusion\.workers/);
+  });
+
+  it("accepts the worker-count bounds", () => {
+    for (const workers of [FUSION_WORKERS_MIN, FUSION_WORKERS_MAX]) {
+      expect(
+        parseLlmRunModeConfig({ fusion: { workers } }, providers, "llm.runMode")
+          .fusion?.workers,
+      ).toBe(workers);
+    }
+    expect(DEFAULT_FUSION_WORKERS).toBeGreaterThanOrEqual(FUSION_WORKERS_MIN);
+    expect(DEFAULT_FUSION_WORKERS).toBeLessThanOrEqual(FUSION_WORKERS_MAX);
+  });
+
+  it("bounds the worker step and time ceilings", () => {
+    expect(() =>
+      parseLlmRunModeConfig(
+        { fusion: { workerMaxSteps: 0 } },
+        providers,
+        "llm.runMode",
+      ),
+    ).toThrow(/workerMaxSteps/);
+    expect(() =>
+      parseLlmRunModeConfig(
+        { fusion: { workerTimeoutMs: 10 } },
+        providers,
+        "llm.runMode",
+      ),
+    ).toThrow(/workerTimeoutMs/);
+  });
+
+  it("rejects an empty model label", () => {
+    expect(() =>
+      parseLlmRunModeConfig(
+        { fusion: { orchestratorModel: "" } },
+        providers,
+        "llm.runMode",
+      ),
+    ).toThrow(/orchestratorModel/);
+  });
+});
+
+describe("scrubRunModeProviderPins", () => {
+  it("returns the block untouched when nothing points at the removed id", () => {
+    const block = {
+      mode: "fusion" as const,
+      fusion: { orchestratorProvider: "openrouter" },
+    };
+    expect(scrubRunModeProviderPins(block, "groq")).toBe(block);
+    expect(scrubRunModeProviderPins(undefined, "groq")).toBeUndefined();
+    const noFusion = { mode: "cloud" as const };
+    expect(scrubRunModeProviderPins(noFusion, "openrouter")).toBe(noFusion);
+  });
+
+  it("drops only the pin that names the removed provider", () => {
+    const block = {
+      mode: "fusion" as const,
+      fusion: {
+        orchestratorProvider: "openrouter",
+        workerProvider: "local-llama",
+        workers: 3,
+      },
+    };
+    expect(scrubRunModeProviderPins(block, "openrouter")).toEqual({
+      mode: "fusion",
+      fusion: { workerProvider: "local-llama", workers: 3 },
+    });
+    expect(scrubRunModeProviderPins(block, "local-llama")).toEqual({
+      mode: "fusion",
+      fusion: { orchestratorProvider: "openrouter", workers: 3 },
+    });
+  });
+
+  it("drops a leg's model pin together with its provider pin", () => {
+    const block = {
+      mode: "fusion" as const,
+      fusion: {
+        orchestratorProvider: "openrouter",
+        orchestratorModel: "anthropic/claude-sonnet-4.5",
+        workerProvider: "local-llama",
+        workerModel: "qwen-3.5-4b",
+      },
+    };
+    expect(scrubRunModeProviderPins(block, "openrouter")).toEqual({
+      mode: "fusion",
+      fusion: { workerProvider: "local-llama", workerModel: "qwen-3.5-4b" },
+    });
+    expect(scrubRunModeProviderPins(block, "local-llama")).toEqual({
+      mode: "fusion",
+      fusion: {
+        orchestratorProvider: "openrouter",
+        orchestratorModel: "anthropic/claude-sonnet-4.5",
+      },
+    });
+  });
+
+  it("keeps a model pin whose leg was never pinned to a provider", () => {
+    const block = {
+      mode: "fusion" as const,
+      fusion: { workerProvider: "local-llama", orchestratorModel: "gpt-5" },
+    };
+    expect(scrubRunModeProviderPins(block, "local-llama")).toEqual({
+      mode: "fusion",
+      fusion: { orchestratorModel: "gpt-5" },
+    });
+  });
+});
+
+describe("cloudWorkers (F21)", () => {
+  const providers = [
+    { id: "openrouter", kind: "openrouter" },
+    { id: "local-llama", kind: "llama-server" },
+  ];
+  it("is optional and bounded 1..32", () => {
+    expect(
+      parseLlmRunModeConfig({ fusion: { cloudWorkers: 8 } }, providers, "llm.runMode")
+        .fusion?.cloudWorkers,
+    ).toBe(8);
+    expect(
+      parseLlmRunModeConfig({ fusion: {} }, providers, "llm.runMode").fusion
+        ?.cloudWorkers,
+    ).toBeUndefined();
+    for (const bad of [0, 33, 2.5, "4"]) {
+      expect(() =>
+        parseLlmRunModeConfig(
+          { fusion: { cloudWorkers: bad } },
+          providers,
+          "llm.runMode",
+        ),
+      ).toThrow(/llm\.runMode\.fusion\.cloudWorkers/);
+    }
+  });
+});
+
+describe("workerReasoning / workerMaxOutputTokens (F20)", () => {
+  const providers = [
+    { id: "openrouter", kind: "openrouter" },
+    { id: "local-llama", kind: "llama-server" },
+  ];
+  it("are optional, and validated when present", () => {
+    const parsed = parseLlmRunModeConfig(
+      { fusion: { workerReasoning: "low", workerMaxOutputTokens: 12_000 } },
+      providers,
+      "llm.runMode",
+    );
+    expect(parsed.fusion).toEqual({ workerReasoning: "low", workerMaxOutputTokens: 12_000 });
+    expect(parseLlmRunModeConfig({ fusion: {} }, providers, "llm.runMode").fusion).toEqual({});
+    expect(() =>
+      parseLlmRunModeConfig({ fusion: { workerReasoning: "max" } }, providers, "llm.runMode"),
+    ).toThrow(/llm\.runMode\.fusion\.workerReasoning/);
+    for (const bad of [0, -1, 2.5, "8192", 1_000_001]) {
+      expect(() =>
+        parseLlmRunModeConfig(
+          { fusion: { workerMaxOutputTokens: bad } },
+          providers,
+          "llm.runMode",
+        ),
+      ).toThrow(/llm\.runMode\.fusion\.workerMaxOutputTokens/);
+    }
+  });
+});
+
+describe("reviewStallSteps (F41)", () => {
+  const providers = [
+    { id: "openrouter", kind: "openrouter" },
+    { id: "local-llama", kind: "llama-server" },
+  ];
+  it("is optional, accepts 0 (off) and an integer up to the ceiling, and names the field otherwise", () => {
+    expect(
+      parseLlmRunModeConfig({ fusion: {} }, providers, "llm.runMode").fusion
+        ?.reviewStallSteps,
+    ).toBeUndefined();
+    for (const good of [0, 1, 6, FUSION_REVIEW_STALL_STEPS_MAX]) {
+      expect(
+        parseLlmRunModeConfig(
+          { fusion: { reviewStallSteps: good } },
+          providers,
+          "llm.runMode",
+        ).fusion?.reviewStallSteps,
+      ).toBe(good);
+    }
+    for (const bad of [-1, 2.5, "6", FUSION_REVIEW_STALL_STEPS_MAX + 1]) {
+      expect(() =>
+        parseLlmRunModeConfig(
+          { fusion: { reviewStallSteps: bad } },
+          providers,
+          "llm.runMode",
+        ),
+      ).toThrow(/llm\.runMode\.fusion\.reviewStallSteps/);
+    }
+    expect(DEFAULT_FUSION_REVIEW_STALL_STEPS).toBe(6);
+  });
+});

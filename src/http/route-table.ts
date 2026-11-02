@@ -1,0 +1,238 @@
+import { createSessionCompactionHandler } from "./route-compaction.js";
+import type { RouteDefinition } from "./http-server.js";
+
+import { createChatCompletionsHandler } from "./openai-chat-completions.js";
+import { createCancelCompletionHandler } from "./openai-completions-cancel.js";
+import { createHealthHandler } from "./route-health.js";
+import { createLocalModelRecheckHandler } from "./route-local-model-recheck.js";
+import { createModelsHandler } from "./route-models.js";
+import { createCapabilitiesHandler } from "./route-capabilities.js";
+import {
+  createGetConfigHandler,
+  createPatchConfigHandler,
+  createPutConfigHandler,
+} from "./route-config.js";
+import {
+  createGetSkillHandler,
+  createInstallSkillHandler,
+  createListSkillsHandler,
+  createUninstallSkillHandler,
+} from "./route-skills.js";
+import {
+  createProjectTrustAnswerHandler,
+  createProjectTrustStatusHandler,
+} from "./route-project-trust.js";
+import {
+  createAckUndeliveredSteersHandler,
+  createDeleteSessionHandler,
+  createGetSessionHandler,
+  createGetUndeliveredSteersHandler,
+  createListSessionsHandler,
+  createSteerSessionHandler,
+} from "./route-sessions.js";
+import { createRenameSessionHandler } from "./route-session-title.js";
+import {
+  createApprovalEventsHandler,
+  createResolveApprovalHandler,
+} from "./route-approval.js";
+import {
+  createCancelTaskHandler,
+  createCreateTaskHandler,
+  createDrainTasksHandler,
+  createGetTaskHandler,
+  createListTasksHandler,
+  createRunTaskHandler,
+} from "./route-tasks.js";
+import { createWebhookHandler } from "./route-webhooks.js";
+import { createCodingModeHandlers } from "./route-coding-mode.js";
+import { createContextPreviewHandler } from "./route-context-preview.js";
+import {
+  createRestartMcpServerHandler,
+  createSetMcpServerEnabledHandler,
+} from "./route-mcp.js";
+import { createTelegramPairingHandlers } from "./route-telegram-pairing.js";
+import { createSetActiveLlmHandler } from "./route-llm-active.js";
+import { createPanelPageHandler, createPanelScriptHandler } from "./route-panel.js";
+import { createSetSessionWorkingDirHandler } from "./session-working-dir.js";
+import { createReconnectMemoryEmbeddingsHandler } from "./route-memory-embeddings.js";
+import { createTelegramChannelHandler } from "./route-telegram-channel.js";
+
+/**
+ * Build the full atomic-agent HTTP route table. All handlers are
+ * instantiated here so the serve command only needs to hand the
+ * runtime to `createHttpServer`. Unauthenticated routes are the
+ * minimum set an OpenAI SDK probes before attempting auth: `/health`
+ * and `/v1/models`.
+ */
+export function buildRouteTable(): RouteDefinition[] {
+  // One closure for the GET and the POST: the coding mode is per-process
+  // state, and the live switches cannot be read back as the mode that
+  // set them (see route-coding-mode.ts `inferMode`).
+  const codingMode = createCodingModeHandlers();
+  // Same reason: the last pairing window's outcome is per-process state
+  // the GET reads back after the POST opened it.
+  const telegramPairing = createTelegramPairingHandlers();
+  return [
+    {
+      method: "GET",
+      path: "/health",
+      handler: createHealthHandler(),
+      requiresAuth: false,
+    },
+    {
+      method: "GET",
+      path: "/v1/models",
+      handler: createModelsHandler(),
+      requiresAuth: false,
+    },
+    // ATO-1128: the phone panel's page; it holds no data and asks for the key (route-panel.ts).
+    { method: "GET", path: "/panel", handler: createPanelPageHandler(), requiresAuth: false },
+    { method: "GET", path: "/panel/app.js", handler: createPanelScriptHandler(), requiresAuth: false },
+    {
+      method: "POST",
+      path: "/v1/chat/completions",
+      handler: createChatCompletionsHandler(),
+    },
+    {
+      method: "POST",
+      path: "/v1/chat/completions/{completion_id}/cancel",
+      handler: createCancelCompletionHandler(),
+    },
+    {
+      method: "GET",
+      path: "/api/capabilities",
+      handler: createCapabilitiesHandler(),
+    },
+    { method: "POST", path: "/api/sessions/{id}/compact", handler: createSessionCompactionHandler(true) },
+    { method: "GET", path: "/api/sessions/{id}/compaction", handler: createSessionCompactionHandler(false) },
+    { method: "GET", path: "/api/config", handler: createGetConfigHandler() },
+    {
+      method: "PATCH",
+      path: "/api/config",
+      handler: createPatchConfigHandler(),
+    },
+    // ATO-1022: the desktop's whole-file write, without an `atag config set` process.
+    { method: "PUT", path: "/api/config", handler: createPutConfigHandler() },
+    { method: "GET", path: "/api/skills", handler: createListSkillsHandler() },
+    {
+      method: "GET",
+      path: "/api/skills/{name}",
+      handler: createGetSkillHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/skills/install",
+      handler: createInstallSkillHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/skills/uninstall",
+      handler: createUninstallSkillHandler(),
+    },
+    { method: "GET", path: "/api/project-trust", handler: createProjectTrustStatusHandler() },
+    { method: "POST", path: "/api/project-trust", handler: createProjectTrustAnswerHandler() },
+    {
+      method: "POST",
+      path: "/api/mcp/servers/{name}/restart",
+      handler: createRestartMcpServerHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/mcp/servers/{name}/enable",
+      handler: createSetMcpServerEnabledHandler(true),
+    },
+    {
+      method: "POST",
+      path: "/api/mcp/servers/{name}/disable",
+      handler: createSetMcpServerEnabledHandler(false),
+    },
+    {
+      method: "GET",
+      path: "/api/sessions",
+      handler: createListSessionsHandler(),
+    },
+    {
+      method: "GET",
+      path: "/api/sessions/{id}",
+      handler: createGetSessionHandler(),
+    },
+    {
+      method: "DELETE",
+      path: "/api/sessions/{id}",
+      handler: createDeleteSessionHandler(),
+    },
+    {
+      method: "PATCH",
+      path: "/api/sessions/{id}",
+      handler: createRenameSessionHandler(),
+    },
+    // ATO-731: one chat's folder, changed without restarting serve.
+    { method: "POST", path: "/api/sessions/{id}/working-dir", handler: createSetSessionWorkingDirHandler() },
+    {
+      method: "POST",
+      path: "/api/sessions/{id}/steer",
+      handler: createSteerSessionHandler(),
+    },
+    {
+      method: "GET",
+      path: "/api/sessions/{id}/steer",
+      handler: createGetUndeliveredSteersHandler(),
+    },
+    {
+      method: "DELETE",
+      path: "/api/sessions/{id}/steer",
+      handler: createAckUndeliveredSteersHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/approval/resolve",
+      handler: createResolveApprovalHandler(),
+    },
+    {
+      method: "GET",
+      path: "/api/events",
+      handler: createApprovalEventsHandler(),
+    },
+    // The two routes the desktop needs and the TUI does not: the coding-mode
+    // stance it projects onto the approval ladder, and the context figure it
+    // shows before the first message of a session.
+    { method: "GET", path: "/api/coding-mode", handler: codingMode.get },
+    { method: "POST", path: "/api/coding-mode", handler: codingMode.set },
+    { method: "POST", path: "/api/context-preview", handler: createContextPreviewHandler() },
+    // ATO-873: the desktop's Reconnect button after a local server answered 404/405.
+    { method: "POST", path: "/api/local-model/recheck", handler: createLocalModelRecheckHandler() },
+    // ATO-1021: the desktop's model pick, swapped live instead of restarting serve.
+    { method: "POST", path: "/api/llm/active", handler: createSetActiveLlmHandler() },
+    // ATO-1024: the desktop starts serve first and attaches the embedding server once it is up.
+    { method: "POST", path: "/api/memory/embeddings/reconnect", handler: createReconnectMemoryEmbeddingsHandler() },
+    // ATO-859: pairing the Telegram owner from the desktop; the code is in the POST's reply only.
+    { method: "POST", path: "/api/telegram/pairing", handler: telegramPairing.start },
+    { method: "GET", path: "/api/telegram/pairing", handler: telegramPairing.status },
+    { method: "DELETE", path: "/api/telegram/pairing", handler: telegramPairing.cancel },
+    // ATO-758: the channel's state, and another poller of the same bot when that is what holds it off.
+    { method: "GET", path: "/api/telegram/channel", handler: createTelegramChannelHandler() },
+    { method: "POST", path: "/api/tasks", handler: createCreateTaskHandler() },
+    { method: "GET", path: "/api/tasks", handler: createListTasksHandler() },
+    { method: "GET", path: "/api/tasks/{id}", handler: createGetTaskHandler() },
+    {
+      method: "DELETE",
+      path: "/api/tasks/{id}",
+      handler: createCancelTaskHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/tasks/{id}/run",
+      handler: createRunTaskHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/tasks/drain",
+      handler: createDrainTasksHandler(),
+    },
+    {
+      method: "POST",
+      path: "/api/webhooks/{name}",
+      handler: createWebhookHandler(),
+    },
+  ];
+}

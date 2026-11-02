@@ -1,0 +1,58 @@
+export {
+  planUninstallTargets,
+  installDirFor,
+  isInstalledBinary,
+  isSafeToRemove,
+  type UninstallTarget,
+  type UninstallTargetGroup,
+  type UninstallPlanInput,
+} from "./uninstall-targets.js";
+export {
+  measureUninstallPlan,
+  formatBytes,
+  type MeasuredPlan,
+  type MeasuredTarget,
+} from "./measure-uninstall-plan.js";
+export {
+  stripInstallerPathLine,
+  INSTALLER_PATH_MARKER,
+  type StripResult,
+} from "./strip-installer-path-line.js";
+export {
+  runUninstall,
+  installerRcCandidates,
+  type RunUninstallOptions,
+  type UninstallResult,
+  type RemovalOutcome,
+} from "./run-uninstall.js";
+export { packagedUninstallNotice } from "./package-notice.js";
+export {
+  resolveUninstallPlan,
+  pathEntryToRemove,
+  type ResolvedUninstallPlan,
+  type ResolveUninstallPlanOptions,
+} from "./resolve-uninstall-plan.js";
+export {
+  removeUserPathEntry,
+  createUserPathStore,
+  type UserPathStore,
+  type RemovePathEntryResult,
+} from "./windows-user-path.js";
+export {
+  detectDesktopSharing,
+  noDesktopSharing,
+  type DesktopSharing,
+  type DesktopSignal,
+  type DetectDesktopSharingInput,
+} from "./detect-desktop-sharing.js";
+export {
+  DESKTOP_SHARED_WARNING,
+  DESKTOP_DATA_QUESTION,
+  desktopDataKeptNotice,
+  legacyDesktopDirNotice,
+  desktopWarningApplies,
+} from "./desktop-notices.js";
+export {
+  plansToDeleteDesktopData,
+  keepDesktopData,
+} from "./desktop-data-policy.js";

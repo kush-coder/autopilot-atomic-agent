@@ -1,0 +1,1343 @@
+import { describe, expect, it } from "vitest";
+
+import type { AgentLoopEvent } from "../../agent/agent-loop.js";
+import { attachFailedAttempts } from "../../llm/fallback/failed-attempts.js";
+import { attachGenerationId } from "../../llm/provider/openai/generation-id.js";
+import { TransportError } from "../../llm/reliability/llm-failures.js";
+
+import { createTraceRecorder } from "./trace-recorder.js";
+import type { TraceEvent } from "./trace-event.js";
+
+function collector(): {
+  events: TraceEvent[];
+  emit: (event: TraceEvent) => void;
+} {
+  const events: TraceEvent[] = [];
+  return { events, emit: (event) => events.push(event) };
+}
+
+describe("createTraceRecorder", () => {
+  const now = (): number => 1000;
+  it("records compaction progress without starting an inference step or turn", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-compact", emit, now });
+    rec.onAgentEvent({ type: "compaction_progress", sessionId: "s-compact", chunk: 2, chunks: 5, completedChunks: 1, sourceTokens: 50000 });
+    expect(events).toEqual([{ type: "compaction_progress", sessionId: "s-compact", chunk: 2, chunks: 5, completedChunks: 1, sourceTokens: 50000, seq: 0, ts: 1000 }]);
+  });
+
+  it("emits session_started with monotonic seq starting at 0", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-1", emit, now });
+    rec.beginSession({ workingDir: "/w", metadata: { source: "cli" } });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "session_started",
+      sessionId: "s-1",
+      seq: 0,
+      ts: 1000,
+      workingDir: "/w",
+      metadata: { source: "cli" },
+    });
+  });
+
+  it("writes the noted route onto the next turn_started only", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-route", emit, now });
+    const route = {
+      mode: "cloud" as const,
+      main: { providerId: "aimlapi", model: "anthropic/claude-sonnet-5" },
+      worker: null,
+    };
+    rec.noteTurnRoute(route);
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 } as AgentLoopEvent);
+    // A turn nobody noted a route for must not inherit the last one.
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 1 } as AgentLoopEvent);
+    expect(events[0]).toMatchObject({ type: "turn_started", route });
+    expect(events[1]).toMatchObject({ type: "turn_started", turnIndex: 1 });
+    expect(events[1]).not.toHaveProperty("route");
+  });
+
+  it("records a profile clip against the current turn (issue #407)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-clip", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 2 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "profile_clipped",
+      stepIndex: 1,
+      rendered: 12,
+      dropped: 7,
+      pinnedDropped: 3,
+      maxTokens: 512,
+    });
+    expect(events.at(-1)).toEqual({
+      type: "profile_clipped",
+      seq: 1,
+      sessionId: "s-clip",
+      ts: 1000,
+      turnIndex: 2,
+      stepIndex: 1,
+      rendered: 12,
+      dropped: 7,
+      pinnedDropped: 3,
+      maxTokens: 512,
+    });
+  });
+
+  it("records a profile eviction on the session's own seq counter", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-evict", emit, now });
+    rec.beginSession({ workingDir: "/w" });
+    rec.recordProfileFactsEvicted({
+      maxEntries: 500,
+      activeUnpinned: 500,
+      ids: [4, 9],
+      keys: ["old_a", "old_b"],
+    });
+    expect(events[1]).toEqual({
+      type: "profile_facts_evicted",
+      seq: 1,
+      sessionId: "s-evict",
+      ts: 1000,
+      maxEntries: 500,
+      activeUnpinned: 500,
+      evicted: 2,
+      ids: [4, 9],
+      keys: ["old_a", "old_b"],
+    });
+  });
+
+  it("records a parse-failure recovery against the current turn and step", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-parse", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 3 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "parse_failure_recovered",
+      stepIndex: 2,
+      attempt: 1,
+      budget: 2,
+      reason: 'tool call "os.fs.write" arguments are not a valid JSON object',
+    } as AgentLoopEvent);
+    expect(
+      events.find((e) => e.type === "parse_failure_recovered"),
+    ).toMatchObject({
+      type: "parse_failure_recovered",
+      sessionId: "s-parse",
+      turnIndex: 3,
+      stepIndex: 2,
+      attempt: 1,
+      budget: 2,
+    });
+  });
+
+  it("records a memory health warning against the last turn, without the notice text", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-mem", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 5 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "memory_health_warning",
+      kind: "vote",
+      outcome: "failed",
+      consecutive: 3,
+      setting: "memory.voting.enabled",
+      reason: "schema refused",
+      message: "Memory voting failed 3 times in a row (schema refused)…",
+    });
+    // Exact: the row carries the structure and the reason; the prose is
+    // the TUI's business and would only bloat every trace.
+    expect(events.find((e) => e.type === "memory_health_warning")).toEqual({
+      type: "memory_health_warning",
+      seq: 1,
+      sessionId: "s-mem",
+      ts: 1000,
+      turnIndex: 5,
+      kind: "vote",
+      outcome: "failed",
+      consecutive: 3,
+      setting: "memory.voting.enabled",
+      reason: "schema refused",
+    });
+  });
+
+  it("records an empty-completion recovery against the current turn and step", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-empty", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 4 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "empty_completion_recovered",
+      stepIndex: 6,
+      attempt: 1,
+      budget: 1,
+    } as AgentLoopEvent);
+    const recorded = events.find(
+      (e) => e.type === "empty_completion_recovered",
+    );
+    // `turnIndex` comes from the recorder's own cursor, the rest from
+    // the loop event — an empty completion leaves nothing else in the
+    // trace, so a wrong index here strands the only row that shows the
+    // step happened.
+    expect(recorded).toMatchObject({
+      type: "empty_completion_recovered",
+      sessionId: "s-empty",
+      turnIndex: 4,
+      stepIndex: 6,
+      attempt: 1,
+      budget: 1,
+      ts: 1000,
+    });
+    // No `reason`: there was no output to have rejected.
+    expect(recorded).not.toHaveProperty("reason");
+  });
+
+  it("attaches user_message to the next turn_started", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-2", emit, now });
+    rec.onAgentEvent({ type: "user_message", text: "hello" });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    const turn = events.find((e) => e.type === "turn_started");
+    expect(turn).toMatchObject({
+      type: "turn_started",
+      turnIndex: 0,
+      userMessage: "hello",
+    });
+  });
+
+  it("pairs tool_call_parsed + tool_call_executed into tool_invocation", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-3", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "tool_call_parsed",
+        call: { tool: "shell.run", args: { command: "ls" } },
+        batchIndex: 0,
+        batchSize: 1,
+      },
+    });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "tool_call_executed",
+        result: {
+          tool: "shell.run",
+          status: "ok",
+          summary: "listed 3 files",
+          details: { exitCode: 0 },
+          truncated: false,
+        },
+        batchIndex: 0,
+        batchSize: 1,
+      },
+    });
+    const invocation = events.find((e) => e.type === "tool_invocation");
+    expect(invocation).toMatchObject({
+      type: "tool_invocation",
+      tool: "shell.run",
+      args: { command: "ls" },
+      status: "ok",
+      summary: "listed 3 files",
+      details: { exitCode: 0 },
+      turnIndex: 0,
+      stepIndex: 0,
+    });
+    // Solo step → batchIndex/batchSize are omitted from the trace
+    // payload (forward-compat with replay code that ignores them).
+    expect(invocation && "batchIndex" in invocation).toBe(false);
+    expect(invocation && "batchSize" in invocation).toBe(false);
+  });
+
+  it("emits N tool_invocation events per stepIndex with monotonic batchIndex", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-batch", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    // Three parsed events arrive first, then three executed.
+    for (let i = 0; i < 3; i += 1) {
+      rec.onAgentEvent({
+        type: "llm_event",
+        event: {
+          type: "tool_call_parsed",
+          call: { tool: "os.fs.read", args: { path: `f${i}` } },
+          batchIndex: i,
+          batchSize: 3,
+        },
+      });
+    }
+    for (let i = 0; i < 3; i += 1) {
+      rec.onAgentEvent({
+        type: "llm_event",
+        event: {
+          type: "tool_call_executed",
+          result: {
+            tool: "os.fs.read",
+            status: "ok",
+            summary: `read f${i}`,
+            truncated: false,
+          },
+          batchIndex: i,
+          batchSize: 3,
+        },
+      });
+    }
+    const invocations = events.filter((e) => e.type === "tool_invocation");
+    expect(invocations).toHaveLength(3);
+    expect(
+      invocations.map((e) =>
+        e.type === "tool_invocation" ? e.batchIndex : -1,
+      ),
+    ).toEqual([0, 1, 2]);
+    expect(
+      invocations.map((e) => (e.type === "tool_invocation" ? e.batchSize : -1)),
+    ).toEqual([3, 3, 3]);
+    expect(
+      invocations.map((e) => (e.type === "tool_invocation" ? e.args : null)),
+    ).toEqual([{ path: "f0" }, { path: "f1" }, { path: "f2" }]);
+    // All events sit on the same stepIndex.
+    expect(
+      invocations.every(
+        (e) => e.type === "tool_invocation" && e.stepIndex === 0,
+      ),
+    ).toBe(true);
+  });
+
+  it("forwards prompt_captured verbatim", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-4", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "prompt_captured",
+        stepIndex: 0,
+        stablePrefixHash: "abc123",
+        tail: "### conversation\nhi",
+        tokens: { total: 100, stablePrefix: 80, tail: 20 },
+        slotId: 1,
+        cacheReused: true,
+      },
+    });
+    const captured = events.find((e) => e.type === "prompt_captured");
+    expect(captured).toMatchObject({
+      type: "prompt_captured",
+      stablePrefixHash: "abc123",
+      tail: "### conversation\nhi",
+      tokens: { total: 100, stablePrefix: 80, tail: 20 },
+      slotId: 1,
+      cacheReused: true,
+      turnIndex: 0,
+      stepIndex: 0,
+    });
+  });
+
+  it("forwards llm_raw_completion with attempt", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-5", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "llm_raw_completion",
+        stepIndex: 0,
+        attempt: 2,
+        completion: {
+          content: '{"tool":"reply"}',
+          reasoningContent: "thought",
+          stop: true,
+          truncated: false,
+          timing: {
+            promptMs: 5,
+            predictedMs: 12,
+            promptTokens: 80,
+            predictedTokens: 6,
+          },
+          cacheHitTokens: 80,
+          slotId: 0,
+          modelId: "demo",
+        },
+      },
+    });
+    const completion = events.find((e) => e.type === "llm_completion");
+    expect(completion).toMatchObject({
+      type: "llm_completion",
+      attempt: 2,
+      content: '{"tool":"reply"}',
+      reasoningContent: "thought",
+      cacheHitTokens: 80,
+      modelId: "demo",
+      stop: true,
+      truncated: false,
+    });
+    // A hand-built event without the estimate records none.
+    expect(completion).not.toHaveProperty("reasoningTokens");
+  });
+
+  it("forwards the step's reasoningTokens estimate onto llm_completion (F49)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-5b", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "llm_raw_completion",
+        stepIndex: 0,
+        attempt: 1,
+        reasoningTokens: 1500,
+        completion: {
+          content: "[]",
+          reasoningContent: "x".repeat(6000),
+          stop: true,
+          truncated: false,
+          timing: {
+            promptMs: 5,
+            predictedMs: 12,
+            promptTokens: 80,
+            predictedTokens: 1400,
+          },
+          cacheHitTokens: 80,
+          slotId: 0,
+          modelId: "demo",
+        },
+      },
+    });
+    const completion = events.find((e) => e.type === "llm_completion");
+    expect(completion).toMatchObject({
+      type: "llm_completion",
+      attempt: 1,
+      reasoningTokens: 1500,
+      timing: { predictedTokens: 1400 },
+    });
+  });
+
+  it("records llama-server's stop_type on llm_completion (ATO-329)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-stop", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "llm_raw_completion",
+        stepIndex: 0,
+        attempt: 1,
+        completion: {
+          content: "{",
+          reasoningContent: "",
+          stop: true,
+          truncated: true,
+          stopType: "limit",
+          finishReason: "length",
+          cacheHitTokens: 0,
+          slotId: 0,
+          modelId: "demo",
+          timing: {
+            promptMs: 1,
+            predictedMs: 1,
+            promptTokens: 10,
+            predictedTokens: 512,
+          },
+        },
+      },
+    });
+    expect(events.find((e) => e.type === "llm_completion")).toMatchObject({
+      truncated: true,
+      stopType: "limit",
+    });
+  });
+
+  it("records a batch trim with the calls that never ran", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-trim", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 3 } as AgentLoopEvent);
+    rec.onAgentEvent({ type: "step_started", stepIndex: 4 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "batch_trimmed",
+        stepIndex: 4,
+        originalSize: 5,
+        kept: "os.fs.write",
+        dropped: ["os.fs.write", "os.fs.write", "os.fs.edit", "reply"],
+        reason: "approval-gated-batched",
+      },
+    });
+    expect(events.at(-1)).toEqual({
+      type: "batch_trimmed",
+      seq: 2,
+      sessionId: "s-trim",
+      ts: 1000,
+      turnIndex: 3,
+      stepIndex: 4,
+      originalSize: 5,
+      kept: "os.fs.write",
+      dropped: ["os.fs.write", "os.fs.write", "os.fs.edit", "reply"],
+      reason: "approval-gated-batched",
+    });
+  });
+
+  it("records a batch run behind approval barriers with what never ran", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-barrier", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 1 } as AgentLoopEvent);
+    rec.onAgentEvent({ type: "step_started", stepIndex: 2 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "batch_approval_barriers",
+        stepIndex: 2,
+        originalSize: 3,
+        waves: 0,
+        barriers: 1,
+        retained: 1,
+        invalidated: 2,
+        stoppedBy: { tool: "os.fs.write", batchIndex: 0, cause: "not_approved" },
+        cancelled: false,
+      },
+    });
+    expect(events.at(-1)).toEqual({
+      type: "batch_approval_barriers",
+      seq: 2,
+      sessionId: "s-barrier",
+      ts: 1000,
+      turnIndex: 1,
+      stepIndex: 2,
+      originalSize: 3,
+      waves: 0,
+      barriers: 1,
+      retained: 1,
+      invalidated: 2,
+      stoppedBy: { tool: "os.fs.write", batchIndex: 0, cause: "not_approved" },
+      cancelled: false,
+    });
+  });
+
+  it("records a cut answer's continuation with counts only (ATO-1031)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-cont", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 1 } as AgentLoopEvent);
+    rec.onAgentEvent({ type: "step_started", stepIndex: 2 } as AgentLoopEvent);
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "answer_continued",
+        stepIndex: 2,
+        cause: "reply_cap",
+        partialChars: 1_234,
+        outcome: "cut_again",
+      },
+    });
+    expect(events.at(-1)).toEqual({
+      type: "answer_continued",
+      seq: 2,
+      sessionId: "s-cont",
+      ts: 1000,
+      turnIndex: 1,
+      stepIndex: 2,
+      cause: "reply_cap",
+      partialChars: 1_234,
+      outcome: "cut_again",
+    });
+  });
+
+  it("emits parse_retry and error events", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-6", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 1 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "parse_retry",
+        stepIndex: 1,
+        attempt: 1,
+        reason: "unexpected token",
+      },
+    });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "step_error",
+        error: new Error("boom"),
+        category: "grammar",
+      },
+    });
+    expect(events.some((e) => e.type === "parse_retry")).toBe(true);
+    const err = events.find((e) => e.type === "error");
+    expect(err).toMatchObject({
+      type: "error",
+      message: "boom",
+      category: "grammar",
+    });
+  });
+
+  it("maps loop_detected and loop_failed", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-7", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({
+      type: "loop_detected",
+      tool: "fs.read",
+      count: 3,
+      stepIndex: 2,
+    });
+    rec.onAgentEvent({
+      type: "loop_failed",
+      error: new Error("loop blew up"),
+      category: "transport",
+    });
+    expect(events.some((e) => e.type === "loop_detected")).toBe(true);
+    const err = events.find((e) => e.type === "error");
+    expect(err).toMatchObject({
+      type: "error",
+      message: "loop blew up",
+      category: "transport",
+    });
+    expect(err).not.toHaveProperty("fallbackFailures");
+  });
+
+  it("records one error for a step failure the loop rethrows unchanged", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-dup", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 3 });
+    // `executeStep` emits `step_error` and rethrows the very same
+    // object, which the loop then reports as `loop_failed` — one
+    // failure, and so one `error` row.
+    const failure = new Error("batch cancelled mid-execution");
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: { type: "step_error", error: failure, category: "cancelled" },
+    });
+    rec.onAgentEvent({
+      type: "loop_failed",
+      error: failure,
+      category: "cancelled",
+    });
+    const errors = events.filter((e) => e.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: "error",
+      message: "batch cancelled mid-execution",
+      category: "cancelled",
+      stepIndex: 3,
+    });
+  });
+
+  it("records both errors when the loop fails with a different one", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-dup-2", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 2 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "step_error",
+        error: new Error("provider refused the raised reply cap"),
+        category: "transport",
+      },
+    });
+    // The truncation-retry path swaps in `truncationRetry.original`
+    // before emitting `loop_failed`: a genuinely different failure,
+    // which must still reach the trace.
+    rec.onAgentEvent({
+      type: "loop_failed",
+      error: new Error("completion truncated at the reply cap"),
+      category: "model",
+    });
+    expect(
+      events.filter((e) => e.type === "error").map((e) => e.message),
+    ).toEqual([
+      "provider refused the raised reply cap",
+      "completion truncated at the reply cap",
+    ]);
+  });
+
+  it("records a loop_failed that no step_error preceded", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-dup-3", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "loop_failed",
+      error: new Error("failed outside executeStep"),
+      category: "transport",
+    });
+    const errors = events.filter((e) => e.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      message: "failed outside executeStep",
+      stepIndex: 0,
+    });
+  });
+
+  it("records a size-rejection repack (F30)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-repack", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 1 });
+    rec.onAgentEvent({
+      type: "prompt_repacked",
+      stepIndex: 4,
+      contextWindow: 8_192,
+      source: "estimate",
+      promptTokens: 10_240,
+    });
+    expect(events.find((e) => e.type === "prompt_repacked")).toMatchObject({
+      type: "prompt_repacked",
+      turnIndex: 1,
+      stepIndex: 4,
+      contextWindow: 8_192,
+      source: "estimate",
+      promptTokens: 10_240,
+    });
+  });
+
+  it("records the generation id of a stream that failed after output", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-gen", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    const error = new Error("openai provider 504: Upstream idle timeout", {
+      cause: attachGenerationId(new Error("terminated"), "gen-504"),
+    });
+    rec.onAgentEvent({ type: "loop_failed", error, category: "transport" });
+    expect(events.find((e) => e.type === "error")).toMatchObject({
+      message: "openai provider 504: Upstream idle timeout",
+      generationId: "gen-504",
+    });
+  });
+
+  it("keeps the last link's message and lists the links that failed before it", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-fb", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    const error = new TypeError("fetch failed");
+    attachFailedAttempts(error, [
+      {
+        providerId: "openrouter",
+        error: new Error("openai provider 404: No endpoints found"),
+      },
+    ]);
+    rec.onAgentEvent({ type: "loop_failed", error, category: "transport" });
+    expect(events.find((e) => e.type === "error")).toMatchObject({
+      message: "fetch failed",
+      category: "transport",
+      fallbackFailures: [
+        {
+          providerId: "openrouter",
+          reason: "openai provider 404: No endpoints found",
+        },
+      ],
+    });
+  });
+
+  it("records the errno a transport failure left on its cause chain, on the one row", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-errno", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    // The field case: a local server that is not running. The step
+    // executor wraps undici's `fetch failed` in a `TransportError`, and
+    // the errno survives only two links down the `cause` chain.
+    const failure = new TransportError(
+      "fetch failed",
+      null,
+      "http://127.0.0.1:8080/completion",
+      {
+        cause: new TypeError("fetch failed", {
+          cause: Object.assign(
+            new Error("connect ECONNREFUSED 127.0.0.1:8080"),
+            { code: "ECONNREFUSED" },
+          ),
+        }),
+      },
+    );
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: { type: "step_error", error: failure, category: "transport" },
+    });
+    // The loop rethrows the very same object: still one row, and the
+    // row that stays is the one carrying the code.
+    rec.onAgentEvent({
+      type: "loop_failed",
+      error: failure,
+      category: "transport",
+    });
+    const errors = events.filter((e) => e.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      message: "fetch failed",
+      category: "transport",
+      causeCode: "ECONNREFUSED",
+      stepIndex: 0,
+    });
+  });
+
+  it("records the errno on a loop_failed that no step_error preceded", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-errno-loop", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    const error = new TypeError("fetch failed", {
+      cause: Object.assign(new Error("read ECONNRESET"), {
+        code: "ECONNRESET",
+      }),
+    });
+    rec.onAgentEvent({ type: "loop_failed", error, category: "transport" });
+    expect(events.find((e) => e.type === "error")).toMatchObject({
+      message: "fetch failed",
+      causeCode: "ECONNRESET",
+    });
+  });
+
+  it("leaves causeCode off a row with no errno, and off any category but transport", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-no-errno", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "step_error",
+        error: new TransportError("fetch failed", null, ""),
+        category: "transport",
+      },
+    });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 1 });
+    // An abort can carry Node's `ABORT_ERR`. It says the request was
+    // cut off here, nothing about the provider, so it is not recorded.
+    rec.onAgentEvent({
+      type: "llm_event",
+      event: {
+        type: "step_error",
+        error: new Error("This operation was aborted", {
+          cause: Object.assign(new Error("The operation was aborted"), {
+            code: "ABORT_ERR",
+          }),
+        }),
+        category: "cancelled",
+      },
+    });
+    const errors = events.filter((e) => e.type === "error");
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toMatchObject({ category: "transport" });
+    expect(errors[0]).not.toHaveProperty("causeCode");
+    expect(errors[1]).toMatchObject({ category: "cancelled" });
+    expect(errors[1]).not.toHaveProperty("causeCode");
+  });
+
+  it("records what a parked turn waits on: the cause, its errno and the link", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-wait", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 3 });
+    rec.onAgentEvent({
+      type: "provider_waiting",
+      attempt: 1,
+      waitedMs: 0,
+      maxWaitMs: 300_000,
+      nextRetryMs: 2_000,
+      reason: "fetch failed",
+      cause: { kind: "refused" },
+      causeCode: "ECONNREFUSED",
+      providerId: "local-llama",
+    });
+    expect(events.find((e) => e.type === "provider_waiting")).toEqual({
+      type: "provider_waiting",
+      seq: 2,
+      sessionId: "s-wait",
+      ts: 1000,
+      turnIndex: 0,
+      stepIndex: 3,
+      attempt: 1,
+      waitedMs: 0,
+      maxWaitMs: 300_000,
+      nextRetryMs: 2_000,
+      reason: "fetch failed",
+      cause: { kind: "refused" },
+      causeCode: "ECONNREFUSED",
+      providerId: "local-llama",
+    });
+  });
+
+  it("records a wait without an errno as such, and a stream status of null as absent", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-wait-2", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({
+      type: "provider_waiting",
+      attempt: 1,
+      waitedMs: 0,
+      maxWaitMs: 300_000,
+      nextRetryMs: 2_000,
+      reason: "the provider ended the completion with an error",
+      cause: { kind: "stream_error", status: null },
+    });
+    rec.onAgentEvent({
+      type: "provider_waiting",
+      attempt: 2,
+      waitedMs: 2_000,
+      maxWaitMs: 300_000,
+      nextRetryMs: 4_000,
+      reason: "openai provider 503: overloaded",
+      cause: { kind: "http", status: 503 },
+    });
+    // One shape for a reader, as on the SSE frame: `status` only when a
+    // response had one.
+    expect(events.filter((e) => e.type === "provider_waiting")).toEqual([
+      {
+        type: "provider_waiting",
+        seq: 1,
+        sessionId: "s-wait-2",
+        ts: 1000,
+        turnIndex: 0,
+        attempt: 1,
+        waitedMs: 0,
+        maxWaitMs: 300_000,
+        nextRetryMs: 2_000,
+        reason: "the provider ended the completion with an error",
+        cause: { kind: "stream_error" },
+      },
+      {
+        type: "provider_waiting",
+        seq: 2,
+        sessionId: "s-wait-2",
+        ts: 1000,
+        turnIndex: 0,
+        attempt: 2,
+        waitedMs: 2_000,
+        maxWaitMs: 300_000,
+        nextRetryMs: 4_000,
+        reason: "openai provider 503: overloaded",
+        cause: { kind: "http", status: 503 },
+      },
+    ]);
+  });
+
+  it("records a truncation with no cap on the wire without inventing one", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-trunc-nocap", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({
+      type: "completion_truncated",
+      stepIndex: 1,
+      cause: "provider_limit",
+      completionTokens: 33_678,
+      promptTokens: 21_000,
+      retry: { kind: "raise_cap", maxTokens: 32_768 },
+    });
+    const recorded = events.filter((e) => e.type === "completion_truncated");
+    expect(recorded).toEqual([
+      expect.objectContaining({
+        cause: "provider_limit",
+        completionTokens: 33_678,
+        retry: "raise_cap",
+        retryValue: 32_768,
+      }),
+    ]);
+    expect(recorded[0]).not.toHaveProperty("requestedMaxTokens");
+  });
+
+  it("records that a cut reply was a loop (ATO-331)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-trunc-loop", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({
+      type: "completion_truncated",
+      stepIndex: 2,
+      cause: "unknown",
+      completionTokens: 0,
+      promptTokens: 0,
+      requestedMaxTokens: 16_384,
+      repetitive: true,
+      retry: { kind: "same_cap", maxTokens: 16_384 },
+    });
+    expect(
+      events.find((e) => e.type === "completion_truncated"),
+    ).toMatchObject({ repetitive: true, retry: "same_cap" });
+  });
+
+  it("records a truncation retry with its cause, counts and the retry taken", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-trunc", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 2 });
+    rec.onAgentEvent({
+      type: "completion_truncated",
+      stepIndex: 5,
+      cause: "reply_cap",
+      completionTokens: 8_192,
+      promptTokens: 6_000,
+      requestedMaxTokens: 8_192,
+      retry: { kind: "raise_cap", maxTokens: 32_768 },
+    });
+    rec.onAgentEvent({
+      type: "completion_truncated",
+      stepIndex: 6,
+      cause: "context_window",
+      completionTokens: 2_768,
+      promptTokens: 30_000,
+      requestedMaxTokens: 8_192,
+      retry: { kind: "fit_window", contextWindow: 32_768 },
+    });
+    rec.onAgentEvent({
+      type: "completion_truncated",
+      stepIndex: 7,
+      cause: "reply_cap",
+      completionTokens: 64_000,
+      promptTokens: 40_000,
+      requestedMaxTokens: 64_000,
+      retry: { kind: "same_cap", maxTokens: 64_000 },
+    });
+    const recorded = events.filter((e) => e.type === "completion_truncated");
+    expect(recorded).toEqual([
+      expect.objectContaining({
+        type: "completion_truncated",
+        turnIndex: 2,
+        stepIndex: 5,
+        cause: "reply_cap",
+        completionTokens: 8_192,
+        promptTokens: 6_000,
+        requestedMaxTokens: 8_192,
+        retry: "raise_cap",
+        retryValue: 32_768,
+      }),
+      expect.objectContaining({
+        stepIndex: 6,
+        cause: "context_window",
+        retry: "fit_window",
+        retryValue: 32_768,
+      }),
+      expect.objectContaining({
+        stepIndex: 7,
+        retry: "same_cap",
+        retryValue: 64_000,
+      }),
+    ]);
+  });
+
+  it("carries the read-repeat detector payload into the recorded event", () => {
+    // A `read_repeat` trace line is unreadable without the file, the
+    // range and the fingerprint pair: those three are the whole evidence
+    // that the re-read was redundant. They have to survive the recorder,
+    // not just the agent-loop event.
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-7b", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({
+      type: "loop_detected",
+      tool: "os.fs.read",
+      count: 2,
+      stepIndex: 4,
+      level: "warn",
+      detector: "read_repeat",
+      read: {
+        path: "/repo/src/a.ts",
+        startLine: 90,
+        endLine: 119,
+        previousFingerprint: "ff01",
+        fingerprint: "ff01",
+      },
+    });
+    expect(events.find((e) => e.type === "loop_detected")).toMatchObject({
+      type: "loop_detected",
+      detector: "read_repeat",
+      read: {
+        path: "/repo/src/a.ts",
+        startLine: 90,
+        endLine: 119,
+        previousFingerprint: "ff01",
+        fingerprint: "ff01",
+      },
+    });
+  });
+
+  it("omits the read payload for detectors that have none", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-7c", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({
+      type: "loop_detected",
+      tool: "noop",
+      count: 3,
+      stepIndex: 1,
+      detector: "generic_repeat",
+    });
+    const event = events.find((e) => e.type === "loop_detected");
+    expect(event).toBeDefined();
+    expect("read" in event!).toBe(false);
+  });
+
+  it("ignores noisy events (reasoning_delta, assistant_delta, llm_completed)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-8", emit, now });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    const ignored: AgentLoopEvent[] = [
+      {
+        type: "llm_event",
+        event: { type: "reasoning_delta", stepIndex: 0, text: "..." },
+      },
+      {
+        type: "llm_event",
+        event: { type: "assistant_delta", text: "..." },
+      },
+      {
+        type: "llm_event",
+        event: {
+          type: "prompt_built",
+          prompt: {
+            text: "",
+            stablePrefix: "",
+            tail: "",
+            tokens: { total: 0, stablePrefix: 0, tail: 0 },
+            truncated: {
+              session: false,
+              worldSnapshot: false,
+              conversation: false,
+            },
+          } as never,
+          slotId: 0,
+        },
+      },
+    ];
+    for (const ev of ignored) rec.onAgentEvent(ev);
+    expect(events.filter((e) => e.type === "prompt_captured")).toHaveLength(0);
+    expect(events.filter((e) => e.type === "llm_completion")).toHaveLength(0);
+  });
+
+  // Phase 7a — recorder owns the seq counter for vote events too,
+  // so they interleave cleanly with the agent-loop stream even
+  // though `VoteRunner` fires post-turn (after `turn_finished`).
+  it("emits vote_applied with monotonic seq", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-vote-a", emit, now });
+    rec.beginSession({ workingDir: "/w" });
+    rec.recordVoteApplied({
+      kind: "lesson",
+      targetId: 42,
+      direction: 1,
+      score: 3,
+      clampHit: false,
+    });
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({
+      type: "vote_applied",
+      sessionId: "s-vote-a",
+      seq: 1,
+      ts: 1000,
+      kind: "lesson",
+      targetId: 42,
+      direction: 1,
+      score: 3,
+      clampHit: false,
+    });
+  });
+
+  it("emits vote_rejected with the supplied reason", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-vote-r", emit, now });
+    rec.recordVoteRejected({
+      kind: "memory",
+      targetId: 7,
+      direction: -1,
+      reason: "out_of_allowlist",
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "vote_rejected",
+      sessionId: "s-vote-r",
+      seq: 0,
+      kind: "memory",
+      targetId: 7,
+      direction: -1,
+      reason: "out_of_allowlist",
+    });
+  });
+
+  it("vote events share the same seq counter as agent events", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-vote-mix", emit, now });
+    rec.beginSession({ workingDir: "/w" });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.recordVoteApplied({
+      kind: "lesson",
+      targetId: 1,
+      direction: 1,
+      score: 1,
+      clampHit: false,
+    });
+    rec.recordVoteRejected({
+      kind: "memory",
+      targetId: null,
+      direction: null,
+      reason: "malformed",
+    });
+    rec.recordVote({
+      outcome: "skipped",
+      candidates: 0,
+      reason: "candidates=0 of 0 surfaced ids",
+    });
+    expect(events.map((e) => e.seq)).toEqual([0, 1, 2, 3, 4]);
+    expect(events.map((e) => e.type)).toEqual([
+      "session_started",
+      "turn_started",
+      "vote_applied",
+      "vote_rejected",
+      "vote",
+    ]);
+  });
+
+  // Memory sub-call trace events — reflection / link_generator /
+  // query_rewriter ride the same per-session seq counter as the
+  // agent-loop stream even though they fire fire-and-forget.
+  it("emits reflection with outcome + write counts", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-refl", emit, now });
+    rec.recordReflection({ outcome: "ok", factsWritten: 2, notesWritten: 1 });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "reflection",
+      sessionId: "s-refl",
+      seq: 0,
+      outcome: "ok",
+      factsWritten: 2,
+      notesWritten: 1,
+    });
+  });
+
+  it("omits reflection write counts when not provided", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-refl-none", emit, now });
+    rec.recordReflection({ outcome: "none" });
+    expect(events[0]).toMatchObject({ type: "reflection", outcome: "none" });
+    expect(events[0]).not.toHaveProperty("factsWritten");
+    expect(events[0]).not.toHaveProperty("notesWritten");
+  });
+
+  it("emits link_generator with linksWritten", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-link", emit, now });
+    rec.recordLinkGenerator({ outcome: "ok", linksWritten: 3 });
+    expect(events[0]).toMatchObject({
+      type: "link_generator",
+      sessionId: "s-link",
+      outcome: "ok",
+      linksWritten: 3,
+    });
+  });
+
+  // The run-level `vote` row: the decorator's two pre-runner
+  // bail-outs are the only place a vote turn's outcome can be said.
+  it("emits vote with the outcome, the reason and candidates", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-vote-run", emit, now });
+    // An agent event first: the row's `seq` has to come from the
+    // recorder's counter, which a constant would also satisfy on a
+    // fresh recorder.
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.recordVote({
+      outcome: "skipped",
+      candidates: 0,
+      reason: "candidates=0 of 0 surfaced ids",
+    });
+    expect(events[1]).toMatchObject({
+      type: "vote",
+      sessionId: "s-vote-run",
+      seq: 1,
+      outcome: "skipped",
+      candidates: 0,
+      reason: "candidates=0 of 0 surfaced ids",
+    });
+  });
+
+  it("omits vote candidates when the count is unknown", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-vote-fail", emit, now });
+    rec.recordVote({
+      outcome: "failed",
+      reason: "candidate hydration failed: boom",
+    });
+    expect(events[0]).toMatchObject({ type: "vote", outcome: "failed" });
+    expect(events[0]).not.toHaveProperty("candidates");
+  });
+
+  it("emits query_rewriter with outcome only", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-rw", emit, now });
+    rec.recordQueryRewriter({ outcome: "skipped_not_referential" });
+    expect(events[0]).toMatchObject({
+      type: "query_rewriter",
+      sessionId: "s-rw",
+      outcome: "skipped_not_referential",
+    });
+  });
+
+  it("memory sub-call events share the agent-loop seq counter", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-mix2", emit, now });
+    rec.beginSession({ workingDir: "/w" });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.recordReflection({ outcome: "ok", factsWritten: 1 });
+    rec.recordLinkGenerator({ outcome: "none" });
+    rec.recordQueryRewriter({ outcome: "ok" });
+    expect(events.map((e) => e.seq)).toEqual([0, 1, 2, 3, 4]);
+    expect(events.map((e) => e.type)).toEqual([
+      "session_started",
+      "turn_started",
+      "reflection",
+      "link_generator",
+      "query_rewriter",
+    ]);
+  });
+
+  it("step_finished carries the stalled-review signal when the loop sends one (F41)", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-stall", emit, now });
+    rec.beginSession({ workingDir: "/w" });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 5 });
+    rec.onAgentEvent({
+      type: "step_finished",
+      stepIndex: 5,
+      summary: "os.fs.read",
+      durationMs: 3,
+    });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 12 });
+    rec.onAgentEvent({
+      type: "step_finished",
+      stepIndex: 12,
+      summary: "os.fs.read[error]",
+      durationMs: 4,
+      reviewStall: { steps: 12, phase: "cut" },
+    });
+    const rows = events.filter((e) => e.type === "step_finished");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).not.toHaveProperty("reviewStall");
+    expect(rows[1]).toMatchObject({
+      stepIndex: 12,
+      reviewStall: { steps: 12, phase: "cut" },
+    });
+  });
+
+  it("assigns monotonic seq across events", () => {
+    const { events, emit } = collector();
+    const rec = createTraceRecorder({ sessionId: "s-9", emit, now });
+    rec.beginSession({ workingDir: "/w" });
+    rec.onAgentEvent({ type: "turn_started", turnIndex: 0 });
+    rec.onAgentEvent({ type: "step_started", stepIndex: 0 });
+    rec.onAgentEvent({
+      type: "step_finished",
+      stepIndex: 0,
+      summary: "ok",
+      durationMs: 10,
+    });
+    rec.onAgentEvent({
+      type: "turn_finished",
+      turnIndex: 0,
+      reason: "reply",
+      stepCount: 1,
+      durationMs: 20,
+    });
+    expect(events.map((e) => e.seq)).toEqual([0, 1, 2, 3, 4]);
+  });
+});

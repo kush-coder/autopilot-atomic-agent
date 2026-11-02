@@ -1,0 +1,1166 @@
+import { resolve } from "node:path";
+
+import type { ChannelStatus } from "../../runtime/channel-status.js";
+import { getUserConfigPath } from "../../config/index.js";
+import type { TaskReport, TaskReportSink } from "../../tasks/index.js";
+
+import { createAttachmentInbox } from "../attachments/inbox.js";
+import {
+  handleInboundFile,
+  handleInboundText,
+  type InboundContext,
+  type InboundTextUpdate,
+  type PendingMediaGroup,
+  type TelegramBotIdentity,
+  type TelegramTarget,
+} from "./inbound-handler.js";
+import { ApprovalBridge } from "./approval-bridge.js";
+import { TelegramSessionPointer } from "./telegram-session-pointer.js";
+import { TelegramLockfile, type ChannelLock } from "./telegram-lockfile.js";
+import { defaultGrammyBotFactory } from "./telegram-bot-factory.js";
+import {
+  DefaultPairingMode,
+  type ClaimedPairing,
+  type PairingMode,
+} from "./pairing-mode.js";
+import {
+  type TelegramSettingsSink,
+  defaultTelegramSettingsSink,
+} from "./telegram-settings.js";
+import { sendOutbound, type TelegramParseMode } from "./outbound-sender.js";
+import { formatTaskReportMessage } from "./task-report-message.js";
+import { sendWelcomeMessage } from "./welcome-message.js";
+import {
+  POLL_STALL_MS,
+  TelegramReconnect,
+  classifyTelegramFailure,
+  formatGivingUpError,
+  formatLockWaitError,
+  formatReconnectingError,
+  type ReconnectKind,
+  type TelegramFailureKind,
+} from "./telegram-reconnect.js";
+import {
+  resolveTokenFromDeps,
+  scrubErrorMessage,
+  type BotInstance,
+  type TelegramChannelDeps,
+} from "./telegram-channel-types.js";
+
+export type { ChannelLock } from "./telegram-lockfile.js";
+export type {
+  BotFactory,
+  BotInstance,
+  TelegramChannelDeps,
+} from "./telegram-channel-types.js";
+export { scrubErrorMessage } from "./telegram-channel-types.js";
+
+const CHANNEL_NAME = "telegram";
+
+export interface PairingStateSnapshot {
+  active: boolean;
+  expiresAt: number | null;
+}
+
+/**
+ * Outcome of a `sendTaskReport` call. Every branch is a value, never
+ * a throw, so the task-runner sink can log skips without a try/catch
+ * pyramid: `sent` (every chunk accepted), `queued` (channel has a
+ * token but is not `up` yet — the report waits in the bounded queue
+ * and is flushed on the transition to `up`), `channel_not_up` (no
+ * token configured, nothing to wait for), `not_paired` (no
+ * `ownerUserId` yet), `delivery_failed` (one or more chunks dropped
+ * by the Telegram API — partial delivery is a failure, never a
+ * silent `sent`).
+ */
+export type TaskReportDelivery =
+  "sent" | "queued" | "channel_not_up" | "not_paired" | "delivery_failed";
+
+/**
+ * Hard cap on reports waiting for the channel to reach `up`. When the
+ * queue is full the oldest report is evicted with a warning — bounded
+ * memory wins over completeness for a channel that may never start.
+ */
+export const TASK_REPORT_QUEUE_LIMIT = 20;
+
+/**
+ * How long `stop()` waits for grammy's `bot.stop()`. The loop itself
+ * ends at once; what `bot.stop()` then awaits is one more `getUpdates`
+ * confirming the offset, which on a dead network runs to its deadline.
+ * Shutdown abandons the bot instead -- the next bot resumes after
+ * `lastUpdateId` either way, so nothing is handled twice.
+ */
+export const STOP_POLLING_TIMEOUT_MS = 3_000;
+
+/**
+ * Outcome of a successful pairing claim. `claim` is what the operator
+ * "won"; `welcomeDelivered` reports whether the post-persistence
+ * confirmation DM was actually accepted by Telegram. The TUI reads
+ * the second field so it never claims delivery when the welcome was
+ * skipped (bot null after a failed restart) or rejected (sendMessage
+ * threw and was swallowed).
+ */
+export interface PairingOutcome {
+  claim: ClaimedPairing;
+  welcomeDelivered: boolean;
+}
+
+/** The window `startPairing` opened, for the operator's screen. */
+export interface OpenedPairingWindow {
+  /** The one-time code the owner sends as `/start <code>`. Never log it. */
+  code: string;
+  /** Epoch ms when the window, and the code, expire. */
+  expiresAt: number;
+}
+
+export interface StartPairingOptions {
+  /**
+   * The operator explicitly confirmed replacing the owner already
+   * paired with this bot. Without it `startPairing` refuses while an
+   * owner is configured (ATO-718).
+   */
+  replaceOwner?: boolean;
+  /**
+   * Called synchronously once the window is open, with the code to
+   * show the operator. Not called when no window opens.
+   */
+  onOpened?: (window: OpenedPairingWindow) => void;
+}
+
+/** `startPairing` while an owner is paired and replacing them was not confirmed. */
+export class OwnerAlreadyPairedError extends Error {
+  constructor() {
+    super(
+      "this bot already has an owner; confirm replacing them before pairing again",
+    );
+    this.name = "OwnerAlreadyPairedError";
+  }
+}
+
+/**
+ * Lifecycle orchestrator for the Telegram remote-control channel.
+ * Owns: polling lifecycle, status transitions, approval-bridge wiring,
+ * pairing-mode state, and live-control writes. Settings persistence
+ * delegates to `telegram-settings.ts`; pairing logic to
+ * `pairing-mode.ts`.
+ */
+export class TelegramChannel {
+  private readonly deps: TelegramChannelDeps;
+  private readonly sessionPointer: TelegramSessionPointer;
+  private readonly lock: ChannelLock;
+  /** Persistence target for the live-control setters (see `TelegramSettingsSink`). */
+  private readonly settings: TelegramSettingsSink;
+  /** `chatKey -> AbortController` for the turn running in that chat/topic. */
+  private readonly inflight = new Map<string, AbortController>();
+  /** Albums still arriving — see `InboundContext.mediaGroups`. */
+  private readonly mediaGroups = new Map<string, PendingMediaGroup>();
+  private readonly userConfigPath: string;
+  private readonly stateDir: string;
+  private readonly pairing: PairingMode;
+  private currentToken: string | null;
+  /**
+   * Live owner-id mirror. Mutated by `setOwnerUserId` / pairing claim.
+   * Inbound handler + approval bridge re-capture it on each `start()`.
+   */
+  private currentOwnerUserId: number | null;
+  /**
+   * Live parse-mode mirror for agent replies. Captured from
+   * `config.telegram.parseMode` at construction. Re-captured by the
+   * inbound handler on every `start()`. `setParseMode` mutates it in
+   * place and persists to `config.json`; a restart is only required
+   * if the channel is currently `up` (so the new value reaches the
+   * already-registered text handler).
+   */
+  private currentParseMode: TelegramParseMode;
+  /**
+   * Bot identity captured from `getMe` on every successful start.
+   * `null` until the channel reaches `up` for the first time. Cleared
+   * on stop so `down` panels never show a stale `@username`.
+   */
+  private currentBotIdentity: TelegramBotIdentity | null = null;
+  private bot: BotInstance | null = null;
+  /**
+   * Task reports that arrived while the channel was not `up` but a
+   * token is configured (boot race: an overdue task can fire on the
+   * first scheduler tick while `start()` is still probing `getMe`, or
+   * the operator may enable the channel later). Flushed in FIFO order
+   * on every transition to `up`; capped at `TASK_REPORT_QUEUE_LIMIT`
+   * with oldest-first eviction. Deliberately not persisted — a report
+   * is a courtesy notification, not durable state (the task row keeps
+   * the authoritative outcome), and the queue survives `stop()` so a
+   * later `restart()` still delivers.
+   */
+  private readonly pendingTaskReports: TaskReport[] = [];
+  private approvalBridge: ApprovalBridge | null = null;
+  /**
+   * `sessionId -> approval binding`. One entry per chat that is (or
+   * recently was) talking to the bot: with per-chat sessions two chats
+   * can run turns at once, and each needs its approval keyboard in its
+   * own chat/topic. Dropped on `/new`, `/switch`, and `stop()`.
+   */
+  private readonly approvalSubscriptions = new Map<
+    string,
+    { target: TelegramTarget; unsubscribe: () => void }
+  >();
+  private currentState: ChannelStatus["state"] = "disabled";
+  private currentError: string | null = null;
+  private startInFlight = false;
+  /**
+   * True between `stop()` being called and the poller actually ending,
+   * so a deliberate shutdown is not misread as the poller dying.
+   */
+  private stopRequested = false;
+  /**
+   * Bumped by every `stop()`. A `start()` still awaiting Telegram when
+   * the stop lands compares it before committing, so a disable or a
+   * shutdown is never undone by a start -- or by the retry a failed
+   * start would arm -- that finishes afterwards.
+   */
+  private stopGeneration = 0;
+  /**
+   * Brings the poller back after a stop nobody asked for, on the shared
+   * backoff. See `telegram-reconnect.ts`.
+   */
+  private readonly reconnect = new TelegramReconnect();
+  /**
+   * When the live bot's `getUpdates` last got an answer (or polling
+   * began). A poll failure this long after it means the connection is
+   * gone; see `handlePollFailed`.
+   */
+  private lastPollAnsweredAt = 0;
+  /**
+   * Highest `update_id` any of this channel's bots has fetched. A
+   * replacement bot resumes after it: the poller it replaces never
+   * confirmed its last batch, and Telegram would otherwise hand those
+   * messages out again and run their turns twice.
+   */
+  private lastUpdateId: number | null = null;
+
+  constructor(deps: TelegramChannelDeps) {
+    this.deps = deps;
+    this.currentToken = resolveTokenFromDeps(deps);
+    this.currentOwnerUserId =
+      deps.ownerUserId !== undefined
+        ? deps.ownerUserId
+        : deps.config.telegram.ownerUserId;
+    this.currentParseMode = deps.config.telegram.parseMode;
+    this.stateDir = deps.config.paths.stateDir;
+    this.userConfigPath =
+      deps.userConfigPath ?? getUserConfigPath(this.stateDir);
+    this.sessionPointer = new TelegramSessionPointer(
+      deps.sessionPointerPath ??
+        resolve(this.stateDir, "telegram-session.json"),
+    );
+    this.lock =
+      deps.lock ??
+      new TelegramLockfile(resolve(this.stateDir, "telegram.lock"));
+    this.settings =
+      deps.settings ??
+      defaultTelegramSettingsSink({
+        userConfigPath: this.userConfigPath,
+        stateDir: this.stateDir,
+      });
+    this.pairing = new DefaultPairingMode();
+  }
+
+  state(): ChannelStatus["state"] {
+    return this.currentState;
+  }
+
+  lastError(): string | null {
+    return this.currentError;
+  }
+
+  /** Live owner id. Reflects mutations from `setOwnerUserId` / pairing. */
+  getOwnerUserId(): number | null {
+    return this.currentOwnerUserId;
+  }
+
+  /** Live parse-mode mirror. Reflects mutations from `setParseMode`. */
+  getParseMode(): TelegramParseMode {
+    return this.currentParseMode;
+  }
+
+  /** Live bot identity from the last successful `getMe`. */
+  /** Whether a bot token is currently resolved (env or explicit). */
+  hasToken(): boolean {
+    return this.currentToken !== null;
+  }
+
+  getBotIdentity(): { id: number; username: string | null } | null {
+    return this.currentBotIdentity;
+  }
+
+  pairingState(): PairingStateSnapshot {
+    return {
+      active: this.pairing.isActive(),
+      expiresAt: this.pairing.expiresAt(),
+    };
+  }
+
+  /**
+   * Acquire the lock, validate the token via `getMe`, register
+   * handlers, and begin polling. Idempotent. Failures land in `down`
+   * and never throw past this boundary. A failure a retry can fix --
+   * Telegram unreachable, another process holding the lock or polling
+   * the bot -- arms the next attempt, on the first start as on any
+   * other: a machine that boots offline must not need a restart once
+   * the network is back. Only a rejected token gives up.
+   */
+  async start(): Promise<void> {
+    // `this.bot` too: never a second poller beside a live one, even
+    // while that one is still being stopped.
+    if (this.currentState === "up" || this.startInFlight || this.bot) return;
+    // Whoever starts the channel -- the retry timer, the TUI, a
+    // live-control setter -- supersedes a retry still waiting to run.
+    this.reconnect.clearTimer();
+    if (!this.currentToken) {
+      this.reconnect.cancel();
+      this.transition("down", "missing TELEGRAM_BOT_TOKEN");
+      return;
+    }
+    this.startInFlight = true;
+    const generation = this.stopGeneration;
+    let lockAcquired = false;
+    try {
+      // Before `starting`: while another process holds the lock, the
+      // retries that wait for it must not flash `starting` on every try.
+      this.lock.acquire();
+      lockAcquired = true;
+      this.transition("starting", null);
+      const factory = this.deps.botFactory ?? defaultGrammyBotFactory;
+      // The hooks fire for this bot only; `created` tells them apart
+      // from a previous bot's late reports.
+      let created: BotInstance | null = null;
+      const bot = await factory(this.currentToken, {
+        onError: (err) => {
+          this.deps.logger.warn("telegram: polling error", {
+            error: scrubErrorMessage(err),
+          });
+        },
+        onPollAnswered: (lastUpdateId) =>
+          this.handlePollAnswered(created, lastUpdateId),
+        onPollFailed: (err) => this.handlePollFailed(created, err),
+        resumeAfterUpdateId: () => this.lastUpdateId,
+      });
+      created = bot;
+      const me = await bot.api.getMe();
+      this.currentBotIdentity = {
+        id: me.id,
+        username: me.username ?? null,
+        ...(typeof me.can_read_all_group_messages === "boolean"
+          ? { canReadAllGroupMessages: me.can_read_all_group_messages }
+          : {}),
+      };
+      this.deps.logger.info("telegram: getMe ok", {
+        botId: me.id,
+        botUsername: me.username,
+        canReadAllGroupMessages: me.can_read_all_group_messages,
+      });
+      if (me.can_read_all_group_messages === false) {
+        // BotFather's default. Replies to the bot and `/cmd@bot` still
+        // arrive; a plain @mention in a group does not, so an operator
+        // who tries one gets silence. Say so once, where it can be read.
+        this.deps.logger.warn(
+          "telegram: privacy mode is on — plain @mentions in groups are not delivered; reply to the bot or use /cmd@<username>, or disable privacy mode in @BotFather (/setprivacy → Disable) and re-add the bot to the group",
+          { botUsername: me.username },
+        );
+      }
+      // A bridge that survived a lost poller is kept, and so are the
+      // session bindings that dispatch to it: its pending approvals'
+      // keyboards are still in the chat, and their clicks now arrive
+      // through this bot.
+      let bridge = this.approvalBridge;
+      if (bridge) {
+        bridge.rebind(bot.api, this.currentOwnerUserId);
+      } else {
+        bridge = new ApprovalBridge({
+          api: bot.api,
+          approvals: this.deps.runtime.approvals,
+          ownerUserId: this.currentOwnerUserId,
+          logger: this.deps.logger,
+        });
+        this.approvalBridge = bridge;
+      }
+      const activeBridge = bridge;
+      // One context for both handlers: the text and file paths share
+      // the owner check, the session pointer, the in-flight map and
+      // the approval binding, and must never drift apart.
+      const inboundCtx: InboundContext = {
+        runtime: this.deps.runtime,
+        api: bot.api,
+        sessionPointer: this.sessionPointer,
+        logger: this.deps.logger,
+        ownerUserId: this.currentOwnerUserId,
+        // Captured by value at registration time. `setParseMode`
+        // restarts the channel when up so the new mode reaches
+        // the freshly-registered text handler — same pattern as
+        // `setOwnerUserId`.
+        agentReplyParseMode: this.currentParseMode,
+        // Captured by value at registration time, same as parseMode:
+        // flipping `telegram.progressIndicator` takes effect on the
+        // next channel (re)start.
+        progressIndicator: this.deps.config.telegram.progressIndicator,
+        inflight: this.inflight,
+        inbox: createAttachmentInbox({
+          dir: resolve(this.stateDir, "inbox", "telegram"),
+        }),
+        mediaGroups: this.mediaGroups,
+        botIdentity: this.currentBotIdentity,
+        ensureApprovalSession: (sessionId, target) =>
+          this.ensureApprovalSession(sessionId, target),
+        releaseApprovalSession: (sessionId) =>
+          this.releaseApprovalSession(sessionId),
+        tryClaimForPairing: (u) => this.handlePairingClaim(u),
+      };
+      bot.setTextHandler((update) => handleInboundText(update, inboundCtx));
+      bot.setFileHandler?.((update) => handleInboundFile(update, inboundCtx));
+      bot.setCallbackHandler?.((update) => activeBridge.handleCallback(update));
+      try {
+        await bot.api.setMyCommands?.([
+          { command: "start", description: "Show help" },
+          { command: "help", description: "Show help" },
+          { command: "status", description: "Show this chat's session" },
+          { command: "sessions", description: "List sessions by chat" },
+          {
+            command: "switch",
+            description: "Continue an existing session here",
+          },
+          {
+            command: "new",
+            description: "Start a fresh session for this chat",
+          },
+          {
+            command: "model",
+            description: "Show or switch the provider and model",
+          },
+          { command: "cancel", description: "Cancel this chat's current turn" },
+        ]);
+      } catch (err) {
+        this.deps.logger.warn("telegram: setMyCommands failed (non-fatal)", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      if (generation !== this.stopGeneration) {
+        this.abandonStart();
+        return;
+      }
+      this.stopRequested = false;
+      this.lastPollAnsweredAt = Date.now();
+      bot.start(
+        () => {
+          this.deps.logger.info("telegram: polling started");
+        },
+        (err) => this.handlePollingStopped(bot, err),
+      );
+      this.bot = bot;
+      if (this.reconnect.inOutage()) {
+        this.deps.logger.info("telegram: polling reconnected", {
+          attempt: this.reconnect.currentAttempt(),
+        });
+      }
+      this.reconnect.markUp();
+      this.transition("up", null);
+    } catch (err) {
+      if (generation !== this.stopGeneration) {
+        this.abandonStart();
+        return;
+      }
+      try {
+        this.lock.release();
+      } catch {
+        // ignore — we are in the failure path already
+      }
+      const reason = scrubErrorMessage(err);
+      // A lock we could not take means another atomic-agent serves this
+      // bot right now -- worth waiting out, not worth reporting twice.
+      const kind = lockAcquired ? classifyTelegramFailure(err) : "locked";
+      if (kind === "fatal") {
+        this.giveUp(reason);
+      } else {
+        // The lock reason keeps its `channel-locked:` prefix up front,
+        // where the Integrations hub looks for it.
+        this.scheduleReconnect(
+          kind !== "locked" && this.reconnect.inOutage()
+            ? `reconnect failed: ${reason}`
+            : reason,
+          kind,
+        );
+      }
+    } finally {
+      this.startInFlight = false;
+    }
+  }
+
+  /**
+   * `stop()` landed while this start was awaiting Telegram. The stop has
+   * already reported `disabled` and released the lock; drop the little
+   * this start set up and leave without polling or arming a retry.
+   */
+  private abandonStart(): void {
+    this.approvalBridge = null;
+    this.currentBotIdentity = null;
+    try {
+      this.lock.release();
+    } catch {
+      // best effort — release() only removes a file this process owns
+    }
+    this.deps.logger.info("telegram: start abandoned, stop() landed first");
+  }
+
+  /**
+   * Report the outage and arm the next attempt. `cause` is already
+   * scrubbed. A transient failure leaves a `warn` per attempt -- the
+   * post-mortem trail on `serve`'s stderr. A conflict or a lock held
+   * elsewhere can last as long as the other process runs, so it is
+   * reported when it starts and then waited out at `debug`.
+   */
+  private scheduleReconnect(cause: string, kind: ReconnectKind): void {
+    const next = this.reconnect.schedule(() => {
+      void this.start().catch((err: unknown) => {
+        this.deps.logger.error("telegram: reconnect start() rejected", {
+          error: scrubErrorMessage(err),
+        });
+      });
+    }, kind);
+    const context = {
+      attempt: next.attempt,
+      delayMs: next.delayMs,
+      kind,
+      reason: cause,
+    };
+    if (kind === "transient" || next.firstOfKind) {
+      this.deps.logger.warn("telegram: polling reconnect scheduled", context);
+    } else {
+      this.deps.logger.debug("telegram: polling reconnect scheduled", context);
+    }
+    this.transition(
+      "down",
+      kind === "locked"
+        ? formatLockWaitError(cause)
+        : formatReconnectingError(cause, next),
+    );
+  }
+
+  /**
+   * Telegram rejected the token (401 / 404). No retry can help, so the
+   * outage ends here: said once at `error` and in `lastError`, and every
+   * pending approval is denied now -- no click can reach this channel
+   * until the token is replaced.
+   */
+  private giveUp(reason: string): void {
+    this.reconnect.cancel();
+    this.retireApprovalBridge("telegram channel down: bot token rejected");
+    this.deps.logger.error("telegram: giving up, the bot token was rejected", {
+      reason,
+    });
+    this.transition("down", formatGivingUpError(reason));
+  }
+
+  /** Drop the session bindings and deny what the bridge still holds. */
+  private retireApprovalBridge(reason: string): void {
+    for (const sub of this.approvalSubscriptions.values()) sub.unsubscribe();
+    this.approvalSubscriptions.clear();
+    this.approvalBridge?.expireAll(reason);
+    this.approvalBridge = null;
+  }
+
+  /** The live bot's `getUpdates` got an answer. */
+  private handlePollAnswered(
+    bot: BotInstance | null,
+    lastUpdateId: number | null,
+  ): void {
+    // Recorded whichever bot fetched it: grammy hands a batch to the
+    // handlers even when its poller was stopped in the meantime.
+    if (
+      lastUpdateId !== null &&
+      (this.lastUpdateId === null || lastUpdateId > this.lastUpdateId)
+    ) {
+      this.lastUpdateId = lastUpdateId;
+    }
+    if (bot !== null && this.bot === bot) this.lastPollAnsweredAt = Date.now();
+  }
+
+  /**
+   * The live bot's `getUpdates` failed. grammy retries it by itself every
+   * 3 s, which covers a blip; but past `POLL_STALL_MS` without an answer
+   * the connection is gone, and the channel says so instead of sitting
+   * `up`: the poller is abandoned and replaced on the reconnect backoff.
+   */
+  private handlePollFailed(bot: BotInstance | null, err: Error): void {
+    if (this.stopRequested || bot === null || this.bot !== bot) return;
+    const reason = scrubErrorMessage(err);
+    const silentMs = Date.now() - this.lastPollAnsweredAt;
+    if (silentMs < POLL_STALL_MS) {
+      this.deps.logger.debug("telegram: getUpdates failed, retrying", {
+        reason,
+      });
+      return;
+    }
+    this.deps.logger.warn("telegram: polling stalled, replacing the poller", {
+      reason,
+      silentMs,
+    });
+    this.abandonBot(bot);
+    this.losePoller("transient", `connection lost: ${reason}`, reason);
+  }
+
+  /** End a bot's polling without waiting on Telegram. */
+  private abandonBot(bot: BotInstance): void {
+    if (bot.abandon) {
+      bot.abandon();
+      return;
+    }
+    void bot.stop().catch(() => undefined);
+  }
+
+  /**
+   * The polling loop ended. Anything other than a `stop()` we asked for
+   * is a failure: the channel is no longer receiving updates, so it
+   * must say so rather than sit at `up` looking healthy while every
+   * message goes unanswered -- and, unless Telegram rejected the token
+   * (`classifyTelegramFailure`), come back by itself on a backoff
+   * instead of waiting for a process restart.
+   *
+   * Guarded on the bot identity so a late callback from a previous
+   * generation (restart, token change) cannot knock down the live one.
+   */
+  private handlePollingStopped(bot: BotInstance, err?: unknown): void {
+    if (this.stopRequested) return;
+    if (this.bot !== bot) return;
+    const reason =
+      err === undefined
+        ? "polling stopped unexpectedly"
+        : scrubErrorMessage(err);
+    this.deps.logger.warn("telegram: polling loop ended", { reason });
+    this.losePoller(
+      classifyTelegramFailure(err),
+      err === undefined ? reason : `polling stopped: ${reason}`,
+      reason,
+    );
+  }
+
+  /**
+   * The live poller is gone, whatever ended it. Give the lock back, then
+   * either give up or arm the retry. The approval bridge and its session
+   * bindings are kept for a retry -- `start()` rebinds them to the next
+   * bot, so a keyboard sent before the drop still works after it.
+   */
+  private losePoller(
+    kind: TelegramFailureKind,
+    cause: string,
+    reason: string,
+  ): void {
+    this.bot = null;
+    this.currentBotIdentity = null;
+    try {
+      this.lock.release();
+    } catch {
+      // best effort — a stale lock is reclaimed on the next acquire
+    }
+    if (kind === "fatal") {
+      this.giveUp(reason);
+      return;
+    }
+    this.scheduleReconnect(cause, kind);
+  }
+
+  /** Stop polling, abort in-flight turns, cancel pairing, release the lock. Idempotent. */
+  async stop(): Promise<void> {
+    // No retry may outlive a stop, and a start still awaiting Telegram
+    // must not commit after it (see `stopGeneration`).
+    this.reconnect.cancel();
+    this.stopGeneration += 1;
+    if (this.currentState === "disabled" && !this.bot) {
+      // Still cancel pairing — the operator may have started a window
+      // before stop() landed and we don't want a stale promise.
+      this.pairing.cancel();
+      return;
+    }
+    this.stopRequested = true;
+    this.transition("stopping", null);
+    this.pairing.cancel();
+    for (const controller of this.inflight.values()) {
+      try {
+        controller.abort();
+      } catch {
+        // never let an aborted controller fail the shutdown sequence
+      }
+    }
+    this.inflight.clear();
+    for (const group of this.mediaGroups.values()) {
+      try {
+        group.cancel();
+      } catch {
+        // a timer that will not cancel must not fail the shutdown
+      }
+    }
+    this.mediaGroups.clear();
+    for (const sub of this.approvalSubscriptions.values()) sub.unsubscribe();
+    this.approvalSubscriptions.clear();
+    this.approvalBridge?.cancelAll();
+    this.approvalBridge = null;
+    if (this.bot) {
+      try {
+        await this.stopPolling(this.bot);
+      } catch (err) {
+        this.deps.logger.warn("telegram: bot.stop() failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      this.bot = null;
+    }
+    this.currentBotIdentity = null;
+    try {
+      this.lock.release();
+    } catch (err) {
+      this.deps.logger.warn("telegram: lock.release() failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    this.transition("disabled", null);
+  }
+
+  /**
+   * `bot.stop()`, bounded by `STOP_POLLING_TIMEOUT_MS`. Past it the bot
+   * is abandoned, which also aborts the offset confirmation still in
+   * flight -- left running, it could land after a restarted bot's first
+   * poll and terminate that one with a 409.
+   */
+  private async stopPolling(bot: BotInstance): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), STOP_POLLING_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([
+        bot.stop().then(() => "stopped" as const),
+        timedOut,
+      ]);
+      if (outcome === "timeout") {
+        this.deps.logger.warn("telegram: bot.stop() timed out, abandoning", {
+          timeoutMs: STOP_POLLING_TIMEOUT_MS,
+        });
+        this.abandonBot(bot);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Stop then start. No-op when the channel was already stopped. A
+   * channel waiting to reconnect counts as running: restarting it means
+   * "try now", not "stay stopped".
+   */
+  async restart(): Promise<void> {
+    const wasUp = this.currentState === "up" || this.reconnect.pending();
+    await this.stop();
+    if (wasUp) await this.start();
+  }
+
+  /**
+   * Persist `enabled` to user config and reconcile lifecycle (start
+   * when true, stop when false). With a missing token, `enabled=true`
+   * still persists; `start()` lands in `down`. TUI surfaces the
+   * outcome via `state()` + `lastError()`.
+   */
+  async setEnabled(enabled: boolean): Promise<void> {
+    this.settings.writeSettings({ enabled });
+    if (enabled) {
+      await this.start();
+    } else {
+      await this.stop();
+    }
+  }
+
+  /**
+   * Persist `ownerUserId` to user config; restart when up so the
+   * inbound handler + approval bridge re-capture the new value.
+   */
+  async setOwnerUserId(ownerUserId: number | null): Promise<void> {
+    this.settings.writeSettings({ ownerUserId });
+    this.currentOwnerUserId = ownerUserId;
+    if (this.currentState === "up") {
+      await this.restart();
+    }
+  }
+
+  /**
+   * Persist `parseMode` to user config and re-register the inbound
+   * handler so agent replies pick up the new mode. Restart is only
+   * needed when the channel is up; an idle channel just updates the
+   * mirror so the next `start()` reads the fresh value.
+   */
+  async setParseMode(parseMode: TelegramParseMode): Promise<void> {
+    this.settings.writeSettings({ parseMode });
+    this.currentParseMode = parseMode;
+    if (this.currentState === "up") {
+      await this.restart();
+    }
+  }
+
+  /**
+   * Re-read the token from the environment into the live channel.
+   *
+   * The channel resolves its token **once, at construction**, so a
+   * token written to `<stateDir>/.env` afterwards by someone else --
+   * the Integrations hub owns its own credential writes -- would never
+   * reach a running process: `start()` would keep landing in `down`
+   * with "missing TELEGRAM_BOT_TOKEN" until a restart. This is the
+   * seam for a writer that has already persisted the value and only
+   * needs the running channel to catch up; `setToken` stays the path
+   * for a writer that wants the persistence too.
+   */
+  adoptTokenFromEnv(): void {
+    this.replaceToken(resolveTokenFromDeps(this.deps));
+  }
+
+  /**
+   * Swap the live token. Update ids are per bot, so another bot's
+   * numbering says nothing about this one's: resuming after it could
+   * skip every message the new bot receives.
+   */
+  private replaceToken(token: string | null): void {
+    if (token !== this.currentToken) this.lastUpdateId = null;
+    this.currentToken = token;
+  }
+
+  /**
+   * Persist a new bot token to `<stateDir>/.env` (mode 0600) and
+   * restart when up -- or when waiting to reconnect: the outage being
+   * retried belonged to the old token, and the new one deserves an
+   * immediate verdict. `null` clears the token; the next `start()`
+   * lands in `down`. Never logs the value.
+   */
+  async setToken(token: string | null): Promise<void> {
+    this.settings.writeToken(token);
+    this.replaceToken(token);
+    if (this.currentState === "up" || this.reconnect.pending()) {
+      await this.restart();
+    }
+  }
+
+  /**
+   * Open a pairing window with a fresh 6-digit one-time code, handed
+   * to `options.onOpened` for the operator's screen. The first private
+   * DM `/start <code>` within `timeoutMs` (5 minutes by default) is
+   * captured as the new owner: `ownerUserId` is persisted, the channel
+   * restarts, and the returned promise resolves with the claim. Any
+   * other DM claims nothing. Resolves to `null` on timeout or
+   * `cancelPairing()`.
+   *
+   * Pairing requires the channel to be `up` so updates can arrive.
+   * Calling it while down resolves to `null` immediately and emits
+   * a warn log — the TUI is expected to enable + start first. While an
+   * owner is configured it rejects with `OwnerAlreadyPairedError`
+   * unless `options.replaceOwner` carries the operator's confirmation.
+   * The code is never logged.
+   */
+  async startPairing(
+    timeoutMs?: number,
+    options: StartPairingOptions = {},
+  ): Promise<PairingOutcome | null> {
+    if (this.currentState !== "up") {
+      this.deps.logger.warn(
+        "telegram: pairing requested while channel not up",
+        { state: this.currentState },
+      );
+      return null;
+    }
+    if (this.currentOwnerUserId !== null && options.replaceOwner !== true) {
+      this.deps.logger.warn(
+        "telegram: pairing refused, an owner is paired and replacing them was not confirmed",
+      );
+      throw new OwnerAlreadyPairedError();
+    }
+    const pending = this.pairing.start(timeoutMs);
+    const code = this.pairing.currentCode();
+    const expiresAt = this.pairing.expiresAt();
+    if (code !== null && expiresAt !== null) {
+      options.onOpened?.({ code, expiresAt });
+    }
+    const claim = await pending;
+    if (!claim) return null;
+    // Persist first; only after the new owner is durably stored do
+    // we attempt the user-visible Telegram confirmation. The welcome
+    // is best-effort — a failed sendMessage never reverts the claim
+    // — but we DO report delivery status to the caller so the TUI
+    // can tell the operator whether a confirmation actually landed.
+    await this.setOwnerUserId(claim.userId);
+    let welcomeDelivered = false;
+    if (this.bot) {
+      welcomeDelivered = await sendWelcomeMessage({
+        api: this.bot.api,
+        chatId: claim.chatId,
+        logger: this.deps.logger,
+      });
+    }
+    return { claim, welcomeDelivered };
+  }
+
+  cancelPairing(): void {
+    this.pairing.cancel();
+  }
+
+  /**
+   * Build the `TaskRunner.reportSink` that routes task reports into a
+   * Telegram channel. Static so bootstrap can wire it through the
+   * already-imported `TelegramChannel` name without touching its
+   * import block, and unit-testable in isolation: both skip paths
+   * warn-log with a reason (never silent), pinned by
+   * `telegram-channel.test.ts`.
+   *
+   * `resolveChannel` is read at delivery time, not at build time —
+   * bootstrap constructs the runner before the channel, and a due task
+   * on an early scheduler tick may fire in that window; the `null`
+   * branch logs and drops that report instead of crashing or silently
+   * losing it.
+   */
+  static buildTaskReportSink(deps: {
+    resolveChannel: () => TelegramChannel | null;
+    logger: {
+      warn(message: string, context?: Record<string, unknown>): void;
+    };
+  }): TaskReportSink {
+    return async (report) => {
+      const channel = deps.resolveChannel();
+      if (!channel) {
+        deps.logger.warn(
+          "telegram task report skipped: channel not constructed",
+          { taskId: report.taskId },
+        );
+        return;
+      }
+      const delivery = await channel.sendTaskReport(report);
+      // `queued` is not a loss — the channel already info-logged it
+      // and will flush on `up`; warn only on outcomes that dropped
+      // the report.
+      if (delivery !== "sent" && delivery !== "queued") {
+        deps.logger.warn("telegram task report skipped", {
+          taskId: report.taskId,
+          delivery,
+        });
+      }
+    };
+  }
+
+  /**
+   * Post a scheduled task's terminal outcome to the paired owner's DM.
+   * Wired as the `TaskRunner.reportSink` route in bootstrap for tasks
+   * that carry `notify: "telegram"`.
+   *
+   * Chat resolution: the message goes to `chatId = ownerUserId`. The
+   * owner id is only ever captured from a private DM (the inbound
+   * handler drops non-private chats), and the Telegram Bot API
+   * addresses a user-bot private chat by the user's own id — the same
+   * invariant every bot relies on to DM its users.
+   *
+   * Always plain text: a task report is channel infrastructure (see
+   * ../docs/adapters.md), and its error
+   * excerpts may contain `<`/`&` that must never meet the HTML parser.
+   * Never throws — every failure mode is a `TaskReportDelivery` value,
+   * and per-chunk send errors are already swallowed by `sendOutbound`.
+   *
+   * Not-up handling: with a token configured the report is queued and
+   * flushed on the transition to `up` (see `pendingTaskReports`);
+   * without a token there is nothing to wait for and the report is
+   * skipped as before.
+   */
+  async sendTaskReport(report: TaskReport): Promise<TaskReportDelivery> {
+    const bot = this.bot;
+    if (this.currentState !== "up" || !bot) {
+      if (this.currentToken === null) return "channel_not_up";
+      this.queueTaskReport(report);
+      return "queued";
+    }
+    const ownerUserId = this.currentOwnerUserId;
+    if (ownerUserId === null) return "not_paired";
+    const result = await sendOutbound({
+      api: bot.api,
+      chatId: ownerUserId,
+      text: formatTaskReportMessage(report),
+      parseMode: "plain",
+      logger: {
+        warn: (message, context) => this.deps.logger.warn(message, context),
+      },
+    });
+    // Any dropped chunk fails the report — a partially delivered
+    // message must never account as `sent`. With the current format
+    // caps a report always fits one chunk (pinned by
+    // task-report-message.test.ts), so this also covers the whole-
+    // message failure; the count split keeps the log honest if the
+    // caps ever grow past the chunk size.
+    if (result.dropped > 0) {
+      this.deps.logger.warn("telegram task report chunks dropped", {
+        taskId: report.taskId,
+        deliveredChunks: result.chunks - result.dropped,
+        totalChunks: result.chunks,
+      });
+      return "delivery_failed";
+    }
+    // One logical outbound message, same accounting rule as agent
+    // replies (never per-chunk).
+    this.deps.metrics?.recordTelegramMessage({ direction: "out" });
+    return "sent";
+  }
+
+  /** FIFO-append with oldest-first eviction at `TASK_REPORT_QUEUE_LIMIT`. */
+  private queueTaskReport(report: TaskReport): void {
+    this.pendingTaskReports.push(report);
+    if (this.pendingTaskReports.length > TASK_REPORT_QUEUE_LIMIT) {
+      const evicted = this.pendingTaskReports.shift();
+      this.deps.logger.warn("telegram task report evicted: queue full", {
+        taskId: evicted?.taskId,
+        limit: TASK_REPORT_QUEUE_LIMIT,
+      });
+    }
+    this.deps.logger.info("telegram task report queued until channel is up", {
+      taskId: report.taskId,
+      queued: this.pendingTaskReports.length,
+    });
+  }
+
+  /**
+   * Deliver every queued report now that the channel is `up`. FIFO;
+   * `splice` empties the queue up-front so a report that fails again
+   * mid-flush (channel dropped back to `down`) re-queues itself via
+   * `sendTaskReport` instead of looping here. Fire-and-forget from
+   * `transition` — flushing must never block a state change.
+   */
+  private async flushPendingTaskReports(): Promise<void> {
+    const queued = this.pendingTaskReports.splice(0);
+    for (const report of queued) {
+      const delivery = await this.sendTaskReport(report);
+      if (delivery !== "sent" && delivery !== "queued") {
+        this.deps.logger.warn("queued telegram task report not delivered", {
+          taskId: report.taskId,
+          delivery,
+        });
+      }
+    }
+  }
+
+  /** Logs who claimed or tried, never the code they sent. */
+  private handlePairingClaim(update: InboundTextUpdate): boolean {
+    const result = this.pairing.tryClaim(update);
+    if (result === "claimed") {
+      this.deps.logger.info("telegram: pairing claimed with the one-time code", {
+        fromId: update.from?.id,
+        chatId: update.chat.id,
+      });
+    } else if (result === "wrong_code") {
+      this.deps.logger.warn("telegram: pairing attempt with a wrong code ignored", {
+        fromId: update.from?.id,
+        chatId: update.chat.id,
+      });
+    }
+    return result !== "ignored";
+  }
+
+  /**
+   * Bind/re-bind the approval router so requests for `sessionId` land
+   * on the inline-keyboard bridge in `target` (chat + optional forum
+   * topic). No-op when the binding is already current; a session that
+   * moved to another chat via `/switch` is re-pointed.
+   */
+  private ensureApprovalSession(
+    sessionId: string,
+    target: TelegramTarget,
+  ): void {
+    const existing = this.approvalSubscriptions.get(sessionId);
+    if (
+      existing &&
+      existing.target.chatId === target.chatId &&
+      existing.target.threadId === target.threadId
+    ) {
+      return;
+    }
+    existing?.unsubscribe();
+    this.approvalSubscriptions.delete(sessionId);
+    // A chat has exactly one current session, so any other session still
+    // bound to this same chat/topic is stale (hand-edited pointer, a
+    // pointer to a pruned session) and would leak.
+    for (const [otherId, sub] of this.approvalSubscriptions) {
+      if (
+        sub.target.chatId === target.chatId &&
+        sub.target.threadId === target.threadId
+      ) {
+        sub.unsubscribe();
+        this.approvalSubscriptions.delete(otherId);
+      }
+    }
+    const bridge = this.approvalBridge;
+    if (!bridge) return;
+    const unsubscribe = this.deps.runtime.setApprovalHandlerForSession(
+      sessionId,
+      (request) => {
+        void bridge.dispatch(request, target.chatId, target.threadId);
+      },
+    );
+    this.approvalSubscriptions.set(sessionId, { target, unsubscribe });
+  }
+
+  /** Drop the approval binding for a session no chat talks to anymore. */
+  private releaseApprovalSession(sessionId: string): void {
+    const existing = this.approvalSubscriptions.get(sessionId);
+    if (!existing) return;
+    existing.unsubscribe();
+    this.approvalSubscriptions.delete(sessionId);
+  }
+
+  private transition(next: ChannelStatus["state"], error: string | null): void {
+    if (
+      this.currentState === next &&
+      (this.currentError ?? null) === (error ?? null)
+    ) {
+      return;
+    }
+    this.currentState = next;
+    this.currentError = error;
+    const status: ChannelStatus = {
+      channel: CHANNEL_NAME,
+      state: next,
+      ...(error !== null ? { lastError: error } : {}),
+    };
+    try {
+      this.deps.emitStatus?.(status);
+    } catch (err) {
+      this.deps.logger.warn("telegram: status sink threw", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    // Lifecycle counters: only the terminal-ish states (`up`, `down`)
+    // are recorded; `starting`/`stopping`/`disabled` are pass-through
+    // transitions whose dashboards-of-record are the same `up`/`down`
+    // counters bracketing them.
+    if (next === "up") {
+      this.deps.metrics?.recordTelegramUp();
+      // Deliver task reports that arrived before the channel came up
+      // (boot race / late enable). Fire-and-forget: a state change
+      // must never block on Telegram round-trips.
+      if (this.pendingTaskReports.length > 0) {
+        void this.flushPendingTaskReports();
+      }
+    } else if (next === "down") {
+      this.deps.metrics?.recordTelegramDown({
+        outcome: "error",
+        ...(error ? { reason: shortReason(error) } : {}),
+      });
+    }
+  }
+}
+
+/**
+ * Collapse a free-form `lastError` string into a short, low-cardinality
+ * `reason` tag for the down-counter. Anything we don't recognise lands
+ * as `other` so dashboards stay bounded.
+ */
+function shortReason(error: string): string {
+  if (error.includes("missing TELEGRAM_BOT_TOKEN")) return "missing_token";
+  if (error.toLowerCase().includes("lock")) return "lock_held";
+  if (error.toLowerCase().includes("getme")) return "getme_failed";
+  if (error.toLowerCase().includes("token")) return "token_invalid";
+  return "other";
+}

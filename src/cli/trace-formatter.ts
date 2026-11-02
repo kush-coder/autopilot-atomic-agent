@@ -1,0 +1,177 @@
+import type { TraceEvent } from "../tracing/index.js";
+
+export interface FormatShowOptions {
+  step?: number;
+  raw?: boolean;
+}
+
+/**
+ * Convert a trace event stream into a compact human-readable chronology
+ * suitable for `atomic-agent trace show`. Long payloads (prompt tail,
+ * completion content) are truncated unless `raw` is set — the full
+ * bytes live in the NDJSON file and can be inspected with `trace
+ * export` anyway.
+ */
+export function formatTraceChronology(
+  events: readonly TraceEvent[],
+  options: FormatShowOptions = {},
+): string {
+  const lines: string[] = [];
+  for (const event of events) {
+    if (options.step !== undefined) {
+      const stepIndex = extractStepIndex(event);
+      if (stepIndex !== options.step) continue;
+    }
+    lines.push(formatTraceEvent(event, options.raw === true));
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Return the event's `stepIndex` or `null` for session/turn-level
+ * events. The `trace show --step N` filter treats `null` as "does not
+ * match": only events tied to a specific step survive, so the caller
+ * sees a focused view of that step.
+ */
+function extractStepIndex(event: TraceEvent): number | null {
+  if ("stepIndex" in event && typeof event.stepIndex === "number") {
+    return event.stepIndex;
+  }
+  return null;
+}
+
+function formatTraceEvent(event: TraceEvent, raw: boolean): string {
+  const ts = new Date(event.ts).toISOString();
+  const head = `[${ts}] #${event.seq} ${event.type}`;
+  switch (event.type) {
+    case "session_started":
+      return `${head} workingDir=${event.workingDir}`;
+    case "turn_started":
+      return `${head} turn=${event.turnIndex}${
+        event.route
+          ? ` mode=${event.route.mode} model=${event.route.main.providerId}/${
+              event.route.main.model ?? "?"
+            }`
+          : ""
+      }${
+        event.userMessage ? ` user=${truncate(event.userMessage, 80, raw)}` : ""
+      }`;
+    case "turn_finished":
+      return `${head} turn=${event.turnIndex} reason=${event.reason} steps=${event.stepCount} durationMs=${event.durationMs}`;
+    case "step_started":
+      return `${head} turn=${event.turnIndex} step=${event.stepIndex}`;
+    case "step_finished":
+      return `${head} turn=${event.turnIndex} step=${event.stepIndex} durationMs=${event.durationMs} summary=${truncate(event.summary, 160, raw)}`;
+    case "prompt_captured":
+      return `${head} step=${event.stepIndex} prefixHash=${event.stablePrefixHash.slice(0, 12)} tokens(total=${event.tokens.total},prefix=${event.tokens.stablePrefix},tail=${event.tokens.tail}) cacheReused=${event.cacheReused}${
+        raw ? `\n  tail: ${event.tail}` : ""
+      }`;
+    case "llm_completion": {
+      const timing = event.timing
+        ? ` promptMs=${event.timing.promptMs} predictedMs=${event.timing.predictedMs} tokens(p=${event.timing.promptTokens},c=${event.timing.predictedTokens})`
+        : "";
+      const reasoningTokens =
+        event.reasoningTokens !== undefined
+          ? ` reasoningTokens=${event.reasoningTokens}`
+          : "";
+      return `${head} step=${event.stepIndex} attempt=${event.attempt} cacheHit=${event.cacheHitTokens}${timing}${reasoningTokens}${
+        raw
+          ? `\n  content: ${event.content}${
+              event.reasoningContent
+                ? `\n  reasoning: ${event.reasoningContent}`
+                : ""
+            }`
+          : ` content=${truncate(event.content, 160, false)}`
+      }`;
+    }
+    case "tool_invocation":
+      return `${head} step=${event.stepIndex} tool=${event.tool} status=${event.status} summary=${truncate(event.summary, 120, raw)}${
+        raw ? `\n  args: ${JSON.stringify(event.args)}` : ""
+      }`;
+    case "parse_retry":
+      return `${head} step=${event.stepIndex} attempt=${event.attempt} reason=${event.reason}`;
+    case "answer_continued":
+      return `${head} step=${event.stepIndex} cause=${event.cause} partial=${event.partialChars} outcome=${event.outcome}`;
+    case "task_continued":
+      return `${head} steps=${event.stepsTaken}/${event.stepCeiling} elapsed=${Math.round(
+        event.elapsedMs / 1000,
+      )}s`;
+    case "parse_failure_recovered":
+      return `${head} step=${event.stepIndex} attempt=${event.attempt}/${event.budget} reason=${truncate(event.reason, 120, raw)}`;
+    case "empty_completion_recovered":
+      return `${head} step=${event.stepIndex} attempt=${event.attempt}/${event.budget}`;
+    case "memory_health_warning":
+      return `${head} turn=${event.turnIndex} kind=${event.kind} outcome=${event.outcome} consecutive=${event.consecutive} setting=${event.setting}${
+        event.reason !== undefined
+          ? ` reason=${truncate(event.reason, 120, raw)}`
+          : ""
+      }`;
+    case "provider_waiting":
+      // The errno last: `reason` is often a bare `fetch failed`, and
+      // the code is what says whether the server was refused, timed out
+      // or never resolved. Rows without one print as they always have.
+      return `${head} attempt=${event.attempt} waited=${Math.round(
+        event.waitedMs / 1000,
+      )}s/${Math.round(event.maxWaitMs / 1000)}s next=${Math.round(
+        event.nextRetryMs / 1000,
+      )}s reason=${truncate(event.reason, 120, raw)}${causeCodeSuffix(
+        event.causeCode,
+      )}`;
+    case "provider_recovered":
+      return `${head} waited=${Math.round(event.waitedMs / 1000)}s`;
+    case "completion_truncated":
+      return `${head} step=${event.stepIndex} cause=${event.cause} reply=${event.completionTokens} prompt=${event.promptTokens} cap=${event.requestedMaxTokens ?? "none"}${event.repetitive === true ? " repetitive" : ""} retry=${event.retry}:${event.retryValue}`;
+    case "prompt_repacked":
+      return `${head} step=${event.stepIndex} window=${event.contextWindow} source=${event.source} prompt=${event.promptTokens}`;
+    case "loop_detected":
+      return `${head} step=${event.stepIndex} tool=${event.tool} count=${event.count}${
+        event.detector !== undefined ? ` detector=${event.detector}` : ""
+      }${
+        // Read-repeat lines are unreadable without the file and range the
+        // detector was talking about; the fingerprints show that the
+        // content did not move between the two reads.
+        event.read !== undefined
+          ? ` path=${event.read.path} lines=${event.read.startLine}-${event.read.endLine} fingerprint=${event.read.previousFingerprint}→${event.read.fingerprint}`
+          : ""
+      }`;
+    case "profile_clipped":
+      return `${head} turn=${event.turnIndex} step=${event.stepIndex} rendered=${event.rendered} dropped=${event.dropped} pinnedDropped=${event.pinnedDropped} maxTokens=${event.maxTokens}`;
+    case "profile_facts_evicted":
+      return `${head} evicted=${event.evicted} maxEntries=${event.maxEntries} activeUnpinned=${event.activeUnpinned} keys=${truncate(event.keys.join(","), 120, raw)}`;
+    case "error": {
+      const after = (event.fallbackFailures ?? []).map(
+        (f) => `"${f.providerId}" failed: ${f.reason}`,
+      );
+      // The code sits right after the message it explains, ahead of the
+      // links that failed before: it belongs to the last link's error.
+      return `${head} message=${event.message}${causeCodeSuffix(
+        event.causeCode,
+      )}${after.length > 0 ? ` (after ${after.join("; ")})` : ""}`;
+    }
+    case "trace_truncated":
+      // The counts are the point of the row: they tell the reader how
+      // much of the session is missing above this line.
+      return `${head}${
+        event.droppedEvents !== undefined
+          ? ` droppedEvents=${event.droppedEvents}`
+          : ""
+      }${
+        event.droppedBytes !== undefined
+          ? ` droppedBytes=${event.droppedBytes}`
+          : ""
+      } reason=${event.reason}`;
+    default:
+      return `${head} ${JSON.stringify(event)}`;
+  }
+}
+
+/** ` code=ECONNREFUSED`, or nothing when the row carries no cause code. */
+function causeCodeSuffix(causeCode: string | undefined): string {
+  return causeCode !== undefined ? ` code=${causeCode}` : "";
+}
+
+function truncate(input: string, max: number, raw: boolean): string {
+  if (raw) return input;
+  if (input.length <= max) return input;
+  return `${input.slice(0, max)}… (+${input.length - max} chars)`;
+}
